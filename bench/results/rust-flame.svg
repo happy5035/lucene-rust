@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="226" font-family="monospace">
+<text x="10" y="24" font-size="16">RustLucene index write (4 threads, perf cpu-clock, 1538 samples) (samples=1538)</text>
+<rect x="10.0" y="40" width="762.1" height="15" fill="hsl(334,45%,60%)"><title>&lt;std[1e3c4ec04c5261a9]::sys::thread::unix::Thread&gt;::new::thread_start (994)</title></rect><text x="13.0" y="52" font-size="11">&lt;std[1e3c4ec04c5261a9]::sys::thread::unix::Thread&gt;::new::thread_start</text>
+<rect x="10.0" y="56" width="762.1" height="15" fill="hsl(323,45%,60%)"><title>core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$ (994)</title></rect><text x="13.0" y="68" font-size="11">core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$</text>
+<rect x="10.0" y="72" width="762.1" height="15" fill="hsl(220,45%,60%)"><title>std::sys::backtrace::__rust_begin_short_backtrace (994)</title></rect><text x="13.0" y="84" font-size="11">std::sys::backtrace::__rust_begin_short_backtrace</text>
+<rect x="10.0" y="88" width="613.0" height="15" fill="hsl(128,45%,60%)"><title>rustlucene_core::segment_builder::SegmentBuilder::add_document (790)</title></rect><text x="13.0" y="100" font-size="11">rustlucene_core::segment_builder::SegmentBuilder::add_document</text>
+<rect x="10.0" y="104" width="357.8" height="15" fill="hsl(323,45%,60%)"><title>rustlucene_core::doc_writer::TermDict::lookup_or_insert_flag (285)</title></rect><text x="13.0" y="116" font-size="11">rustlucene_core::doc_writer::TermDict::lookup_or_insert</text>
+<rect x="368.3" y="104" width="170.5" height="15" fill="hsl(137,45%,60%)"><title>alloc::raw_vec::RawVec&lt;T,A&gt;::grow_one (136)</title></rect><text x="371.3" y="116" font-size="11">alloc::raw_vec::RawVec&lt;T,A</text>
+<rect x="368.3" y="120" width="170.5" height="15" fill="hsl(116,45%,60%)"><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow (134)</title></rect><text x="371.3" y="132" font-size="11">alloc::raw_vec::RawVecInne</text>
+<rect x="368.3" y="136" width="170.5" height="15" fill="hsl(28,80%,65%)"><title>realloc (132)</title></rect><text x="371.3" y="148" font-size="11">realloc</text>
+<rect x="368.3" y="152" width="170.5" height="15" fill="hsl(38,80%,65%)"><title>__mprotect (48)</title></rect><text x="371.3" y="164" font-size="11">__mprotect</text>
+<rect x="539.3" y="104" width="64.9" height="15" fill="hsl(36,45%,60%)"><title>codec_lucene9::stored_fields::StoredFieldsWriter::flush (52)</title></rect><text x="542.3" y="116" font-size="11">codec_luce</text>
+<rect x="539.3" y="120" width="63.6" height="15" fill="hsl(206,45%,60%)"><title>codec_lucene9::stored_fields::compress_lz4 (51)</title></rect><text x="542.3" y="132" font-size="11">codec_luc</text>
+<rect x="539.3" y="136" width="54.8" height="15" fill="hsl(3,45%,60%)"><title>codec_lucene9::io::ChecksumIndexOutput::write_bytes (44)</title></rect><text x="542.3" y="148" font-size="11">codec_lu</text>
+<rect x="539.3" y="152" width="48.5" height="15" fill="hsl(155,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::write_all_cold (39)</title></rect><text x="542.3" y="164" font-size="11">std::io</text>
+<rect x="539.3" y="168" width="48.5" height="15" fill="hsl(357,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::flush_buf (36)</title></rect><text x="542.3" y="180" font-size="11">std::io</text>
+<rect x="539.3" y="184" width="48.5" height="15" fill="hsl(45,80%,65%)"><title>write (36)</title></rect><text x="542.3" y="196" font-size="11">write</text>
+<rect x="588.3" y="152" width="5.8" height="15" fill="hsl(317,45%,60%)"><title>crc32fast::specialized::pclmulqdq::calculate (5)</title></rect>
+<rect x="594.6" y="136" width="7.0" height="15" fill="hsl(104,45%,60%)"><title>codec_lucene9::stored_fields::lz4_block_compress (6)</title></rect>
+<rect x="594.6" y="152" width="7.0" height="15" fill="hsl(113,45%,60%)"><title>lz4::block::compress (6)</title></rect>
+<rect x="594.6" y="168" width="7.0" height="15" fill="hsl(47,80%,65%)"><title>__libc_calloc (5)</title></rect>
+<rect x="594.6" y="184" width="7.0" height="15" fill="hsl(38,80%,65%)"><title>__mprotect (4)</title></rect>
+<rect x="602.1" y="136" width="0.8" height="15" fill="hsl(261,45%,60%)"><title>codec_lucene9::io::ChecksumIndexOutput::write_vint (1)</title></rect>
+<rect x="602.1" y="152" width="0.8" height="15" fill="hsl(36,45%,60%)"><title>crc32fast::baseline::update_fast_16 (1)</title></rect>
+<rect x="603.4" y="120" width="0.8" height="15" fill="hsl(285,45%,60%)"><title>codec_lucene9::stored_fields::save_ints (1)</title></rect>
+<rect x="604.7" y="104" width="10.8" height="15" fill="hsl(47,80%,65%)"><title>cfree (9)</title></rect>
+<rect x="616.0" y="104" width="7.0" height="15" fill="hsl(296,45%,60%)"><title>codec_lucene9::stored_fields::StoredFieldsWriter::write_field (6)</title></rect>
+<rect x="623.5" y="88" width="129.2" height="15" fill="hsl(251,45%,60%)"><title>rustlucene_cli::gen_message (167)</title></rect><text x="626.5" y="100" font-size="11">rustlucene_cli::gen</text>
+<rect x="623.5" y="104" width="129.2" height="15" fill="hsl(42,80%,65%)"><title>malloc (4)</title></rect><text x="626.5" y="116" font-size="11">malloc</text>
+<rect x="753.2" y="88" width="15.0" height="15" fill="hsl(83,45%,60%)"><title>rustlucene_core::segment_builder::SegmentBuilder::finalize (20)</title></rect>
+<rect x="753.2" y="104" width="7.7" height="15" fill="hsl(292,45%,60%)"><title>core::ptr::drop_glue&lt;core::option::Option&lt;rustlucene_core::doc_writer::FieldBuf&gt;&gt; (10)</title></rect>
+<rect x="753.2" y="120" width="7.7" height="15" fill="hsl(319,45%,60%)"><title>core::ptr::drop_glue&lt;core::option::Option&lt;rustlucene_core::doc_writer::TermDict&gt;&gt; (10)</title></rect>
+<rect x="753.2" y="136" width="7.7" height="15" fill="hsl(47,80%,65%)"><title>cfree (10)</title></rect>
+<rect x="753.2" y="152" width="7.7" height="15" fill="hsl(25,80%,65%)"><title>__madvise (8)</title></rect>
+<rect x="761.4" y="104" width="6.0" height="15" fill="hsl(47,45%,60%)"><title>&lt;std[1e3c4ec04c5261a9]::fs::File&gt;::sync_data (8)</title></rect>
+<rect x="761.4" y="120" width="6.0" height="15" fill="hsl(47,80%,65%)"><title>fdatasync (8)</title></rect>
+<rect x="767.9" y="104" width="0.5" height="15" fill="hsl(101,45%,60%)"><title>codec_lucene9::directory::FSDirectory::create_output (1)</title></rect>
+<rect x="767.9" y="120" width="0.5" height="15" fill="hsl(32,45%,60%)"><title>&lt;std[1e3c4ec04c5261a9]::fs::OpenOptions&gt;::_open (1)</title></rect>
+<rect x="767.9" y="136" width="0.5" height="15" fill="hsl(40,45%,60%)"><title>&lt;std[1e3c4ec04c5261a9]::sys::fs::unix::File&gt;::open_c (1)</title></rect>
+<rect x="767.9" y="152" width="0.5" height="15" fill="hsl(30,80%,65%)"><title>open64 (1)</title></rect>
+<rect x="768.7" y="88" width="2.6" height="15" fill="hsl(137,45%,60%)"><title>alloc::raw_vec::RawVec&lt;T,A&gt;::grow_one (4)</title></rect>
+<rect x="768.7" y="104" width="2.6" height="15" fill="hsl(116,45%,60%)"><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow (4)</title></rect>
+<rect x="768.7" y="120" width="2.6" height="15" fill="hsl(42,80%,65%)"><title>malloc (2)</title></rect>
+<rect x="771.9" y="88" width="0.5" height="15" fill="hsl(42,80%,65%)"><title>malloc (1)</title></rect>
+<rect x="772.6" y="40" width="231.2" height="15" fill="hsl(83,45%,60%)"><title>rustlucene_core::segment_builder::SegmentBuilder::finalize (302)</title></rect><text x="775.6" y="52" font-size="11">rustlucene_core::segment_builder::S</text>
+<rect x="772.6" y="56" width="231.2" height="15" fill="hsl(75,45%,60%)"><title>codec_lucene9::postings::PostingsWriter::write_term (302)</title></rect><text x="775.6" y="68" font-size="11">codec_lucene9::postings::PostingsWr</text>
+<rect x="772.6" y="72" width="132.3" height="15" fill="hsl(151,45%,60%)"><title>codec_lucene9::io::IndexOutput::into_bytes (133)</title></rect><text x="775.6" y="84" font-size="11">codec_lucene9::io::I</text>
+<rect x="772.6" y="88" width="102.7" height="15" fill="hsl(47,80%,65%)"><title>cfree (101)</title></rect><text x="775.6" y="100" font-size="11">cfree</text>
+<rect x="772.6" y="104" width="102.7" height="15" fill="hsl(25,80%,65%)"><title>__madvise (95)</title></rect><text x="775.6" y="116" font-size="11">__madvise</text>
+<rect x="875.8" y="88" width="13.8" height="15" fill="hsl(357,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::flush_buf (14)</title></rect>
+<rect x="875.8" y="104" width="13.8" height="15" fill="hsl(200,45%,60%)"><title>alloc::raw_vec::RawVecInner&lt;A&gt;::reserve::do_reserve_and_handle (10)</title></rect>
+<rect x="875.8" y="120" width="13.8" height="15" fill="hsl(116,45%,60%)"><title>alloc::raw_vec::RawVecInner&lt;A&gt;::finish_grow (8)</title></rect>
+<rect x="875.8" y="136" width="13.8" height="15" fill="hsl(42,80%,65%)"><title>malloc (7)</title></rect>
+<rect x="890.1" y="88" width="8.7" height="15" fill="hsl(42,80%,65%)"><title>malloc (9)</title></rect>
+<rect x="899.3" y="88" width="5.6" height="15" fill="hsl(189,45%,60%)"><title>core::ptr::drop_glue&lt;std::io::buffered::bufwriter::BufWriter&lt;codec_lucene9::io::Sink&gt;&gt; (6)</title></rect>
+<rect x="899.3" y="104" width="5.6" height="15" fill="hsl(47,80%,65%)"><title>cfree (6)</title></rect>
+<rect x="905.5" y="72" width="33.5" height="15" fill="hsl(42,80%,65%)"><title>malloc (34)</title></rect><text x="908.5" y="84" font-size="11">mallo</text>
+<rect x="939.4" y="72" width="13.5" height="15" fill="hsl(353,45%,60%)"><title>codec_lucene9::postings_ll::for_util_encode_primitive (14)</title></rect>
+<rect x="953.4" y="72" width="12.5" height="15" fill="hsl(155,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::write_all_cold (13)</title></rect>
+<rect x="953.4" y="88" width="12.5" height="15" fill="hsl(357,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::flush_buf (13)</title></rect>
+<rect x="953.4" y="104" width="12.5" height="15" fill="hsl(45,80%,65%)"><title>write (13)</title></rect>
+<rect x="966.4" y="72" width="10.5" height="15" fill="hsl(165,45%,60%)"><title>core::slice::sort::unstable::quicksort::quicksort (11)</title></rect>
+<rect x="966.4" y="88" width="10.5" height="15" fill="hsl(165,45%,60%)"><title>core::slice::sort::unstable::quicksort::quicksort (1)</title></rect>
+<rect x="977.4" y="72" width="8.5" height="15" fill="hsl(211,45%,60%)"><title>codec_lucene9::postings::PostingsWriter::push_term_boundary (9)</title></rect>
+<rect x="977.4" y="88" width="8.5" height="15" fill="hsl(273,45%,60%)"><title>codec_lucene9::postings::PostingsWriter::write_blocks (8)</title></rect>
+<rect x="977.4" y="104" width="8.5" height="15" fill="hsl(158,45%,60%)"><title>codec_lucene9::postings::PostingsWriter::write_block (8)</title></rect>
+<rect x="977.4" y="120" width="8.5" height="15" fill="hsl(151,45%,60%)"><title>codec_lucene9::io::IndexOutput::into_bytes (4)</title></rect>
+<rect x="977.4" y="136" width="6.2" height="15" fill="hsl(47,80%,65%)"><title>cfree (3)</title></rect>
+<rect x="977.4" y="152" width="6.2" height="15" fill="hsl(25,80%,65%)"><title>__madvise (3)</title></rect>
+<rect x="984.1" y="136" width="1.7" height="15" fill="hsl(189,45%,60%)"><title>core::ptr::drop_glue&lt;std::io::buffered::bufwriter::BufWriter&lt;codec_lucene9::io::Sink&gt;&gt; (1)</title></rect>
+<rect x="984.1" y="152" width="1.7" height="15" fill="hsl(357,45%,60%)"><title>std::io::buffered::bufwriter::BufWriter&lt;W&gt;::flush_buf (1)</title></rect>
+<rect x="986.4" y="72" width="8.5" height="15" fill="hsl(278,45%,60%)"><title>core::slice::sort::unstable::ipnsort (9)</title></rect>
+<rect x="995.3" y="72" width="4.5" height="15" fill="hsl(47,80%,65%)"><title>cfree (5)</title></rect>
+<rect x="1000.3" y="72" width="1.5" height="15" fill="hsl(36,45%,60%)"><title>crc32fast::baseline::update_fast_16 (2)</title></rect>
+<rect x="1002.3" y="72" width="1.5" height="15" fill="hsl(317,45%,60%)"><title>crc32fast::specialized::pclmulqdq::calculate (2)</title></rect>
+<rect x="1004.3" y="40" width="183.6" height="15" fill="hsl(44,80%,65%)"><title>LZ4_compress_fast (240)</title></rect><text x="1007.3" y="52" font-size="11">LZ4_compress_fast</text>
+<rect x="1004.3" y="56" width="183.6" height="15" fill="hsl(29,80%,65%)"><title>LZ4_compress_fast_extState (240)</title></rect><text x="1007.3" y="68" font-size="11">LZ4_compress_fast_extState</text>
+<rect x="1188.5" y="40" width="1.0" height="15" fill="hsl(19,80%,65%)"><title>__libc_start_main (2)</title></rect>
+<rect x="1188.5" y="56" width="1.0" height="15" fill="hsl(31,80%,65%)"><title>main (2)</title></rect>
+<rect x="1188.5" y="72" width="1.0" height="15" fill="hsl(220,45%,60%)"><title>std::sys::backtrace::__rust_begin_short_backtrace (2)</title></rect>
+<rect x="1188.5" y="88" width="1.0" height="15" fill="hsl(242,45%,60%)"><title>rustlucene_cli::main (2)</title></rect>
+<rect x="1188.5" y="104" width="0.5" height="15" fill="hsl(13,45%,60%)"><title>&lt;std[1e3c4ec04c5261a9]::sys::thread::unix::Thread&gt;::new (1)</title></rect>
+<rect x="1188.5" y="120" width="0.5" height="15" fill="hsl(37,80%,65%)"><title>pthread_create (1)</title></rect>
+<rect x="1188.5" y="136" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>__mprotect (1)</title></rect>
+<rect x="1189.2" y="104" width="0.5" height="15" fill="hsl(84,45%,60%)"><title>rustlucene_core::index_writer::commit_segments (1)</title></rect>
+<rect x="1189.2" y="120" width="0.5" height="15" fill="hsl(119,45%,60%)"><title>core::ptr::drop_glue&lt;codec_lucene9::segment_infos::SegmentInfos&gt; (1)</title></rect>
+<rect x="1189.2" y="136" width="0.5" height="15" fill="hsl(261,45%,60%)"><title>core::ptr::drop_glue&lt;codec_lucene9::segment_infos::SegmentCommitInfo&gt; (1)</title></rect>
+<rect x="1189.2" y="152" width="0.5" height="15" fill="hsl(249,45%,60%)"><title>core::ptr::drop_glue&lt;codec_lucene9::segment_info::SegmentInfo&gt; (1)</title></rect>
+<rect x="1189.2" y="168" width="0.5" height="15" fill="hsl(65,45%,60%)"><title>alloc::collections::btree::map::IntoIter&lt;K,V,A&gt;::dying_next (1)</title></rect>
+<rect x="1189.2" y="184" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>cfree (1)</title></rect>
+<rect x="1189.2" y="200" width="0.5" height="15" fill="hsl(25,80%,65%)"><title>__madvise (1)</title></rect>
+</svg>

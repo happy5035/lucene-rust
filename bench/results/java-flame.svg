@@ -1,0 +1,451 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="130" font-family="monospace">
+<text x="10" y="24" font-size="16">Java Lucene 9.12.3 index write (4 threads, JFR, 1855 samples) (samples=1855)</text>
+<rect x="10.0" y="40" width="204.3" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invert (322)</title></rect><text x="13.0" y="52" font-size="11">org.apache.lucene.index.Indexin</text>
+<rect x="10.0" y="56" width="204.3" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invertTokenStream (322)</title></rect><text x="13.0" y="68" font-size="11">org.apache.lucene.index.Indexin</text>
+<rect x="10.0" y="72" width="137.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.add (217)</title></rect><text x="13.0" y="84" font-size="11">org.apache.lucene.ind</text>
+<rect x="10.0" y="88" width="85.4" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.add (135)</title></rect><text x="13.0" y="100" font-size="11">org.apache.lu</text>
+<rect x="10.0" y="104" width="85.4" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.findHash (135)</title></rect><text x="13.0" y="116" font-size="11">org.apache.lu</text>
+<rect x="95.9" y="88" width="51.0" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.positionStreamSlice (81)</title></rect><text x="98.9" y="100" font-size="11">org.apa</text>
+<rect x="95.9" y="104" width="51.0" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.addTerm (81)</title></rect><text x="98.9" y="116" font-size="11">org.apa</text>
+<rect x="147.4" y="88" width="0.5" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.initStreamSlices (1)</title></rect>
+<rect x="147.4" y="104" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.newTerm (1)</title></rect>
+<rect x="148.0" y="72" width="49.8" height="15" fill="hsl(32,80%,65%)"><title>org.apache.lucene.analysis.tokenattributes.CharTermAttributeImpl.getBytesRef (79)</title></rect><text x="151.0" y="84" font-size="11">org.apa</text>
+<rect x="148.0" y="88" width="49.8" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.util.BytesRefBuilder.copyChars (79)</title></rect><text x="151.0" y="100" font-size="11">org.apa</text>
+<rect x="148.0" y="104" width="47.8" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (76)</title></rect><text x="151.0" y="116" font-size="11">org.apa</text>
+<rect x="196.4" y="104" width="0.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRefBuilder.grow (2)</title></rect>
+<rect x="197.7" y="104" width="0.5" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.maxUTF8Length (1)</title></rect>
+<rect x="198.3" y="72" width="11.6" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.analysis.util.CharTokenizer.incrementToken (19)</title></rect>
+<rect x="198.3" y="88" width="6.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.util.AttributeSource.clearAttributes (11)</title></rect>
+<rect x="198.3" y="104" width="6.5" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.util.AttributeSource.getCurrentState (11)</title></rect>
+<rect x="205.3" y="88" width="4.0" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.analysis.core.WhitespaceTokenizer.isTokenChar (7)</title></rect>
+<rect x="205.3" y="104" width="4.0" height="15" fill="hsl(30,80%,65%)"><title>java.lang.Character.isWhitespace (7)</title></rect>
+<rect x="209.7" y="88" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.fill (1)</title></rect>
+<rect x="209.7" y="104" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.fill (1)</title></rect>
+<rect x="210.4" y="72" width="2.7" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.start (5)</title></rect>
+<rect x="210.4" y="88" width="2.7" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.start (5)</title></rect>
+<rect x="210.4" y="104" width="2.7" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.TermVectorsConsumerPerField.start (5)</title></rect>
+<rect x="213.6" y="72" width="0.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.analysis.util.CharTokenizer.end (2)</title></rect>
+<rect x="213.6" y="88" width="0.8" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.analysis.TokenStream.end (2)</title></rect>
+<rect x="213.6" y="104" width="0.8" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.util.AttributeSource.endAttributes (2)</title></rect>
+<rect x="214.8" y="40" width="138.8" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processDocument (219)</title></rect><text x="217.8" y="52" font-size="11">org.apache.lucene.ind</text>
+<rect x="214.8" y="56" width="138.2" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processField (218)</title></rect><text x="217.8" y="68" font-size="11">org.apache.lucene.ind</text>
+<rect x="214.8" y="72" width="138.2" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invert (218)</title></rect><text x="217.8" y="84" font-size="11">org.apache.lucene.ind</text>
+<rect x="214.8" y="88" width="138.2" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invertTokenStream (218)</title></rect><text x="217.8" y="100" font-size="11">org.apache.lucene.ind</text>
+<rect x="214.8" y="104" width="119.7" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.analysis.util.CharTokenizer.incrementToken (189)</title></rect><text x="217.8" y="116" font-size="11">org.apache.lucene.</text>
+<rect x="335.1" y="104" width="11.0" height="15" fill="hsl(32,80%,65%)"><title>org.apache.lucene.analysis.tokenattributes.CharTermAttributeImpl.getBytesRef (18)</title></rect>
+<rect x="346.5" y="104" width="5.2" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.start (9)</title></rect>
+<rect x="352.2" y="104" width="0.5" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.analysis.Tokenizer.close (1)</title></rect>
+<rect x="352.9" y="104" width="0.5" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.index.FieldInvertState.setAttributeSource (1)</title></rect>
+<rect x="353.5" y="56" width="0.5" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexingChain.finishStoredFields (1)</title></rect>
+<rect x="353.5" y="72" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.finishDocument (1)</title></rect>
+<rect x="353.5" y="88" width="0.5" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.finishDocument (1)</title></rect>
+<rect x="353.5" y="104" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.size (1)</title></rect>
+<rect x="354.1" y="40" width="115.9" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.doCompress (183)</title></rect><text x="357.1" y="52" font-size="11">org.apache.lucene</text>
+<rect x="354.1" y="56" width="115.9" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.compressWithDictionary (183)</title></rect><text x="357.1" y="68" font-size="11">org.apache.lucene</text>
+<rect x="354.1" y="72" width="110.2" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.encodeSequence (174)</title></rect><text x="357.1" y="84" font-size="11">org.apache.lucene</text>
+<rect x="354.1" y="88" width="109.5" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.encodeLiterals (173)</title></rect><text x="357.1" y="100" font-size="11">org.apache.lucen</text>
+<rect x="354.1" y="104" width="109.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (173)</title></rect><text x="357.1" y="116" font-size="11">org.apache.lucen</text>
+<rect x="464.2" y="88" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeShort (1)</title></rect>
+<rect x="464.2" y="104" width="0.5" height="15" fill="hsl(33,80%,65%)"><title>java.nio.HeapByteBuffer.putShort (1)</title></rect>
+<rect x="464.8" y="72" width="4.0" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.commonBytes (7)</title></rect>
+<rect x="464.8" y="88" width="4.0" height="15" fill="hsl(12,80%,65%)"><title>java.util.Arrays.mismatch (7)</title></rect>
+<rect x="464.8" y="104" width="4.0" height="15" fill="hsl(19,80%,65%)"><title>jdk.internal.util.ArraysSupport.mismatch (7)</title></rect>
+<rect x="469.3" y="72" width="0.8" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.util.compress.LZ4$FastCompressionHashTable.initDictionary (2)</title></rect>
+<rect x="469.3" y="88" width="0.8" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.readInt (2)</title></rect>
+<rect x="469.3" y="104" width="0.8" height="15" fill="hsl(11,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.get (2)</title></rect>
+<rect x="470.5" y="40" width="89.8" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeString (142)</title></rect><text x="473.5" y="52" font-size="11">org.apache.lu</text>
+<rect x="470.5" y="56" width="89.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRef.&lt;init&gt; (142)</title></rect><text x="473.5" y="68" font-size="11">org.apache.lu</text>
+<rect x="470.5" y="72" width="89.8" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (142)</title></rect><text x="473.5" y="84" font-size="11">org.apache.lu</text>
+<rect x="470.5" y="88" width="89.8" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (142)</title></rect><text x="473.5" y="100" font-size="11">org.apache.lu</text>
+<rect x="470.5" y="104" width="89.8" height="15" fill="hsl(10,80%,65%)"><title>java.lang.String.charAt (142)</title></rect><text x="473.5" y="116" font-size="11">java.lang.Str</text>
+<rect x="560.9" y="40" width="86.0" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invertTokenStream (136)</title></rect><text x="563.9" y="52" font-size="11">org.apache.lu</text>
+<rect x="560.9" y="56" width="77.7" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.add (123)</title></rect><text x="563.9" y="68" font-size="11">org.apache.l</text>
+<rect x="560.9" y="72" width="77.7" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.positionStreamSlice (123)</title></rect><text x="563.9" y="84" font-size="11">org.apache.l</text>
+<rect x="560.9" y="88" width="77.7" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.addTerm (123)</title></rect><text x="563.9" y="100" font-size="11">org.apache.l</text>
+<rect x="560.9" y="104" width="77.7" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.writeVInt (123)</title></rect><text x="563.9" y="116" font-size="11">org.apache.l</text>
+<rect x="639.1" y="56" width="5.9" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.analysis.util.CharTokenizer.incrementToken (10)</title></rect>
+<rect x="639.1" y="72" width="5.2" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.fill (9)</title></rect>
+<rect x="639.1" y="88" width="5.2" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.fill (9)</title></rect>
+<rect x="639.1" y="104" width="5.2" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.readFully (9)</title></rect>
+<rect x="644.8" y="72" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.analysis.core.WhitespaceTokenizer.isTokenChar (1)</title></rect>
+<rect x="644.8" y="88" width="0.5" height="15" fill="hsl(30,80%,65%)"><title>java.lang.Character.isWhitespace (1)</title></rect>
+<rect x="644.8" y="104" width="0.5" height="15" fill="hsl(44,80%,65%)"><title>java.lang.CharacterData.of (1)</title></rect>
+<rect x="645.5" y="56" width="0.8" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.start (2)</title></rect>
+<rect x="645.5" y="72" width="0.8" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.start (2)</title></rect>
+<rect x="645.5" y="88" width="0.8" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.TermVectorsConsumerPerField.start (2)</title></rect>
+<rect x="645.5" y="104" width="0.8" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.start (2)</title></rect>
+<rect x="646.8" y="56" width="0.5" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.index.FieldInvertState.setAttributeSource (1)</title></rect>
+<rect x="646.8" y="72" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.util.AttributeSource.addAttribute (1)</title></rect>
+<rect x="646.8" y="88" width="0.5" height="15" fill="hsl(45,80%,65%)"><title>java.util.LinkedHashMap.get (1)</title></rect>
+<rect x="646.8" y="104" width="0.5" height="15" fill="hsl(36,80%,65%)"><title>java.util.HashMap.getNode (1)</title></rect>
+<rect x="647.4" y="40" width="80.3" height="15" fill="hsl(39,80%,65%)"><title>JavaWarmupBench.lambda$round$0 (127)</title></rect><text x="650.4" y="52" font-size="11">JavaWarmupBe</text>
+<rect x="647.4" y="56" width="77.7" height="15" fill="hsl(21,80%,65%)"><title>JavaWarmupBench.genMessage (123)</title></rect><text x="650.4" y="68" font-size="11">JavaWarmupBe</text>
+<rect x="647.4" y="72" width="77.1" height="15" fill="hsl(38,80%,65%)"><title>java.lang.StringBuilder.append (122)</title></rect><text x="650.4" y="84" font-size="11">java.lang.S</text>
+<rect x="647.4" y="88" width="77.1" height="15" fill="hsl(18,80%,65%)"><title>java.lang.AbstractStringBuilder.append (122)</title></rect><text x="650.4" y="100" font-size="11">java.lang.A</text>
+<rect x="647.4" y="104" width="77.1" height="15" fill="hsl(47,80%,65%)"><title>java.lang.AbstractStringBuilder.ensureCapacityInternal (122)</title></rect><text x="650.4" y="116" font-size="11">java.lang.A</text>
+<rect x="725.0" y="72" width="0.5" height="15" fill="hsl(28,80%,65%)"><title>java.lang.StringBuilder.setLength (1)</title></rect>
+<rect x="725.0" y="88" width="0.5" height="15" fill="hsl(48,80%,65%)"><title>java.lang.AbstractStringBuilder.setLength (1)</title></rect>
+<rect x="725.0" y="104" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>java.lang.AbstractStringBuilder.ensureCapacityInternal (1)</title></rect>
+<rect x="725.6" y="56" width="2.0" height="15" fill="hsl(19,80%,65%)"><title>org.apache.lucene.index.IndexWriter.addDocument (4)</title></rect>
+<rect x="725.6" y="72" width="2.0" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocument (4)</title></rect>
+<rect x="725.6" y="88" width="2.0" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocuments (4)</title></rect>
+<rect x="725.6" y="104" width="2.0" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.updateDocuments (4)</title></rect>
+<rect x="728.2" y="40" width="65.0" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processField (103)</title></rect><text x="731.2" y="52" font-size="11">org.apache</text>
+<rect x="728.2" y="56" width="62.5" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invert (99)</title></rect><text x="731.2" y="68" font-size="11">org.apach</text>
+<rect x="728.2" y="72" width="62.5" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invertTokenStream (99)</title></rect><text x="731.2" y="84" font-size="11">org.apach</text>
+<rect x="728.2" y="88" width="27.5" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.analysis.util.CharTokenizer.incrementToken (44)</title></rect>
+<rect x="728.2" y="104" width="13.5" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.analysis.CharacterUtils.fill (22)</title></rect>
+<rect x="742.2" y="104" width="9.7" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.util.AttributeSource.clearAttributes (16)</title></rect>
+<rect x="752.4" y="104" width="2.7" height="15" fill="hsl(47,80%,65%)"><title>java.lang.Character.codePointAt (5)</title></rect>
+<rect x="755.5" y="104" width="0.5" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.analysis.Tokenizer.correctOffset (1)</title></rect>
+<rect x="756.2" y="88" width="24.3" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.add (39)</title></rect>
+<rect x="756.2" y="104" width="13.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.positionStreamSlice (22)</title></rect>
+<rect x="770.2" y="104" width="10.3" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.add (17)</title></rect>
+<rect x="781.0" y="88" width="7.1" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.start (12)</title></rect>
+<rect x="781.0" y="104" width="7.1" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.start (12)</title></rect>
+<rect x="788.6" y="88" width="0.8" height="15" fill="hsl(32,80%,65%)"><title>org.apache.lucene.analysis.tokenattributes.CharTermAttributeImpl.getBytesRef (2)</title></rect>
+<rect x="788.6" y="104" width="0.8" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.util.BytesRefBuilder.copyChars (2)</title></rect>
+<rect x="789.9" y="88" width="0.8" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.index.FieldInvertState.setAttributeSource (2)</title></rect>
+<rect x="789.9" y="104" width="0.8" height="15" fill="hsl(21,80%,65%)"><title>org.apache.lucene.util.AttributeSource.getAttribute (2)</title></rect>
+<rect x="791.2" y="56" width="2.0" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.writeField (4)</title></rect>
+<rect x="791.2" y="72" width="2.0" height="15" fill="hsl(37,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.writeField (4)</title></rect>
+<rect x="791.2" y="88" width="2.0" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeString (4)</title></rect>
+<rect x="791.2" y="104" width="0.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRef.&lt;init&gt; (2)</title></rect>
+<rect x="792.4" y="104" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (1)</title></rect>
+<rect x="793.1" y="104" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeVInt (1)</title></rect>
+<rect x="793.7" y="40" width="63.1" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.writeVInt (100)</title></rect><text x="796.7" y="52" font-size="11">org.apach</text>
+<rect x="793.7" y="56" width="63.1" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.writeByte (100)</title></rect><text x="796.7" y="68" font-size="11">org.apach</text>
+<rect x="793.7" y="72" width="63.1" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.ByteSlicePool.allocSlice (100)</title></rect><text x="796.7" y="84" font-size="11">org.apach</text>
+<rect x="793.7" y="88" width="63.1" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.index.ByteSlicePool.allocKnownSizeSlice (100)</title></rect><text x="796.7" y="100" font-size="11">org.apach</text>
+<rect x="793.7" y="104" width="63.1" height="15" fill="hsl(23,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.set (100)</title></rect><text x="796.7" y="116" font-size="11">java.lang</text>
+<rect x="857.3" y="40" width="54.2" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.updateDocuments (86)</title></rect><text x="860.3" y="52" font-size="11">org.apac</text>
+<rect x="857.3" y="56" width="54.2" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processDocument (86)</title></rect><text x="860.3" y="68" font-size="11">org.apac</text>
+<rect x="857.3" y="72" width="53.6" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processField (85)</title></rect><text x="860.3" y="84" font-size="11">org.apac</text>
+<rect x="857.3" y="88" width="51.7" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invert (82)</title></rect><text x="860.3" y="100" font-size="11">org.apac</text>
+<rect x="857.3" y="104" width="51.7" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invertTokenStream (82)</title></rect><text x="860.3" y="116" font-size="11">org.apac</text>
+<rect x="909.5" y="88" width="0.8" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.document.Field.storedValue (2)</title></rect>
+<rect x="909.5" y="104" width="0.8" height="15" fill="hsl(17,80%,65%)"><title>java.lang.String.valueOf (2)</title></rect>
+<rect x="910.7" y="88" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.writeField (1)</title></rect>
+<rect x="910.7" y="104" width="0.5" height="15" fill="hsl(37,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.writeField (1)</title></rect>
+<rect x="911.4" y="72" width="0.5" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.finish (1)</title></rect>
+<rect x="911.4" y="88" width="0.5" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriterPerField.finish (1)</title></rect>
+<rect x="911.4" y="104" width="0.5" height="15" fill="hsl(36,80%,65%)"><title>org.apache.lucene.index.FieldInfo.setStorePayloads (1)</title></rect>
+<rect x="912.0" y="40" width="26.2" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocument (42)</title></rect>
+<rect x="912.0" y="56" width="26.2" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocuments (42)</title></rect>
+<rect x="912.0" y="72" width="26.2" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.updateDocuments (42)</title></rect>
+<rect x="912.0" y="88" width="17.3" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.isFlushPending (28)</title></rect>
+<rect x="912.0" y="104" width="17.3" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.SetOnce.get (28)</title></rect>
+<rect x="929.8" y="88" width="7.1" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.updateDocuments (12)</title></rect>
+<rect x="929.8" y="104" width="7.1" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processDocument (12)</title></rect>
+<rect x="937.5" y="88" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.postUpdate (1)</title></rect>
+<rect x="937.5" y="104" width="0.5" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.maybeFlush (1)</title></rect>
+<rect x="938.1" y="88" width="0.5" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.preUpdate (1)</title></rect>
+<rect x="938.1" y="104" width="0.5" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.maybeFlush (1)</title></rect>
+<rect x="938.7" y="40" width="25.6" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocuments (41)</title></rect>
+<rect x="938.7" y="56" width="25.6" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.updateDocuments (41)</title></rect>
+<rect x="938.7" y="72" width="16.7" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThreadPool.marksAsFreeAndUnlock (27)</title></rect>
+<rect x="938.7" y="88" width="16.7" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.index.LockableConcurrentApproximatePriorityQueue.addAndUnlock (27)</title></rect>
+<rect x="938.7" y="104" width="16.0" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.index.ConcurrentApproximatePriorityQueue.add (26)</title></rect>
+<rect x="955.3" y="104" width="0.5" height="15" fill="hsl(43,80%,65%)"><title>java.util.concurrent.atomic.AtomicInteger.incrementAndGet (1)</title></rect>
+<rect x="955.9" y="72" width="3.3" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterFlushControl.obtainAndLock (6)</title></rect>
+<rect x="955.9" y="88" width="3.3" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThreadPool.getAndLock (6)</title></rect>
+<rect x="955.9" y="104" width="3.3" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.index.LockableConcurrentApproximatePriorityQueue.lockAndPoll (6)</title></rect>
+<rect x="959.7" y="72" width="3.3" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.updateDocuments (6)</title></rect>
+<rect x="959.7" y="88" width="3.3" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processDocument (6)</title></rect>
+<rect x="959.7" y="104" width="0.8" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexingChain.finishStoredFields (2)</title></rect>
+<rect x="961.0" y="104" width="0.8" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.TermsHash.finishDocument (2)</title></rect>
+<rect x="962.3" y="104" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.reset (1)</title></rect>
+<rect x="962.9" y="104" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processField (1)</title></rect>
+<rect x="963.5" y="72" width="0.8" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.unlock (2)</title></rect>
+<rect x="963.5" y="88" width="0.8" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock.unlock (2)</title></rect>
+<rect x="963.5" y="104" width="0.8" height="15" fill="hsl(43,80%,65%)"><title>java.util.concurrent.locks.AbstractQueuedSynchronizer.release (2)</title></rect>
+<rect x="964.8" y="40" width="23.7" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.add (38)</title></rect>
+<rect x="964.8" y="56" width="23.7" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.add (38)</title></rect>
+<rect x="964.8" y="72" width="23.7" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.findHash (38)</title></rect>
+<rect x="964.8" y="88" width="23.7" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.doHash (38)</title></rect>
+<rect x="964.8" y="104" width="23.7" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.util.StringHelper.murmurhash3_x86_32 (38)</title></rect>
+<rect x="989.0" y="40" width="21.8" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.FreqProxTermsWriter.flush (35)</title></rect>
+<rect x="989.0" y="56" width="21.8" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.codecs.perfield.PerFieldPostingsFormat$FieldsWriter.write (35)</title></rect>
+<rect x="989.0" y="72" width="21.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter.write (35)</title></rect>
+<rect x="989.0" y="88" width="20.5" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.write (33)</title></rect>
+<rect x="989.0" y="104" width="20.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.codecs.PushPostingsWriterBase.writeTerm (33)</title></rect>
+<rect x="1010.0" y="88" width="0.8" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.finish (2)</title></rect>
+<rect x="1010.0" y="104" width="0.5" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.writeBlocks (1)</title></rect>
+<rect x="1010.6" y="104" width="0.5" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.util.FixedBitSet.cardinality (1)</title></rect>
+<rect x="1011.3" y="40" width="19.2" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.write (31)</title></rect>
+<rect x="1011.3" y="56" width="19.2" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.codecs.PushPostingsWriterBase.writeTerm (31)</title></rect>
+<rect x="1011.3" y="72" width="16.0" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.index.FreqProxFields$FreqProxDocsEnum.nextDoc (26)</title></rect>
+<rect x="1011.3" y="88" width="16.0" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.store.DataInput.readVInt (26)</title></rect>
+<rect x="1011.3" y="104" width="16.0" height="15" fill="hsl(21,80%,65%)"><title>org.apache.lucene.index.ByteSliceReader.readByte (26)</title></rect>
+<rect x="1027.8" y="72" width="2.7" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.startDoc (5)</title></rect>
+<rect x="1027.8" y="88" width="2.7" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.flushDocBlock (5)</title></rect>
+<rect x="1027.8" y="104" width="1.4" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PForUtil.encode (3)</title></rect>
+<rect x="1029.7" y="104" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForDeltaUtil.encodeDeltas (1)</title></rect>
+<rect x="1030.3" y="104" width="0.5" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.writeImpacts (1)</title></rect>
+<rect x="1031.0" y="40" width="18.6" height="15" fill="hsl(32,80%,65%)"><title>java.util.ArrayList.add (30)</title></rect>
+<rect x="1031.0" y="56" width="18.6" height="15" fill="hsl(32,80%,65%)"><title>java.util.ArrayList.add (30)</title></rect>
+<rect x="1031.0" y="72" width="18.6" height="15" fill="hsl(22,80%,65%)"><title>java.util.ArrayList.grow (30)</title></rect>
+<rect x="1031.0" y="88" width="18.6" height="15" fill="hsl(22,80%,65%)"><title>java.util.ArrayList.grow (30)</title></rect>
+<rect x="1031.0" y="104" width="18.6" height="15" fill="hsl(22,80%,65%)"><title>java.util.Arrays.copyOf (30)</title></rect>
+<rect x="1050.1" y="40" width="16.0" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.finishDocument (26)</title></rect>
+<rect x="1050.1" y="56" width="16.0" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.flush (26)</title></rect>
+<rect x="1050.1" y="72" width="15.4" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.compress (25)</title></rect>
+<rect x="1050.1" y="88" width="15.4" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.doCompress (25)</title></rect>
+<rect x="1050.1" y="104" width="15.4" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.compressWithDictionary (25)</title></rect>
+<rect x="1066.0" y="72" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.toDataInput (1)</title></rect>
+<rect x="1066.0" y="88" width="0.5" height="15" fill="hsl(36,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataInput.&lt;init&gt; (1)</title></rect>
+<rect x="1066.0" y="104" width="0.5" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataInput.ensureAssumptions (1)</title></rect>
+<rect x="1066.6" y="40" width="14.1" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.writeField (23)</title></rect>
+<rect x="1066.6" y="56" width="14.1" height="15" fill="hsl(37,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.writeField (23)</title></rect>
+<rect x="1066.6" y="72" width="14.1" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeString (23)</title></rect>
+<rect x="1066.6" y="88" width="9.7" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRef.&lt;init&gt; (16)</title></rect>
+<rect x="1066.6" y="104" width="7.1" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (12)</title></rect>
+<rect x="1074.2" y="104" width="2.0" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRef.&lt;init&gt; (4)</title></rect>
+<rect x="1076.8" y="88" width="2.7" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeVInt (5)</title></rect>
+<rect x="1076.8" y="104" width="2.7" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeByte (5)</title></rect>
+<rect x="1080.0" y="88" width="0.8" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (2)</title></rect>
+<rect x="1080.0" y="104" width="0.8" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.appendBlock (2)</title></rect>
+<rect x="1081.2" y="40" width="12.9" height="15" fill="hsl(19,80%,65%)"><title>org.apache.lucene.index.IndexWriter.addDocument (21)</title></rect>
+<rect x="1081.2" y="56" width="12.9" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocument (21)</title></rect>
+<rect x="1081.2" y="72" width="12.9" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocuments (21)</title></rect>
+<rect x="1081.2" y="88" width="12.9" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.updateDocuments (21)</title></rect>
+<rect x="1081.2" y="104" width="12.2" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.updateDocuments (20)</title></rect>
+<rect x="1093.9" y="104" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>java.lang.invoke.DirectMethodHandle.allocateInstance (1)</title></rect>
+<rect x="1094.6" y="40" width="12.9" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.add (21)</title></rect>
+<rect x="1094.6" y="56" width="12.2" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.findHash (20)</title></rect>
+<rect x="1094.6" y="72" width="12.2" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.util.BytesRefBlockPool.equals (20)</title></rect>
+<rect x="1094.6" y="88" width="12.2" height="15" fill="hsl(49,80%,65%)"><title>java.util.Arrays.equals (20)</title></rect>
+<rect x="1094.6" y="104" width="12.2" height="15" fill="hsl(19,80%,65%)"><title>jdk.internal.util.ArraysSupport.mismatch (20)</title></rect>
+<rect x="1107.3" y="56" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.rehash (1)</title></rect>
+<rect x="1107.3" y="72" width="0.5" height="15" fill="hsl(25,80%,65%)"><title>org.apache.lucene.util.BytesRefBlockPool.hash (1)</title></rect>
+<rect x="1107.3" y="88" width="0.5" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.util.BytesRefHash.doHash (1)</title></rect>
+<rect x="1107.3" y="104" width="0.5" height="15" fill="hsl(11,80%,65%)"><title>org.apache.lucene.util.StringHelper.murmurhash3_x86_32 (1)</title></rect>
+<rect x="1107.9" y="40" width="11.0" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.flush (18)</title></rect>
+<rect x="1107.9" y="56" width="10.3" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.compress (17)</title></rect>
+<rect x="1107.9" y="72" width="10.3" height="15" fill="hsl(35,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.doCompress (17)</title></rect>
+<rect x="1107.9" y="88" width="10.3" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.compressWithDictionary (17)</title></rect>
+<rect x="1107.9" y="104" width="10.3" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.util.compress.LZ4$FastCompressionHashTable.initDictionary (17)</title></rect>
+<rect x="1118.8" y="56" width="0.5" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.writeHeader (1)</title></rect>
+<rect x="1118.8" y="72" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeVInt (1)</title></rect>
+<rect x="1118.8" y="88" width="0.5" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.store.OutputStreamIndexOutput.writeByte (1)</title></rect>
+<rect x="1118.8" y="104" width="0.5" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.store.OutputStreamIndexOutput$XBufferedOutputStream.write (1)</title></rect>
+<rect x="1119.4" y="40" width="10.3" height="15" fill="hsl(42,80%,65%)"><title>org.apache.lucene.index.DocumentsWriter.updateDocuments (17)</title></rect>
+<rect x="1119.4" y="56" width="9.0" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.updateDocuments (15)</title></rect>
+<rect x="1119.4" y="72" width="9.0" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processDocument (15)</title></rect>
+<rect x="1119.4" y="88" width="5.2" height="15" fill="hsl(12,80%,65%)"><title>org.apache.lucene.index.IndexingChain.getOrAddPerField (9)</title></rect>
+<rect x="1119.4" y="104" width="5.2" height="15" fill="hsl(14,80%,65%)"><title>java.lang.String.hashCode (9)</title></rect>
+<rect x="1125.1" y="88" width="2.7" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.IndexingChain.processField (5)</title></rect>
+<rect x="1125.1" y="104" width="2.0" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.IndexingChain$PerField.invert (4)</title></rect>
+<rect x="1127.7" y="104" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.writeField (1)</title></rect>
+<rect x="1128.3" y="88" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.index.IndexingChain$FieldSchema.assertSameSchema (1)</title></rect>
+<rect x="1128.3" y="104" width="0.5" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.index.IndexingChain$FieldSchema.assertSame (1)</title></rect>
+<rect x="1128.9" y="56" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterFlushControl.obtainAndLock (1)</title></rect>
+<rect x="1128.9" y="72" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThreadPool.getAndLock (1)</title></rect>
+<rect x="1128.9" y="88" width="0.5" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.index.LockableConcurrentApproximatePriorityQueue.lockAndPoll (1)</title></rect>
+<rect x="1128.9" y="104" width="0.5" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.index.ConcurrentApproximatePriorityQueue.poll (1)</title></rect>
+<rect x="1129.6" y="56" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThreadPool.marksAsFreeAndUnlock (1)</title></rect>
+<rect x="1129.6" y="72" width="0.5" height="15" fill="hsl(28,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.ramBytesUsed (1)</title></rect>
+<rect x="1129.6" y="88" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.BufferedUpdates.ramBytesUsed (1)</title></rect>
+<rect x="1129.6" y="104" width="0.5" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.index.BufferedUpdates$DeletedTerms.ramBytesUsed (1)</title></rect>
+<rect x="1130.2" y="40" width="7.1" height="15" fill="hsl(21,80%,65%)"><title>java.util.concurrent.ThreadPoolExecutor.runWorker (12)</title></rect>
+<rect x="1130.2" y="56" width="7.1" height="15" fill="hsl(48,80%,65%)"><title>java.util.concurrent.FutureTask.run (12)</title></rect>
+<rect x="1130.2" y="72" width="7.1" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.Executors$RunnableAdapter.call (12)</title></rect>
+<rect x="1130.2" y="88" width="7.1" height="15" fill="hsl(39,80%,65%)"><title>JavaWarmupBench.lambda$round$0 (12)</title></rect>
+<rect x="1130.2" y="104" width="6.5" height="15" fill="hsl(21,80%,65%)"><title>JavaWarmupBench.genMessage (11)</title></rect>
+<rect x="1137.2" y="104" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.document.Document.&lt;init&gt; (1)</title></rect>
+<rect x="1137.8" y="40" width="5.2" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.codecs.PushPostingsWriterBase.writeTerm (9)</title></rect>
+<rect x="1137.8" y="56" width="5.2" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.startDoc (9)</title></rect>
+<rect x="1137.8" y="72" width="5.2" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.flushDocBlock (9)</title></rect>
+<rect x="1137.8" y="88" width="3.3" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PForUtil.encode (6)</title></rect>
+<rect x="1137.8" y="104" width="2.7" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForUtil.encode (5)</title></rect>
+<rect x="1141.0" y="104" width="0.5" height="15" fill="hsl(43,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PForUtil.allEqual (1)</title></rect>
+<rect x="1141.7" y="88" width="0.5" height="15" fill="hsl(37,80%,65%)"><title>org.apache.lucene.codecs.CompetitiveImpactAccumulator.clear (1)</title></rect>
+<rect x="1141.7" y="104" width="0.5" height="15" fill="hsl(21,80%,65%)"><title>java.util.Arrays.fill (1)</title></rect>
+<rect x="1142.3" y="88" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForDeltaUtil.encodeDeltas (1)</title></rect>
+<rect x="1142.3" y="104" width="0.5" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForUtil.encode (1)</title></rect>
+<rect x="1142.9" y="88" width="0.5" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.copyTo (1)</title></rect>
+<rect x="1142.9" y="104" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (1)</title></rect>
+<rect x="1143.6" y="40" width="4.6" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.startDoc (8)</title></rect>
+<rect x="1143.6" y="56" width="4.6" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.flushDocBlock (8)</title></rect>
+<rect x="1143.6" y="72" width="4.0" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PForUtil.encode (7)</title></rect>
+<rect x="1143.6" y="88" width="1.4" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForUtil.encode (3)</title></rect>
+<rect x="1143.6" y="104" width="1.4" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.codecs.lucene912.ForUtil.encode (3)</title></rect>
+<rect x="1145.5" y="88" width="0.8" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (2)</title></rect>
+<rect x="1145.5" y="104" width="0.8" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (2)</title></rect>
+<rect x="1146.7" y="88" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.util.LongHeap.push (1)</title></rect>
+<rect x="1146.7" y="104" width="0.5" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.util.LongHeap.upHeap (1)</title></rect>
+<rect x="1147.4" y="88" width="0.5" height="15" fill="hsl(32,80%,65%)"><title>org.apache.lucene.util.LongHeap.updateTop (1)</title></rect>
+<rect x="1147.4" y="104" width="0.5" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.util.LongHeap.downHeap (1)</title></rect>
+<rect x="1148.0" y="72" width="0.5" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.reset (1)</title></rect>
+<rect x="1148.0" y="88" width="0.5" height="15" fill="hsl(22,80%,65%)"><title>java.util.ArrayDeque.clear (1)</title></rect>
+<rect x="1148.0" y="104" width="0.5" height="15" fill="hsl(43,80%,65%)"><title>java.util.ArrayDeque.circularClear (1)</title></rect>
+<rect x="1148.7" y="40" width="4.0" height="15" fill="hsl(17,80%,65%)"><title>java.util.concurrent.ThreadPoolExecutor$Worker.run (7)</title></rect>
+<rect x="1148.7" y="56" width="4.0" height="15" fill="hsl(21,80%,65%)"><title>java.util.concurrent.ThreadPoolExecutor.runWorker (7)</title></rect>
+<rect x="1148.7" y="72" width="4.0" height="15" fill="hsl(48,80%,65%)"><title>java.util.concurrent.FutureTask.run (7)</title></rect>
+<rect x="1148.7" y="88" width="4.0" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.Executors$RunnableAdapter.call (7)</title></rect>
+<rect x="1148.7" y="104" width="4.0" height="15" fill="hsl(39,80%,65%)"><title>JavaWarmupBench.lambda$round$0 (7)</title></rect>
+<rect x="1153.1" y="40" width="3.3" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.compressWithDictionary (6)</title></rect>
+<rect x="1153.1" y="56" width="2.7" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.util.compress.LZ4$FastCompressionHashTable.get (5)</title></rect>
+<rect x="1153.1" y="72" width="2.7" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.readInt (5)</title></rect>
+<rect x="1153.1" y="88" width="2.7" height="15" fill="hsl(11,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.get (5)</title></rect>
+<rect x="1153.1" y="104" width="2.7" height="15" fill="hsl(27,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.index (5)</title></rect>
+<rect x="1156.3" y="56" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.util.compress.LZ4.encodeSequence (1)</title></rect>
+<rect x="1156.3" y="72" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeShort (1)</title></rect>
+<rect x="1156.3" y="88" width="0.5" height="15" fill="hsl(33,80%,65%)"><title>java.nio.HeapByteBuffer.putShort (1)</title></rect>
+<rect x="1156.3" y="104" width="0.5" height="15" fill="hsl(21,80%,65%)"><title>jdk.internal.misc.ScopedMemoryAccess.putShortUnaligned (1)</title></rect>
+<rect x="1156.9" y="40" width="2.7" height="15" fill="hsl(23,80%,65%)"><title>org.apache.lucene.index.LockableConcurrentApproximatePriorityQueue.addAndUnlock (5)</title></rect>
+<rect x="1156.9" y="56" width="2.7" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.unlock (5)</title></rect>
+<rect x="1156.9" y="72" width="2.7" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock.unlock (5)</title></rect>
+<rect x="1156.9" y="88" width="2.7" height="15" fill="hsl(43,80%,65%)"><title>java.util.concurrent.locks.AbstractQueuedSynchronizer.release (5)</title></rect>
+<rect x="1156.9" y="104" width="2.7" height="15" fill="hsl(39,80%,65%)"><title>java.util.concurrent.locks.AbstractQueuedSynchronizer.signalNext (5)</title></rect>
+<rect x="1160.1" y="40" width="2.0" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.flushDocBlock (4)</title></rect>
+<rect x="1160.1" y="56" width="2.0" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PostingsUtil.writeVIntBlock (4)</title></rect>
+<rect x="1160.1" y="72" width="2.0" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeGroupVInts (4)</title></rect>
+<rect x="1160.1" y="88" width="2.0" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.util.GroupVIntUtil.writeGroupVInts (4)</title></rect>
+<rect x="1160.1" y="104" width="0.8" height="15" fill="hsl(23,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.set (2)</title></rect>
+<rect x="1161.4" y="104" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeVInt (1)</title></rect>
+<rect x="1162.0" y="104" width="0.5" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.util.GroupVIntUtil.toInt (1)</title></rect>
+<rect x="1162.6" y="40" width="2.0" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterFlushControl.obtainAndLock (4)</title></rect>
+<rect x="1162.6" y="56" width="2.0" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThreadPool.getAndLock (4)</title></rect>
+<rect x="1162.6" y="72" width="2.0" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.index.LockableConcurrentApproximatePriorityQueue.lockAndPoll (4)</title></rect>
+<rect x="1162.6" y="88" width="2.0" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.index.ConcurrentApproximatePriorityQueue.poll (4)</title></rect>
+<rect x="1162.6" y="104" width="2.0" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.index.ApproximatePriorityQueue.poll (4)</title></rect>
+<rect x="1165.2" y="40" width="2.0" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.index.StoredFieldsConsumer.finishDocument (4)</title></rect>
+<rect x="1165.2" y="56" width="2.0" height="15" fill="hsl(30,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.finishDocument (4)</title></rect>
+<rect x="1165.2" y="72" width="2.0" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.flush (4)</title></rect>
+<rect x="1165.2" y="88" width="1.4" height="15" fill="hsl(16,80%,65%)"><title>org.apache.lucene.codecs.lucene90.LZ4WithPresetDictCompressionMode$LZ4WithPresetDictCompressor.compress (3)</title></rect>
+<rect x="1165.2" y="104" width="1.4" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataInput.readBytes (3)</title></rect>
+<rect x="1167.1" y="88" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.toDataInput (1)</title></rect>
+<rect x="1167.1" y="104" width="0.5" height="15" fill="hsl(36,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataInput.&lt;init&gt; (1)</title></rect>
+<rect x="1167.7" y="40" width="1.4" height="15" fill="hsl(48,80%,65%)"><title>java.util.concurrent.FutureTask.run (3)</title></rect>
+<rect x="1167.7" y="56" width="1.4" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.Executors$RunnableAdapter.call (3)</title></rect>
+<rect x="1167.7" y="72" width="1.4" height="15" fill="hsl(39,80%,65%)"><title>JavaWarmupBench.lambda$round$0 (3)</title></rect>
+<rect x="1167.7" y="88" width="1.4" height="15" fill="hsl(19,80%,65%)"><title>org.apache.lucene.index.IndexWriter.addDocument (3)</title></rect>
+<rect x="1167.7" y="104" width="1.4" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocument (3)</title></rect>
+<rect x="1169.6" y="40" width="0.8" height="15" fill="hsl(47,80%,65%)"><title>java.util.concurrent.Executors$RunnableAdapter.call (2)</title></rect>
+<rect x="1169.6" y="56" width="0.8" height="15" fill="hsl(39,80%,65%)"><title>JavaWarmupBench.lambda$round$0 (2)</title></rect>
+<rect x="1169.6" y="72" width="0.8" height="15" fill="hsl(19,80%,65%)"><title>org.apache.lucene.index.IndexWriter.addDocument (2)</title></rect>
+<rect x="1169.6" y="88" width="0.8" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocument (2)</title></rect>
+<rect x="1169.6" y="104" width="0.8" height="15" fill="hsl(40,80%,65%)"><title>org.apache.lucene.index.IndexWriter.updateDocuments (2)</title></rect>
+<rect x="1170.9" y="40" width="0.8" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.analysis.Analyzer$ReuseStrategy.getStoredValue (2)</title></rect>
+<rect x="1170.9" y="56" width="0.8" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.CloseableThreadLocal.get (2)</title></rect>
+<rect x="1170.9" y="72" width="0.8" height="15" fill="hsl(35,80%,65%)"><title>java.lang.ThreadLocal.get (2)</title></rect>
+<rect x="1170.9" y="88" width="0.8" height="15" fill="hsl(35,80%,65%)"><title>java.lang.ThreadLocal.get (2)</title></rect>
+<rect x="1170.9" y="104" width="0.8" height="15" fill="hsl(18,80%,65%)"><title>java.lang.ThreadLocal$ThreadLocalMap.getEntry (2)</title></rect>
+<rect x="1172.2" y="40" width="0.8" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.analysis.Analyzer.tokenStream (2)</title></rect>
+<rect x="1172.2" y="56" width="0.8" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.analysis.Analyzer$1.getReusableComponents (2)</title></rect>
+<rect x="1172.2" y="72" width="0.8" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.analysis.Analyzer$ReuseStrategy.getStoredValue (2)</title></rect>
+<rect x="1172.2" y="88" width="0.8" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.CloseableThreadLocal.get (2)</title></rect>
+<rect x="1172.2" y="104" width="0.8" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.util.CloseableThreadLocal.maybePurge (2)</title></rect>
+<rect x="1173.5" y="40" width="0.8" height="15" fill="hsl(37,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.writeField (2)</title></rect>
+<rect x="1173.5" y="56" width="0.8" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeString (2)</title></rect>
+<rect x="1173.5" y="72" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (1)</title></rect>
+<rect x="1173.5" y="88" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.appendBlock (1)</title></rect>
+<rect x="1173.5" y="104" width="0.5" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput$ByteBufferRecycler.allocate (1)</title></rect>
+<rect x="1174.1" y="72" width="0.5" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.util.BytesRef.&lt;init&gt; (1)</title></rect>
+<rect x="1174.1" y="88" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (1)</title></rect>
+<rect x="1174.1" y="104" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.UnicodeUtil.UTF16toUTF8 (1)</title></rect>
+<rect x="1174.7" y="40" width="0.8" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.codecs.perfield.PerFieldPostingsFormat$FieldsWriter.write (2)</title></rect>
+<rect x="1174.7" y="56" width="0.8" height="15" fill="hsl(22,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter.write (2)</title></rect>
+<rect x="1174.7" y="72" width="0.8" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.write (2)</title></rect>
+<rect x="1174.7" y="88" width="0.8" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.codecs.PushPostingsWriterBase.writeTerm (2)</title></rect>
+<rect x="1174.7" y="104" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.newTermState (1)</title></rect>
+<rect x="1175.4" y="104" width="0.5" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.index.FreqProxFields$FreqProxDocsEnum.nextDoc (1)</title></rect>
+<rect x="1176.0" y="40" width="0.8" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterFlushControl.doAfterDocument (2)</title></rect>
+<rect x="1176.0" y="56" width="0.8" height="15" fill="hsl(19,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.getCommitLastBytesUsedDelta (2)</title></rect>
+<rect x="1176.0" y="72" width="0.8" height="15" fill="hsl(28,80%,65%)"><title>org.apache.lucene.index.DocumentsWriterPerThread.ramBytesUsed (2)</title></rect>
+<rect x="1176.0" y="88" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.BufferedUpdates.ramBytesUsed (1)</title></rect>
+<rect x="1176.0" y="104" width="0.5" height="15" fill="hsl(13,80%,65%)"><title>org.apache.lucene.util.Counter$AtomicCounter.get (1)</title></rect>
+<rect x="1176.6" y="88" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.index.IndexingChain.ramBytesUsed (1)</title></rect>
+<rect x="1176.6" y="104" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.Lucene90CompressingStoredFieldsWriter.ramBytesUsed (1)</title></rect>
+<rect x="1177.3" y="40" width="0.8" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.index.FreqProxFields$FreqProxDocsEnum.nextDoc (2)</title></rect>
+<rect x="1177.3" y="56" width="0.8" height="15" fill="hsl(34,80%,65%)"><title>org.apache.lucene.store.DataInput.readVInt (2)</title></rect>
+<rect x="1177.3" y="72" width="0.8" height="15" fill="hsl(21,80%,65%)"><title>org.apache.lucene.index.ByteSliceReader.readByte (2)</title></rect>
+<rect x="1177.3" y="88" width="0.8" height="15" fill="hsl(28,80%,65%)"><title>org.apache.lucene.index.ByteSliceReader.nextSlice (2)</title></rect>
+<rect x="1177.3" y="104" width="0.8" height="15" fill="hsl(11,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.get (2)</title></rect>
+<rect x="1178.5" y="40" width="0.8" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeShort (2)</title></rect>
+<rect x="1178.5" y="56" width="0.8" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeShort (2)</title></rect>
+<rect x="1178.5" y="72" width="0.8" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeByte (2)</title></rect>
+<rect x="1178.5" y="88" width="0.8" height="15" fill="hsl(10,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.appendBlock (2)</title></rect>
+<rect x="1178.5" y="104" width="0.8" height="15" fill="hsl(31,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput$ByteBufferRecycler.allocate (2)</title></rect>
+<rect x="1179.8" y="40" width="0.5" height="15" fill="hsl(21,80%,65%)"><title>JavaWarmupBench.genMessage (1)</title></rect>
+<rect x="1179.8" y="56" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>java.lang.StringBuilder.append (1)</title></rect>
+<rect x="1179.8" y="72" width="0.5" height="15" fill="hsl(18,80%,65%)"><title>java.lang.AbstractStringBuilder.append (1)</title></rect>
+<rect x="1179.8" y="88" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>java.lang.AbstractStringBuilder.ensureCapacityInternal (1)</title></rect>
+<rect x="1179.8" y="104" width="0.5" height="15" fill="hsl(22,80%,65%)"><title>java.util.Arrays.copyOf (1)</title></rect>
+<rect x="1180.5" y="40" width="0.5" height="15" fill="hsl(40,80%,65%)"><title>java.nio.HeapByteBufferR.&lt;init&gt; (1)</title></rect>
+<rect x="1180.5" y="56" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>java.nio.HeapByteBuffer.&lt;init&gt; (1)</title></rect>
+<rect x="1180.5" y="72" width="0.5" height="15" fill="hsl(16,80%,65%)"><title>java.nio.ByteBuffer.&lt;init&gt; (1)</title></rect>
+<rect x="1180.5" y="88" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>java.nio.Buffer.&lt;init&gt; (1)</title></rect>
+<rect x="1180.5" y="104" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>java.nio.ByteBuffer.position (1)</title></rect>
+<rect x="1181.1" y="40" width="0.5" height="15" fill="hsl(37,80%,65%)"><title>java.nio.HeapByteBufferR.duplicate (1)</title></rect>
+<rect x="1181.1" y="56" width="0.5" height="15" fill="hsl(40,80%,65%)"><title>java.nio.HeapByteBufferR.&lt;init&gt; (1)</title></rect>
+<rect x="1181.1" y="72" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>java.nio.HeapByteBuffer.&lt;init&gt; (1)</title></rect>
+<rect x="1181.1" y="88" width="0.5" height="15" fill="hsl(16,80%,65%)"><title>java.nio.ByteBuffer.&lt;init&gt; (1)</title></rect>
+<rect x="1181.1" y="104" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>java.nio.Buffer.&lt;init&gt; (1)</title></rect>
+<rect x="1181.7" y="40" width="0.5" height="15" fill="hsl(38,80%,65%)"><title>jdk.internal.loader.BuiltinClassLoader.findClassOnClassPathOrNull (1)</title></rect>
+<rect x="1181.7" y="56" width="0.5" height="15" fill="hsl(28,80%,65%)"><title>jdk.internal.loader.BuiltinClassLoader.defineClass (1)</title></rect>
+<rect x="1181.7" y="72" width="0.5" height="15" fill="hsl(10,80%,65%)"><title>jdk.internal.loader.URLClassPath$JarLoader$2.getManifest (1)</title></rect>
+<rect x="1181.7" y="88" width="0.5" height="15" fill="hsl(27,80%,65%)"><title>java.util.jar.JarFile.getManifest (1)</title></rect>
+<rect x="1181.7" y="104" width="0.5" height="15" fill="hsl(22,80%,65%)"><title>java.util.jar.JarFile.getManifestFromReference (1)</title></rect>
+<rect x="1182.4" y="40" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.pushTerm (1)</title></rect>
+<rect x="1182.4" y="56" width="0.5" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.writeBlocks (1)</title></rect>
+<rect x="1182.4" y="72" width="0.5" height="15" fill="hsl(32,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$PendingBlock.compileIndex (1)</title></rect>
+<rect x="1182.4" y="88" width="0.5" height="15" fill="hsl(18,80%,65%)"><title>org.apache.lucene.util.fst.FSTCompiler$Builder.build (1)</title></rect>
+<rect x="1182.4" y="104" width="0.5" height="15" fill="hsl(21,80%,65%)"><title>org.apache.lucene.util.fst.FSTCompiler.&lt;init&gt; (1)</title></rect>
+<rect x="1183.0" y="40" width="0.5" height="15" fill="hsl(24,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.writeBlocks (1)</title></rect>
+<rect x="1183.0" y="56" width="0.5" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.codecs.lucene90.blocktree.Lucene90BlockTreeTermsWriter$TermsWriter.writeBlock (1)</title></rect>
+<rect x="1183.0" y="72" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.codecs.lucene912.Lucene912PostingsWriter.encodeTerm (1)</title></rect>
+<rect x="1183.0" y="88" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeVLong (1)</title></rect>
+<rect x="1183.0" y="104" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeSignedVLong (1)</title></rect>
+<rect x="1183.6" y="40" width="0.5" height="15" fill="hsl(47,80%,65%)"><title>org.apache.lucene.codecs.lucene90.compressing.FieldsIndexWriter.finish (1)</title></rect>
+<rect x="1183.6" y="56" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.store.DataInput.readVLong (1)</title></rect>
+<rect x="1183.6" y="72" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.store.DataInput.readVLong (1)</title></rect>
+<rect x="1183.6" y="88" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.BufferedChecksumIndexInput.readByte (1)</title></rect>
+<rect x="1183.6" y="104" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.store.MemorySegmentIndexInput.readByte (1)</title></rect>
+<rect x="1184.3" y="40" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.codecs.lucene912.PostingsUtil.writeVIntBlock (1)</title></rect>
+<rect x="1184.3" y="56" width="0.5" height="15" fill="hsl(26,80%,65%)"><title>org.apache.lucene.store.DataOutput.writeGroupVInts (1)</title></rect>
+<rect x="1184.3" y="72" width="0.5" height="15" fill="hsl(44,80%,65%)"><title>org.apache.lucene.util.GroupVIntUtil.writeGroupVInts (1)</title></rect>
+<rect x="1184.3" y="88" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (1)</title></rect>
+<rect x="1184.3" y="104" width="0.5" height="15" fill="hsl(41,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.writeBytes (1)</title></rect>
+<rect x="1184.9" y="40" width="0.5" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.document.Field.tokenStream (1)</title></rect>
+<rect x="1184.9" y="56" width="0.5" height="15" fill="hsl(45,80%,65%)"><title>org.apache.lucene.analysis.Analyzer.tokenStream (1)</title></rect>
+<rect x="1184.9" y="72" width="0.5" height="15" fill="hsl(46,80%,65%)"><title>org.apache.lucene.analysis.Analyzer$1.getReusableComponents (1)</title></rect>
+<rect x="1184.9" y="88" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.analysis.Analyzer$ReuseStrategy.getStoredValue (1)</title></rect>
+<rect x="1184.9" y="104" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.CloseableThreadLocal.get (1)</title></rect>
+<rect x="1185.5" y="40" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.index.ByteSlicePool.allocKnownSizeSlice (1)</title></rect>
+<rect x="1185.5" y="56" width="0.5" height="15" fill="hsl(23,80%,65%)"><title>java.lang.invoke.VarHandleByteArrayAsInts$ArrayHandle.set (1)</title></rect>
+<rect x="1185.5" y="72" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>jdk.internal.misc.Unsafe.putIntUnaligned (1)</title></rect>
+<rect x="1185.5" y="88" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>jdk.internal.misc.Unsafe.putIntUnaligned (1)</title></rect>
+<rect x="1185.5" y="104" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>jdk.internal.misc.Unsafe.putIntParts (1)</title></rect>
+<rect x="1186.2" y="40" width="0.5" height="15" fill="hsl(33,80%,65%)"><title>org.apache.lucene.index.ConcurrentApproximatePriorityQueue.poll (1)</title></rect>
+<rect x="1186.2" y="56" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock.lock (1)</title></rect>
+<rect x="1186.2" y="72" width="0.5" height="15" fill="hsl(29,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock$Sync.lock (1)</title></rect>
+<rect x="1186.2" y="88" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (1)</title></rect>
+<rect x="1186.2" y="104" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire (1)</title></rect>
+<rect x="1186.8" y="40" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.TermsHashPerField.writeByte (1)</title></rect>
+<rect x="1186.8" y="56" width="0.5" height="15" fill="hsl(39,80%,65%)"><title>org.apache.lucene.index.ByteSlicePool.allocSlice (1)</title></rect>
+<rect x="1186.8" y="72" width="0.5" height="15" fill="hsl(15,80%,65%)"><title>org.apache.lucene.index.ByteSlicePool.allocKnownSizeSlice (1)</title></rect>
+<rect x="1186.8" y="88" width="0.5" height="15" fill="hsl(14,80%,65%)"><title>org.apache.lucene.util.ByteBlockPool.nextBuffer (1)</title></rect>
+<rect x="1186.8" y="104" width="0.5" height="15" fill="hsl(16,80%,65%)"><title>java.lang.Math.addExact (1)</title></rect>
+<rect x="1187.5" y="40" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.toDataInput (1)</title></rect>
+<rect x="1187.5" y="56" width="0.5" height="15" fill="hsl(48,80%,65%)"><title>org.apache.lucene.store.ByteBuffersDataOutput.toBufferList (1)</title></rect>
+<rect x="1187.5" y="72" width="0.5" height="15" fill="hsl(32,80%,65%)"><title>java.util.ArrayList.add (1)</title></rect>
+<rect x="1187.5" y="88" width="0.5" height="15" fill="hsl(32,80%,65%)"><title>java.util.ArrayList.add (1)</title></rect>
+<rect x="1187.5" y="104" width="0.5" height="15" fill="hsl(22,80%,65%)"><title>java.util.ArrayList.grow (1)</title></rect>
+<rect x="1188.1" y="40" width="0.5" height="15" fill="hsl(43,80%,65%)"><title>org.apache.lucene.store.OutputStreamIndexOutput.writeBytes (1)</title></rect>
+<rect x="1188.1" y="56" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>java.io.BufferedOutputStream.write (1)</title></rect>
+<rect x="1188.1" y="72" width="0.5" height="15" fill="hsl(43,80%,65%)"><title>jdk.internal.misc.InternalLock.lock (1)</title></rect>
+<rect x="1188.1" y="88" width="0.5" height="15" fill="hsl(20,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock.lock (1)</title></rect>
+<rect x="1188.1" y="104" width="0.5" height="15" fill="hsl(29,80%,65%)"><title>java.util.concurrent.locks.ReentrantLock$Sync.lock (1)</title></rect>
+<rect x="1188.7" y="40" width="0.5" height="15" fill="hsl(16,45%,60%)"><title>org.apache.lucene.util.StringSorter.sort (1)</title></rect>
+<rect x="1188.7" y="56" width="0.5" height="15" fill="hsl(115,45%,60%)"><title>org.apache.lucene.util.MSBRadixSorter.sort (1)</title></rect>
+<rect x="1188.7" y="72" width="0.5" height="15" fill="hsl(115,45%,60%)"><title>org.apache.lucene.util.MSBRadixSorter.sort (1)</title></rect>
+<rect x="1188.7" y="88" width="0.5" height="15" fill="hsl(29,80%,65%)"><title>org.apache.lucene.util.MSBRadixSorter.radixSort (1)</title></rect>
+<rect x="1188.7" y="104" width="0.5" height="15" fill="hsl(17,80%,65%)"><title>org.apache.lucene.util.BytesRefHash$1$1.reorder (1)</title></rect>
+<rect x="1189.4" y="40" width="0.5" height="15" fill="hsl(12,80%,65%)"><title>org.apache.lucene.util.fst.BytesRefFSTEnum.next (1)</title></rect>
+<rect x="1189.4" y="56" width="0.5" height="15" fill="hsl(27,80%,65%)"><title>org.apache.lucene.util.fst.FSTEnum.doNext (1)</title></rect>
+<rect x="1189.4" y="72" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.fst.FSTEnum.pushFirst (1)</title></rect>
+<rect x="1189.4" y="88" width="0.5" height="15" fill="hsl(21,80%,65%)"><title>org.apache.lucene.util.fst.FST.readFirstTargetArc (1)</title></rect>
+<rect x="1189.4" y="104" width="0.5" height="15" fill="hsl(49,80%,65%)"><title>org.apache.lucene.util.fst.FST.readFirstRealTargetArc (1)</title></rect>
+</svg>

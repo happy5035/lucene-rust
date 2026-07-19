@@ -1,0 +1,612 @@
+//! rustlucene-cli: corpus generation, index writing, benchmark and golden-file
+//! emission for the Java interop harness.
+//!
+//! Usage:
+//!   rustlucene-cli write <indexDir> <numDocs> <docBytes> <seed> [goldenFile]
+//!   rustlucene-cli bench <indexDir> <numDocs> <docBytes> <seed>
+//!   rustlucene-cli index <inputFileOrDir> <indexDir> [--positions] [--docs N]
+//!
+//! The corpus generator mirrors interop/java/JavaLuceneBench.java exactly
+//! (same xorshift64* stream and vocabulary => identical corpora).
+
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
+use codec_lucene9::FSDirectory;
+use rustlucene_core::{
+    commit_segments, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig, Schema,
+    SegmentBuilder,
+};
+
+/// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
+struct XorShift {
+    s: u64,
+}
+
+impl XorShift {
+    fn new(seed: u64) -> Self {
+        Self {
+            s: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+        }
+    }
+    fn next(&mut self) -> u64 {
+        self.s ^= self.s >> 12;
+        self.s ^= self.s << 25;
+        self.s ^= self.s >> 27;
+        self.s.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    fn next_int(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn vocab() -> Vec<String> {
+    let levels = ["INFO", "WARN", "ERROR", "DEBUG", "TRACE"];
+    let words: Vec<&str> = "connection timeout retry backoff socket buffer stream packet request response \
+        client server upstream downstream latency throughput commit rollback segment flush merge \
+        index query filter cache eviction compaction snapshot replica shard leader follower election \
+        heartbeat protocol handshake encrypt decrypt token session expire renew validate schema \
+        migrate upgrade downgrade rollback checkpoint journal wal fsync sync async batch queue"
+        .split(' ')
+        .collect();
+    let mut v = Vec::with_capacity(words.len() * 40 + levels.len());
+    // entries carry a trailing space so gen_message needs a single push_str
+    // per token (byte-identical to pushing word + space separately).
+    for w in words {
+        for i in 0..40 {
+            v.push(format!("{w}{i} "));
+        }
+    }
+    for l in levels {
+        v.push(format!("{l} "));
+    }
+    v
+}
+
+fn gen_message(rng: &mut XorShift, vocab: &[String], target_bytes: usize) -> String {
+    let mut sb = String::with_capacity(target_bytes + 16);
+    while sb.len() < target_bytes {
+        sb.push_str(&vocab[rng.next_int(vocab.len() as u64) as usize]);
+    }
+    sb.truncate(target_bytes);
+    sb
+}
+
+fn schema() -> Schema {
+    let mut s = Schema::new();
+    s.add(FieldSpec::text("message"));
+    s
+}
+
+/// The M2 log-scenario schema: timestamp (LongPoint + NumericDV + stored),
+/// level (keyword + SortedDV + stored), trace_id (keyword), message (text,
+/// positions optional), and three NumericDocValues.
+/// `bigdict` adds a high-cardinality SortedDocValues field (trace_id_sdv)
+/// to exercise the terms-dict multi-block + reverse-index paths end to end.
+fn log_schema(positions: bool, bigdict: bool) -> Schema {
+    let mut s = Schema::new();
+    s.add(FieldSpec::long_point("timestamp").with_numeric_dv().with_stored(true));
+    s.add(FieldSpec::keyword("level").with_sorted_dv());
+    s.add(FieldSpec::keyword("trace_id"));
+    if bigdict {
+        s.add(FieldSpec::sorted_dv("trace_id_sdv"));
+    }
+    s.add(if positions {
+        FieldSpec::text_with_positions("message")
+    } else {
+        FieldSpec::text("message")
+    });
+    s.add(FieldSpec::numeric_dv("latency_ms"));
+    s.add(FieldSpec::numeric_dv("bytes_sent"));
+    s.add(FieldSpec::numeric_dv("status"));
+    s
+}
+
+const LEVELS: [&str; 5] = ["INFO", "WARN", "ERROR", "DEBUG", "TRACE"];
+const STATUSES: [i64; 5] = [200, 200, 200, 404, 500];
+const TS_BASE: i64 = 1_700_000_000_000;
+
+/// One synthetic log document. The rng call sequence is fixed and must stay
+/// byte-identical with interop/java/JavaLogBench.java.
+///
+/// With `sparse`, some fields are deterministically absent (drawn from the rng
+/// regardless, so the stream stays aligned): latency_ms missing every 7th doc,
+/// bytes_sent every 11th, level every 13th, status present only every 17th —
+/// exercising IndexedDISI's DENSE/SPARSE branches and multi-block jump tables.
+fn gen_log_document(
+    rng: &mut XorShift,
+    vocab: &[String],
+    doc_id: u64,
+    sparse: bool,
+    bigdict: bool,
+) -> Document {
+    let ts = TS_BASE + doc_id as i64 * 1000 + rng.next_int(1000) as i64;
+    let level = LEVELS[rng.next_int(5) as usize];
+    let trace_id = format!("{:016x}{:016x}", rng.next(), rng.next());
+    let message = gen_message(rng, vocab, 200);
+    let latency = rng.next_int(10_000) as i64;
+    let bytes = rng.next_int(1_000_000) as i64;
+    let status = STATUSES[rng.next_int(5) as usize];
+    let mut doc = Document::new();
+    doc.add("timestamp", FieldValue::Long(ts));
+    if !sparse || doc_id % 13 != 0 {
+        doc.add("level", FieldValue::Keyword(level.to_string()));
+    }
+    doc.add("trace_id", FieldValue::Keyword(trace_id.clone()));
+    if bigdict {
+        doc.add("trace_id_sdv", FieldValue::Keyword(trace_id));
+    }
+    doc.add("message", FieldValue::Text(message));
+    if !sparse || doc_id % 7 != 0 {
+        doc.add("latency_ms", FieldValue::Long(latency));
+    }
+    if !sparse || doc_id % 11 != 0 {
+        doc.add("bytes_sent", FieldValue::Long(bytes));
+    }
+    if !sparse || doc_id % 17 == 0 {
+        doc.add("status", FieldValue::Long(status));
+    }
+    doc
+}
+
+/// Sharded log-schema bench, mirroring `bench` (private SegmentBuilder per
+/// thread, unioned commit).
+fn logbench(
+    index_dir: &Path,
+    num_docs: u32,
+    seed: u64,
+    threads: u32,
+    positions: bool,
+) -> std::io::Result<()> {
+    let vocab = vocab();
+    let per_thread = num_docs / threads;
+    let name_counter = AtomicU64::new(0);
+    let t0 = Instant::now();
+
+    let results: Vec<(Vec<SegmentCommitInfo>, u64, u128, Vec<u64>)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for tid in 0..threads {
+            let vocab = &vocab;
+            let name_counter = &name_counter;
+            handles.push(scope.spawn(move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128, Vec<u64>)> {
+                let dir = FSDirectory::open(index_dir)?;
+                let schema = log_schema(positions, false);
+                let name = name_counter.fetch_add(1, Ordering::Relaxed);
+                let mut builder = SegmentBuilder::new(dir, name);
+                let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
+                let mut indexed_bytes = 0u64;
+                let mut scis = Vec::new();
+                // add-latency samples (every 16th add) for p50/p99 reporting
+                let mut samples: Vec<u64> = Vec::with_capacity(per_thread as usize / 16 + 2);
+                for doc_id in 0..per_thread {
+                    let doc = gen_log_document(&mut rng, vocab, doc_id as u64, false, false);
+                    indexed_bytes += 200 + 40; // message + trace_id payload approximation
+                    let t_add = Instant::now();
+                    builder.add_document(&schema, doc)?;
+                    if doc_id % 16 == 0 {
+                        samples.push(t_add.elapsed().as_nanos() as u64);
+                    }
+                }
+                let t_flush = Instant::now();
+                if let Some(sci) = builder.finalize()? {
+                    scis.push(sci);
+                }
+                Ok((scis, indexed_bytes, t_flush.elapsed().as_millis(), samples))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker panicked"))
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("worker io error")
+    });
+
+    let t_commit = Instant::now();
+    let mut scis: Vec<SegmentCommitInfo> = Vec::new();
+    let mut indexed_bytes = 0u64;
+    let mut flush_ms = 0u128;
+    let mut all_samples: Vec<u64> = Vec::new();
+    for (s, b, f, smp) in results {
+        scis.extend(s);
+        indexed_bytes += b;
+        flush_ms = flush_ms.max(f);
+        all_samples.extend(smp);
+    }
+    all_samples.sort_unstable();
+    let pct = |p: usize| -> f64 {
+        if all_samples.is_empty() {
+            return 0.0;
+        }
+        all_samples[(all_samples.len() * p / 100).min(all_samples.len() - 1)] as f64 / 1000.0
+    };
+    let (p50_us, p99_us, max_us) = (pct(50), pct(99), pct(100));
+    scis.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+    let mut infos = SegmentInfos::new();
+    infos.segments = scis;
+    infos.counter = name_counter.load(Ordering::Relaxed) as i64;
+    infos.min_segment_version = Some((9, 12, 3));
+    commit_segments(index_dir, infos, 1)?;
+    let commit_ms = t_commit.elapsed().as_millis();
+
+    let ms = t0.elapsed().as_millis().max(1);
+    let docs = per_thread * threads;
+    let docs_per_sec = docs as f64 * 1000.0 / ms as f64;
+    let mb_per_sec = indexed_bytes as f64 / 1024.0 / 1024.0 / (ms as f64 / 1000.0);
+    println!(
+        "BENCH elapsed_ms={ms} docs_per_sec={docs_per_sec:.0} mb_per_sec={mb_per_sec:.1} indexed_bytes={indexed_bytes} flush_ms={flush_ms} commit_ms={commit_ms} add_p50_us={p50_us:.1} add_p99_us={p99_us:.1} add_max_us={max_us:.1}"
+    );
+    Ok(())
+}
+
+/// Single-writer log-schema indexing (the interop counterpart of JavaLogBench).
+fn logwrite(
+    index_dir: &Path,
+    num_docs: u32,
+    seed: u64,
+    positions: bool,
+    sparse: bool,
+    bigdict: bool,
+) -> std::io::Result<()> {
+    let vocab = vocab();
+    let mut w = IndexWriter::create(index_dir, log_schema(positions, bigdict), IndexWriterConfig::default())?;
+    let mut rng = XorShift::new(seed);
+    let t0 = Instant::now();
+    for doc_id in 0..num_docs {
+        w.add_document(gen_log_document(&mut rng, &vocab, doc_id as u64, sparse, bigdict))?;
+    }
+    w.commit()?;
+    let ms = t0.elapsed().as_millis().max(1);
+    println!(
+        "WROTE docs={num_docs} elapsed_ms={ms} docs_per_sec={:.0}",
+        num_docs as f64 * 1000.0 / ms as f64
+    );
+    Ok(())
+}
+
+/// Multi-threaded sharded bench: each thread owns a private SegmentBuilder
+/// (no shared mutable state), flushed segments are unioned into a single
+/// commit. Mirrors the M3 architecture; threads=1 degenerates to one builder.
+fn bench(
+    index_dir: &Path,
+    num_docs: u32,
+    doc_bytes: usize,
+    seed: u64,
+    threads: u32,
+) -> std::io::Result<()> {
+    let vocab = vocab();
+    let per_thread = num_docs / threads;
+    let name_counter = AtomicU64::new(0);
+    let t0 = Instant::now();
+
+    let results: Vec<(Vec<SegmentCommitInfo>, u64, u128)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for tid in 0..threads {
+            let vocab = &vocab;
+            let name_counter = &name_counter;
+            handles.push(scope.spawn(move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128)> {
+                let dir = FSDirectory::open(index_dir)?;
+                let schema = schema();
+                let name = name_counter.fetch_add(1, Ordering::Relaxed);
+                let mut builder = SegmentBuilder::new(dir, name);
+                let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
+                let mut indexed_bytes = 0u64;
+                let mut scis = Vec::new();
+                for _ in 0..per_thread {
+                    let msg = gen_message(&mut rng, vocab, doc_bytes);
+                    indexed_bytes += msg.len() as u64;
+                    let mut doc = Document::new();
+                    doc.add("message", FieldValue::Text(msg));
+                    builder.add_document(&schema, doc)?;
+                }
+                let t_flush = Instant::now();
+                if let Some(sci) = builder.finalize()? {
+                    scis.push(sci);
+                }
+                Ok((scis, indexed_bytes, t_flush.elapsed().as_millis()))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker panicked"))
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("worker io error")
+    });
+
+    let t_commit = Instant::now();
+    let mut scis: Vec<SegmentCommitInfo> = Vec::new();
+    let mut indexed_bytes = 0u64;
+    let mut flush_ms = 0u128;
+    for (s, b, f) in results {
+        scis.extend(s);
+        indexed_bytes += b;
+        flush_ms = flush_ms.max(f);
+    }
+    scis.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+    let mut infos = SegmentInfos::new();
+    infos.segments = scis;
+    infos.counter = name_counter.load(Ordering::Relaxed) as i64;
+    infos.min_segment_version = Some((9, 12, 3));
+    commit_segments(index_dir, infos, 1)?;
+    let commit_ms = t_commit.elapsed().as_millis();
+
+    let ms = t0.elapsed().as_millis().max(1);
+    let docs = per_thread * threads;
+    let docs_per_sec = docs as f64 * 1000.0 / ms as f64;
+    let mb_per_sec = indexed_bytes as f64 / 1024.0 / 1024.0 / (ms as f64 / 1000.0);
+    println!(
+        "BENCH elapsed_ms={ms} docs_per_sec={docs_per_sec:.0} mb_per_sec={mb_per_sec:.1} indexed_bytes={indexed_bytes} flush_ms={flush_ms} commit_ms={commit_ms}"
+    );
+    Ok(())
+}
+
+fn write_docs(
+    index_dir: &Path,
+    num_docs: u32,
+    doc_bytes: usize,
+    seed: u64,
+    mut golden: Option<&mut dyn Write>,
+) -> std::io::Result<(u128, u64)> {
+    let vocab = vocab();
+    let mut w = IndexWriter::create(index_dir, schema(), IndexWriterConfig::default())?;
+    let mut rng = XorShift::new(seed);
+    let mut indexed_bytes = 0u64;
+    let t0 = Instant::now();
+    for doc_id in 0..num_docs {
+        let msg = gen_message(&mut rng, &vocab, doc_bytes);
+        indexed_bytes += msg.len() as u64;
+        if let Some(g) = golden.as_deref_mut() {
+            writeln!(g, "{doc_id}\tmessage={msg}")?;
+        }
+        let mut doc = Document::new();
+        doc.add("message", FieldValue::Text(msg));
+        w.add_document(doc)?;
+    }
+    w.commit()?;
+    Ok((t0.elapsed().as_millis(), indexed_bytes))
+}
+
+fn write_golden_terms(golden: &mut dyn Write, num_docs: u32, doc_bytes: usize, seed: u64) -> std::io::Result<()> {
+    // Re-generate the same corpus and accumulate postings for a sample of terms.
+    use std::collections::BTreeMap;
+    let vocab = vocab();
+    let mut rng = XorShift::new(seed);
+    let mut postings: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
+    for doc_id in 0..num_docs {
+        let msg = gen_message(&mut rng, &vocab, doc_bytes);
+        for token in msg.split_whitespace() {
+            let docs = postings.entry(token.as_bytes().to_vec()).or_default();
+            if docs.last() != Some(&doc_id) {
+                docs.push(doc_id);
+            }
+        }
+    }
+    // Evenly spaced sample of at most 200 terms.
+    let terms: Vec<&Vec<u8>> = postings.keys().collect();
+    let n = terms.len().min(200);
+    writeln!(golden, "TERMS message {n}")?;
+    for i in 0..n {
+        let idx = if n > 1 { i * (terms.len() - 1) / (n - 1) } else { 0 };
+        let term = terms[idx];
+        let docs = &postings[term];
+        let ids: Vec<String> = docs.iter().map(u32::to_string).collect();
+        writeln!(golden, "{}\t{}", String::from_utf8_lossy(term), ids.join(","))?;
+    }
+    Ok(())
+}
+
+/// Indexes text files (a single file or a directory, walked recursively in
+/// sorted order): each non-empty line becomes one document with fields
+/// `message` (indexed + stored, positions optional), `source` (stored-only
+/// relative file path) and `line` (stored-only 1-based line number).
+///
+/// With `target_docs = Some(n)`, exactly n documents are written: the corpus
+/// is re-read from the first file as many times as needed (cycled); without
+/// it, the corpus is indexed once.
+fn index_files(
+    input: &Path,
+    index_dir: &Path,
+    positions: bool,
+    target_docs: Option<u64>,
+) -> std::io::Result<()> {
+    let mut schema = Schema::new();
+    schema.add(if positions {
+        FieldSpec::text_with_positions("message")
+    } else {
+        FieldSpec::text("message")
+    });
+    schema.add(FieldSpec::stored("source"));
+    schema.add(FieldSpec::stored("line"));
+
+    let mut files = Vec::new();
+    collect_files(input, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        eprintln!("no input files under {}", input.display());
+        std::process::exit(2);
+    }
+
+    let mut w = IndexWriter::create(index_dir, schema, IndexWriterConfig::default())?;
+    let t0 = Instant::now();
+    let (mut docs, mut skipped) = (0u64, 0u64);
+    let target = target_docs.unwrap_or(u64::MAX);
+    'passes: loop {
+        let pass_start_docs = docs;
+        for f in &files {
+            let source = if input.is_dir() {
+                f.strip_prefix(input).unwrap_or(f).to_string_lossy().into_owned()
+            } else {
+                f.file_name().unwrap().to_string_lossy().into_owned()
+            };
+            let reader = std::io::BufReader::new(File::open(f)?);
+            let mut lineno = 0u64;
+            for line in std::io::BufRead::lines(reader) {
+                if docs >= target {
+                    break 'passes;
+                }
+                // non-UTF-8 lines are skipped (lossy decoding would merge terms)
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                lineno += 1;
+                let text = line.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let mut doc = Document::new();
+                doc.add("message", FieldValue::Text(text.to_string()));
+                doc.add("source", FieldValue::Text(source.clone()));
+                doc.add("line", FieldValue::Text(lineno.to_string()));
+                w.add_document(doc)?;
+                docs += 1;
+            }
+        }
+        if target_docs.is_none() || docs >= target {
+            break;
+        }
+        if docs == pass_start_docs {
+            // a full pass added nothing (all lines empty/non-UTF-8):
+            // cycling would never reach the target
+            eprintln!(
+                "input under {} has no indexable lines; cannot reach --docs {target}",
+                input.display()
+            );
+            std::process::exit(2);
+        }
+    }
+    w.commit()?;
+    let ms = t0.elapsed().as_millis().max(1);
+    println!(
+        "INDEXED files={} docs={} skipped_lines={} elapsed_ms={} docs_per_sec={:.0} positions={}",
+        files.len(),
+        docs,
+        skipped,
+        ms,
+        docs as f64 * 1000.0 / ms as f64,
+        positions
+    );
+    Ok(())
+}
+
+fn collect_files(path: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    if path.is_file() {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            collect_files(&p, out)?;
+        } else if p.is_file() {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+fn usage() -> ! {
+    eprintln!("usage:");
+    eprintln!("  rustlucene-cli write <indexDir> <numDocs> <docBytes> <seed> [goldenFile]");
+    eprintln!("  rustlucene-cli bench <indexDir> <numDocs> <docBytes> <seed> [threads]");
+    eprintln!("  rustlucene-cli index <inputFileOrDir> <indexDir> [--positions] [--docs N]");
+    eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions]");
+    eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
+    std::process::exit(2);
+}
+
+fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        usage();
+    }
+    match args[1].as_str() {
+        "write" | "bench" => {
+            if args.len() < 6 {
+                usage();
+            }
+            let index_dir = Path::new(&args[2]);
+            let num_docs: u32 = args[3].parse().unwrap();
+            let doc_bytes: usize = args[4].parse().unwrap();
+            let seed: u64 = args[5].parse().unwrap();
+            if args[1] == "write" {
+                let mut golden = args.get(6).map(|p| BufWriter::new(File::create(p).unwrap()));
+                if let Some(g) = golden.as_mut() {
+                    writeln!(g, "DOCS {num_docs}")?;
+                }
+                let (ms, bytes) = write_docs(
+                    index_dir,
+                    num_docs,
+                    doc_bytes,
+                    seed,
+                    golden.as_mut().map(|g| g as &mut dyn Write),
+                )?;
+                if let Some(g) = golden.as_mut() {
+                    write_golden_terms(g, num_docs, doc_bytes, seed)?;
+                    g.flush()?;
+                }
+                println!("WROTE docs={num_docs} elapsed_ms={ms} indexed_bytes={bytes}");
+                Ok(())
+            } else {
+                let threads: u32 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(1);
+                bench(index_dir, num_docs, doc_bytes, seed, threads)
+            }
+        }
+        "index" => {
+            if args.len() < 4 {
+                usage();
+            }
+            let mut positions = false;
+            let mut docs = None;
+            let mut rest = args[4..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--positions" => positions = true,
+                    "--docs" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        docs = Some(v.parse::<u64>().unwrap_or_else(|_| usage()));
+                    }
+                    _ => usage(),
+                }
+            }
+            index_files(Path::new(&args[2]), Path::new(&args[3]), positions, docs)
+        }
+        "logwrite" => {
+            if args.len() < 5 {
+                usage();
+            }
+            let positions = args[5..].iter().any(|a| a == "--positions");
+            let sparse = args[5..].iter().any(|a| a == "--sparse");
+            let bigdict = args[5..].iter().any(|a| a == "--bigdict");
+            logwrite(
+                Path::new(&args[2]),
+                args[3].parse().unwrap(),
+                args[4].parse().unwrap(),
+                positions,
+                sparse,
+                bigdict,
+            )
+        }
+        "logbench" => {
+            if args.len() < 5 {
+                usage();
+            }
+            let threads: u32 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(1);
+            let positions = args[5..].iter().any(|a| a == "--positions");
+            logbench(
+                Path::new(&args[2]),
+                args[3].parse().unwrap(),
+                args[4].parse().unwrap(),
+                threads,
+                positions,
+            )
+        }
+        _ => usage(),
+    }
+}

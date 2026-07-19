@@ -1,0 +1,818 @@
+//! Lucene90 stored fields writer, BEST_SPEED mode (LZ4), mirroring
+//! `codecs/lucene90/compressing/Lucene90CompressingStoredFieldsWriter.java`,
+//! `FieldsIndexWriter.java`, `StoredFieldsInts.java` and
+//! `codecs/lucene90/LZ4WithPresetDictCompressionMode.java` (9.12.3).
+//!
+//! Writes `_X.fdt` (compressed chunks), `_X.fdx` (DirectMonotonic index) and
+//! `_X.fdm` (metadata). Simplification vs. Lucene: LZ4 sub-blocks are
+//! compressed independently (no preset dictionary); the on-disk layout
+//! (dictLength/blockLength VInts + compressed-length table) is unchanged and
+//! remains readable by `LZ4WithPresetDictDecompressor`.
+
+use std::io;
+
+use crate::codec_util::{write_footer, write_index_header};
+#[cfg(test)]
+use crate::codec_util::index_header_length;
+use crate::directory::FSDirectory;
+use crate::io::ChecksumIndexOutput;
+use crate::packed::direct_monotonic_write;
+
+/// Lucene90StoredFieldsFormat.Mode.BEST_SPEED parameters
+/// (Lucene90StoredFieldsFormat.java:157-172,182-185).
+pub const CHUNK_SIZE: usize = 81920; // 10 * 8 * 1024
+pub const MAX_DOCS_PER_CHUNK: i32 = 1024;
+pub const BLOCK_SHIFT: u32 = 10;
+
+/// Lucene90CompressingStoredFieldsWriter codec names / extensions (:59-82).
+pub const FIELDS_EXTENSION: &str = "fdt";
+pub const INDEX_EXTENSION: &str = "fdx";
+pub const META_EXTENSION: &str = "fdm";
+const FDT_CODEC_NAME: &str = "Lucene90StoredFieldsFastData";
+const INDEX_CODEC_NAME: &str = "Lucene90FieldsIndex";
+const FDT_VERSION: u32 = 1; // VERSION_CURRENT (:80-82)
+const FIELDS_INDEX_VERSION: u32 = 0; // FieldsIndexWriter (:48-49)
+
+// Field type tags (:70-75). TYPE_BITS = 3 (:77).
+const TYPE_STRING: i64 = 0;
+const TYPE_BYTE_ARR: i64 = 1;
+const TYPE_NUMERIC_INT: i64 = 2;
+const TYPE_NUMERIC_FLOAT: i64 = 3;
+const TYPE_NUMERIC_LONG: i64 = 4;
+const TYPE_NUMERIC_DOUBLE: i64 = 5;
+
+// TLong encodings (:334-340)
+const SECOND: i64 = 1000;
+const HOUR: i64 = 60 * 60 * SECOND;
+const DAY: i64 = 24 * HOUR;
+const SECOND_ENCODING: u8 = 0x40;
+const HOUR_ENCODING: u8 = 0x80;
+const DAY_ENCODING: u8 = 0xC0;
+
+/// A single stored field value.
+pub enum StoredField {
+    String(String),
+    Bytes(Vec<u8>),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+}
+
+/// Segment file names produced by this writer (IndexFileNames.segmentFileName).
+pub fn file_names(segment: &str, suffix: &str) -> [String; 3] {
+    [
+        format!("{segment}{suffix}.{FIELDS_EXTENSION}"),
+        format!("{segment}{suffix}.{INDEX_EXTENSION}"),
+        format!("{segment}{suffix}.{META_EXTENSION}"),
+    ]
+}
+
+/// Lucene90CompressingStoredFieldsWriter.writeTLong (:442-470).
+pub fn write_tlong(out: &mut Vec<u8>, l: i64) {
+    let mut value = l;
+    let mut header: u8;
+    if value % SECOND != 0 {
+        header = 0;
+    } else if value % DAY == 0 {
+        header = DAY_ENCODING;
+        value /= DAY;
+    } else if value % HOUR == 0 {
+        header = HOUR_ENCODING;
+        value /= HOUR;
+    } else {
+        header = SECOND_ENCODING;
+        value /= SECOND;
+    }
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    header |= (zigzag & 0x1f) as u8;
+    let upper = zigzag >> 5;
+    if upper != 0 {
+        header |= 0x20;
+    }
+    out.push(header);
+    if upper != 0 {
+        write_vlong_raw(out, upper);
+    }
+}
+
+/// Lucene90CompressingStoredFieldsWriter.writeZFloat (:357-374).
+pub fn write_zfloat(out: &mut Vec<u8>, f: f32) {
+    let int_val = f as i32;
+    let float_bits = f.to_bits() as i32;
+    const NEGATIVE_ZERO_FLOAT: i32 = (-0.0f32).to_bits() as i32;
+    if f == int_val as f32 && (-1..=0x7d).contains(&int_val) && float_bits != NEGATIVE_ZERO_FLOAT {
+        // small integer value [-1..125]: single byte
+        out.push(0x80 | (1 + int_val) as u8);
+    } else if float_bits >= 0 {
+        // other positive floats: 4 bytes (byte + LE short + byte)
+        out.push((float_bits >> 24) as u8);
+        out.extend_from_slice(&((float_bits >> 8) as i16).to_le_bytes());
+        out.push(float_bits as u8);
+    } else {
+        // other negative float: 5 bytes
+        out.push(0xFF);
+        out.extend_from_slice(&float_bits.to_le_bytes());
+    }
+}
+
+/// Lucene90CompressingStoredFieldsWriter.writeZDouble (:392-415).
+pub fn write_zdouble(out: &mut Vec<u8>, d: f64) {
+    let int_val = d as i32;
+    let double_bits = d.to_bits() as i64;
+    const NEGATIVE_ZERO_DOUBLE: i64 = (-0.0f64).to_bits() as i64;
+    if d == int_val as f64 && (-1..=0x7c).contains(&int_val) && double_bits != NEGATIVE_ZERO_DOUBLE {
+        // small integer value [-1..124]: single byte
+        out.push(0x80 | (int_val + 1) as u8);
+    } else if d == d as f32 as f64 {
+        // accurate float representation: 5 bytes
+        out.push(0xFE);
+        out.extend_from_slice(&((d as f32).to_bits() as i32).to_le_bytes());
+    } else if double_bits >= 0 {
+        // other positive doubles: 8 bytes (byte + LE int + LE short + byte)
+        out.push((double_bits >> 56) as u8);
+        out.extend_from_slice(&((double_bits >> 24) as i32).to_le_bytes());
+        out.extend_from_slice(&((double_bits >> 8) as i16).to_le_bytes());
+        out.push(double_bits as u8);
+    } else {
+        // other negative doubles: 9 bytes
+        out.push(0xFF);
+        out.extend_from_slice(&double_bits.to_le_bytes());
+    }
+}
+
+fn write_vlong_raw(out: &mut Vec<u8>, mut v: u64) {
+    while v & !0x7f != 0 {
+        out.push(((v & 0x7f) as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn write_vint_raw(out: &mut Vec<u8>, v: i32) {
+    debug_assert!(v >= 0);
+    write_vlong_raw(out, v as u32 as u64);
+}
+
+fn write_zint_raw(out: &mut Vec<u8>, v: i32) {
+    write_vlong_raw(out, ((v << 1) ^ (v >> 31)) as u32 as u64);
+}
+
+/// StoredFieldsInts.writeInts (:31-58) over non-negative ints.
+fn stored_fields_write_ints(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+    debug_assert!(values.iter().all(|&v| v >= 0));
+    let all_equal = values.iter().all(|&v| v == values[0]);
+    if all_equal {
+        out.write_byte(0)?;
+        out.write_vint(values[0])
+    } else {
+        let mut max: u32 = 0;
+        for &v in values {
+            max |= v as u32;
+        }
+        if max <= 0xff {
+            out.write_byte(8)?;
+            write_ints8(out, values)
+        } else if max <= 0xffff {
+            out.write_byte(16)?;
+            write_ints16(out, values)
+        } else {
+            out.write_byte(32)?;
+            write_ints32(out, values)
+        }
+    }
+}
+
+// StoredFieldsInts interleaves 128-value blocks into longs (written LE).
+const SF_BLOCK: usize = 128;
+
+/// StoredFieldsInts.writeInts8 (:60-81).
+fn write_ints8(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+    let count = values.len();
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..16 {
+            let l: u64 = ((values[k + i] as u64) << 56)
+                | ((values[k + 16 + i] as u64) << 48)
+                | ((values[k + 32 + i] as u64) << 40)
+                | ((values[k + 48 + i] as u64) << 32)
+                | ((values[k + 64 + i] as u64) << 24)
+                | ((values[k + 80 + i] as u64) << 16)
+                | ((values[k + 96 + i] as u64) << 8)
+                | (values[k + 112 + i] as u64);
+            out.write_long(l as i64)?;
+        }
+        k += SF_BLOCK;
+    }
+    for &v in &values[k..] {
+        out.write_byte(v as u8)?;
+    }
+    Ok(())
+}
+
+/// StoredFieldsInts.writeInts16 (:83-100).
+fn write_ints16(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+    let count = values.len();
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..32 {
+            let l: u64 = ((values[k + i] as u64) << 48)
+                | ((values[k + 32 + i] as u64) << 32)
+                | ((values[k + 64 + i] as u64) << 16)
+                | (values[k + 96 + i] as u64);
+            out.write_long(l as i64)?;
+        }
+        k += SF_BLOCK;
+    }
+    for &v in &values[k..] {
+        out.write_short(v as i16)?;
+    }
+    Ok(())
+}
+
+/// StoredFieldsInts.writeInts32 (:102-115).
+fn write_ints32(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+    let count = values.len();
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..64 {
+            let l: u64 = ((values[k + i] as u64) << 32) | (values[k + 64 + i] as u64);
+            out.write_long(l as i64)?;
+        }
+        k += SF_BLOCK;
+    }
+    for &v in &values[k..] {
+        out.write_int(v)?;
+    }
+    Ok(())
+}
+
+/// Lucene90CompressingStoredFieldsWriter.saveInts (:199-205).
+fn save_ints(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+    if values.len() == 1 {
+        out.write_vint(values[0])
+    } else {
+        stored_fields_write_ints(out, values)
+    }
+}
+
+/// LZ4WithPresetDictCompressionMode.LZ4WithPresetDictCompressor.compress
+/// (:172-195) semantics, written with `dict_length = 0` and a single
+/// sub-block per chunk: dict/block lengths are per-chunk header values that
+/// the decompressor honors generically
+/// (LZ4WithPresetDictCompressionMode.LZ4WithPresetDictDecompressor.decompress),
+/// so one whole-chunk LZ4 block is a legal encoding. It compresses faster
+/// (one call instead of ~11 small ones) and better (matches span the whole
+/// chunk); the trade-off is read-side amplification, which only affects
+/// Java-side reads, not our write path.
+fn compress_lz4(bytes: &[u8], out: &mut ChecksumIndexOutput) -> io::Result<()> {
+    let len = bytes.len();
+    let dict_length = 0usize;
+    let block_length = len.max(1);
+    out.write_vint(dict_length as i32)?;
+    out.write_vint(block_length as i32)?;
+
+    // Empty dict still materializes as a 1-byte LZ4 stream (0x00 token),
+    // which the decompressor consumes when dict_length == 0.
+    let dict_block = lz4_block_compress(&[])?;
+    let data_block = lz4_block_compress(bytes)?;
+    out.write_vint(dict_block.len() as i32)?;
+    if len > 0 {
+        out.write_vint(data_block.len() as i32)?;
+    }
+    out.write_bytes(&dict_block)?;
+    if len > 0 {
+        out.write_bytes(&data_block)?;
+    }
+    Ok(())
+}
+
+/// Raw LZ4 block compress (no size header), FAST(2) acceleration: ~30%
+/// faster than acceleration 1 for a negligible ratio change on repetitive
+/// log text. Any conforming LZ4 stream is readable by Lucene's decompressor.
+fn lz4_block_compress(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    lz4::block::compress(bytes, Some(lz4::block::CompressionMode::FAST(2)), false)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lz4 compress: {e}")))
+}
+
+/// Writer for `_X.fdt` / `_X.fdx` / `_X.fdm`.
+pub struct StoredFieldsWriter {
+    fields_stream: ChecksumIndexOutput,
+    meta_stream: ChecksumIndexOutput,
+    fdx_name: String,
+    fdt_name: String,
+    fdm_name: String,
+    segment_id: [u8; 16],
+    suffix: String,
+
+    buffered_docs: Vec<u8>,
+    num_stored_fields: Vec<i32>,
+    end_offsets: Vec<i32>,
+    doc_base: i32,
+    num_buffered_docs: i32,
+    num_stored_fields_in_doc: i32,
+
+    chunk_num_docs: Vec<i32>,
+    chunk_start_pointers: Vec<i64>,
+
+    num_chunks: i64,
+    num_dirty_chunks: i64,
+    num_dirty_docs: i64,
+    total_docs_in_chunks: i64,
+}
+
+impl StoredFieldsWriter {
+    /// Creates the writer, writing the .fdm header (+VInt chunkSize) and the
+    /// .fdt header, like the Java constructor (:103-164).
+    pub fn new(dir: &FSDirectory, segment: &str, segment_id: [u8; 16], suffix: &str) -> io::Result<Self> {
+        let [fdt_name, fdx_name, fdm_name] = file_names(segment, suffix);
+
+        let mut meta_stream = dir.create_output(&fdm_name)?;
+        write_index_header(
+            &mut meta_stream,
+            &format!("{INDEX_CODEC_NAME}Meta"),
+            FDT_VERSION,
+            &segment_id,
+            suffix,
+        )?;
+
+        let mut fields_stream = dir.create_output(&fdt_name)?;
+        write_index_header(&mut fields_stream, FDT_CODEC_NAME, FDT_VERSION, &segment_id, suffix)?;
+
+        meta_stream.write_vint(CHUNK_SIZE as i32)?;
+
+        Ok(StoredFieldsWriter {
+            fields_stream,
+            meta_stream,
+            fdx_name,
+            fdt_name,
+            fdm_name,
+            segment_id,
+            suffix: suffix.to_string(),
+            buffered_docs: Vec::new(),
+            num_stored_fields: Vec::new(),
+            end_offsets: Vec::new(),
+            doc_base: 0,
+            num_buffered_docs: 0,
+            num_stored_fields_in_doc: 0,
+            chunk_num_docs: Vec::new(),
+            chunk_start_pointers: Vec::new(),
+            num_chunks: 0,
+            num_dirty_chunks: 0,
+            num_dirty_docs: 0,
+            total_docs_in_chunks: 0,
+        })
+    }
+
+    pub fn start_document(&mut self) {
+        // no-op, mirrors StoredFieldsWriter.startDocument (:180-181)
+    }
+
+    /// Serializes one field into the buffered docs (:272-328).
+    pub fn write_field(&mut self, field_number: u32, value: &StoredField) {
+        self.num_stored_fields_in_doc += 1;
+        let buf = &mut self.buffered_docs;
+        let info_and_bits = ((field_number as i64) << 3) | value.type_tag();
+        write_vlong_raw(buf, info_and_bits as u64);
+        match value {
+            StoredField::String(s) => {
+                write_vint_raw(buf, s.len() as i32);
+                buf.extend_from_slice(s.as_bytes());
+            }
+            StoredField::Bytes(b) => {
+                write_vint_raw(buf, b.len() as i32);
+                buf.extend_from_slice(b);
+            }
+            StoredField::Int(v) => write_zint_raw(buf, *v),
+            StoredField::Long(v) => write_tlong(buf, *v),
+            StoredField::Float(v) => write_zfloat(buf, *v),
+            StoredField::Double(v) => write_zdouble(buf, *v),
+        }
+    }
+
+    /// finishDocument (:183-197): records the doc and flushes when full.
+    pub fn finish_document(&mut self) -> io::Result<()> {
+        self.num_stored_fields.push(self.num_stored_fields_in_doc);
+        self.num_stored_fields_in_doc = 0;
+        self.end_offsets.push(self.buffered_docs.len() as i32);
+        self.num_buffered_docs += 1;
+        if self.buffered_docs.len() >= CHUNK_SIZE || self.num_buffered_docs >= MAX_DOCS_PER_CHUNK {
+            self.flush(false)?;
+        }
+        Ok(())
+    }
+
+    /// Convenience: writes a whole document.
+    pub fn write_document(&mut self, fields: &[(u32, StoredField)]) -> io::Result<()> {
+        self.start_document();
+        for (number, value) in fields {
+            self.write_field(*number, value);
+        }
+        self.finish_document()
+    }
+
+    /// flush (:234-270).
+    fn flush(&mut self, force: bool) -> io::Result<()> {
+        self.num_chunks += 1;
+        if force {
+            self.num_dirty_chunks += 1;
+            self.num_dirty_docs += self.num_buffered_docs as i64;
+        }
+        self.chunk_num_docs.push(self.num_buffered_docs);
+        self.chunk_start_pointers
+            .push(self.fields_stream.file_pointer() as i64);
+        self.total_docs_in_chunks += self.num_buffered_docs as i64;
+
+        // transform end offsets into lengths (:243-248)
+        let n = self.num_buffered_docs as usize;
+        let mut lengths = self.end_offsets.clone();
+        for i in (1..n).rev() {
+            lengths[i] = self.end_offsets[i] - self.end_offsets[i - 1];
+        }
+        lengths.truncate(n);
+        let num_stored_fields = &self.num_stored_fields[..n];
+
+        let sliced = self.buffered_docs.len() >= 2 * CHUNK_SIZE; // :249
+        let sliced_bit = if sliced { 1 } else { 0 };
+        let dirty_bit = if force { 2 } else { 0 };
+
+        // writeHeader (:207-226)
+        self.fields_stream.write_vint(self.doc_base)?;
+        self.fields_stream
+            .write_vint(((self.num_buffered_docs) << 2) | dirty_bit | sliced_bit)?;
+        save_ints(&mut self.fields_stream, num_stored_fields)?;
+        save_ints(&mut self.fields_stream, &lengths)?;
+
+        // compress (:252-264)
+        if sliced {
+            for slice in self.buffered_docs.chunks(CHUNK_SIZE) {
+                compress_lz4(slice, &mut self.fields_stream)?;
+            }
+        } else {
+            let docs = std::mem::take(&mut self.buffered_docs);
+            compress_lz4(&docs, &mut self.fields_stream)?;
+            self.buffered_docs = docs;
+        }
+
+        // reset (:266-269)
+        self.doc_base += self.num_buffered_docs;
+        self.num_buffered_docs = 0;
+        self.buffered_docs.clear();
+        self.num_stored_fields.clear();
+        self.end_offsets.clear();
+        Ok(())
+    }
+
+    /// finish (:472-490) + FieldsIndexWriter.finish (:106-182). Writes .fdx,
+    /// completes .fdm, and footers .fdt/.fdx/.fdm. Java collects the index
+    /// deltas in temp files; we collect them in memory — the byte layout of
+    /// the outputs is identical.
+    pub fn finish(mut self, num_docs: i32, dir: &FSDirectory) -> io::Result<StoredFieldsStats> {
+        if self.num_buffered_docs > 0 {
+            self.flush(true)?;
+        }
+        if self.doc_base != num_docs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("wrote {} docs, finish called with numDocs={num_docs}", self.doc_base),
+            ));
+        }
+        let total_chunks = self.chunk_num_docs.len();
+        let max_pointer = self.fields_stream.file_pointer() as i64;
+
+        // FieldsIndexWriter.finish: create .fdx and write its header (:114-116)
+        let mut data_out = dir.create_output(&self.fdx_name)?;
+        write_index_header(
+            &mut data_out,
+            &format!("{INDEX_CODEC_NAME}Idx"),
+            FIELDS_INDEX_VERSION,
+            &self.segment_id,
+            &self.suffix,
+        )?;
+
+        // .fdm steps 3-4: numDocs, blockShift, totalChunks+1, docsStartPointer (:118-121)
+        self.meta_stream.write_int(num_docs)?;
+        self.meta_stream.write_int(BLOCK_SHIFT as i32)?;
+        self.meta_stream.write_int(total_chunks as i32 + 1)?;
+        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+
+        // docs DirectMonotonic: 0, then cumulative doc counts (:128-136)
+        let mut doc_values: Vec<u64> = Vec::with_capacity(total_chunks + 1);
+        let mut doc = 0u64;
+        doc_values.push(doc);
+        for &n in &self.chunk_num_docs {
+            doc += n as u64;
+            doc_values.push(doc);
+        }
+        debug_assert_eq!(doc, num_docs as u64);
+        direct_monotonic_write(&mut self.meta_stream, &mut data_out, &doc_values, BLOCK_SHIFT)?;
+
+        // .fdm step 6: startPointersStartPointer (:149)
+        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+
+        // filePointers DirectMonotonic: chunk start pointers + maxPointer (:156-167)
+        let mut fp_values: Vec<u64> = Vec::with_capacity(total_chunks + 1);
+        for &fp in &self.chunk_start_pointers {
+            fp_values.push(fp as u64);
+        }
+        fp_values.push(max_pointer as u64);
+        direct_monotonic_write(&mut self.meta_stream, &mut data_out, &fp_values, BLOCK_SHIFT)?;
+
+        // .fdm steps 8-9: startPointersEndPointer, maxPointer (:177-178)
+        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+        self.meta_stream.write_long(max_pointer)?;
+        write_footer(&mut data_out)?;
+
+        // .fdm step 10 + footer; fdt footer (:483-488)
+        self.meta_stream.write_vlong(self.num_chunks)?;
+        self.meta_stream.write_vlong(self.num_dirty_chunks)?;
+        self.meta_stream.write_vlong(self.num_dirty_docs)?;
+        write_footer(&mut self.meta_stream)?;
+        write_footer(&mut self.fields_stream)?;
+
+        self.meta_stream.flush()?;
+        self.fields_stream.flush()?;
+        data_out.flush()?;
+
+        Ok(StoredFieldsStats {
+            num_chunks: self.num_chunks,
+            num_dirty_chunks: self.num_dirty_chunks,
+            num_dirty_docs: self.num_dirty_docs,
+            fdt_name: self.fdt_name,
+            fdx_name: self.fdx_name,
+            fdm_name: self.fdm_name,
+        })
+    }
+}
+
+impl StoredField {
+    fn type_tag(&self) -> i64 {
+        match self {
+            StoredField::String(_) => TYPE_STRING,
+            StoredField::Bytes(_) => TYPE_BYTE_ARR,
+            StoredField::Int(_) => TYPE_NUMERIC_INT,
+            StoredField::Long(_) => TYPE_NUMERIC_LONG,
+            StoredField::Float(_) => TYPE_NUMERIC_FLOAT,
+            StoredField::Double(_) => TYPE_NUMERIC_DOUBLE,
+        }
+    }
+}
+
+pub struct StoredFieldsStats {
+    pub num_chunks: i64,
+    pub num_dirty_chunks: i64,
+    pub num_dirty_docs: i64,
+    pub fdt_name: String,
+    pub fdx_name: String,
+    pub fdm_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::IndexOutput;
+
+    fn ints_bytes(values: &[i32]) -> Vec<u8> {
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        stored_fields_write_ints(&mut out, values).unwrap();
+        out.into_bytes()
+    }
+
+    #[test]
+    fn stored_fields_ints_all_equal() {
+        assert_eq!(ints_bytes(&[5, 5, 5]), vec![0, 5]);
+    }
+
+    #[test]
+    fn stored_fields_ints_bpv8_tail_only() {
+        // < 128 values, not all equal => byte 8 + raw bytes
+        assert_eq!(ints_bytes(&[1, 2, 3]), vec![8, 1, 2, 3]);
+    }
+
+    #[test]
+    fn stored_fields_ints_bpv8_full_block() {
+        // 128 values: 16 LE longs, each interleaving strides of 16
+        let values: Vec<i32> = (0..128).collect();
+        let bytes = ints_bytes(&values);
+        assert_eq!(bytes.len(), 1 + 128);
+        assert_eq!(bytes[0], 8);
+        // first long: v[0]<<56 | v[16]<<48 | ... | v[112], written LE =>
+        // bytes on disk: v[112], v[96], v[80], v[64], v[48], v[32], v[16], v[0]
+        assert_eq!(&bytes[1..9], &[112, 96, 80, 64, 48, 32, 16, 0]);
+        // second long: v[113], v[97], ..., v[1]
+        assert_eq!(&bytes[9..17], &[113, 97, 81, 65, 49, 33, 17, 1]);
+    }
+
+    #[test]
+    fn stored_fields_ints_bpv16() {
+        let mut values = vec![0x1234i32; 129];
+        values[0] = 0x0001; // not all equal, max > 0xff
+        let bytes = ints_bytes(&values);
+        assert_eq!(bytes[0], 16);
+        assert_eq!(bytes.len(), 1 + 256 + 2); // full 128-block + 1 LE short tail
+                                              // first long: v[0]<<48 | v[32]<<32 | v[64]<<16 | v[96], LE
+        let first = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
+        assert_eq!(first, 0x0001_1234_1234_1234);
+        // tail short: values[128] = 0x1234 LE
+        assert_eq!(&bytes[257..259], &[0x34, 0x12]);
+    }
+
+    #[test]
+    fn stored_fields_ints_bpv32() {
+        let mut values = vec![0x01020304i32; 65];
+        values[64] = 0x05060708;
+        let bytes = ints_bytes(&values);
+        assert_eq!(bytes[0], 32);
+        // < 128 values => no interleaved longs, 65 LE ints
+        assert_eq!(bytes.len(), 1 + 65 * 4);
+        assert_eq!(&bytes[1..5], &[4, 3, 2, 1]);
+        assert_eq!(&bytes[257..261], &[8, 7, 6, 5]);
+    }
+
+    #[test]
+    fn stored_fields_ints_single_value_via_save_ints() {
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        save_ints(&mut out, &[42]).unwrap();
+        assert_eq!(out.into_bytes(), vec![42]); // bare VInt, no bpv byte
+    }
+
+    #[test]
+    fn tlong_all_branches() {
+        // 00: not a multiple of 1000, small zigzag
+        let mut b = Vec::new();
+        write_tlong(&mut b, 1);
+        assert_eq!(b, vec![0x02]); // header 00 | zigzag(1)=2
+
+        // negative raw value
+        let mut b = Vec::new();
+        write_tlong(&mut b, -1);
+        assert_eq!(b, vec![0x01]); // zigzag(-1)=1
+
+        // continuation bit: zigzag >= 32
+        let mut b = Vec::new();
+        write_tlong(&mut b, 999);
+        // zigzag(999) = 1998 = 0b11111001110; low5=0b01110=14, upper=62
+        assert_eq!(b, vec![0x20 | 14, 62]);
+
+        // 01: second precision
+        let mut b = Vec::new();
+        write_tlong(&mut b, 2000); // 2s
+        assert_eq!(b, vec![SECOND_ENCODING | 4]); // zigzag(2)=4
+
+        // 10: hour precision
+        let mut b = Vec::new();
+        write_tlong(&mut b, 2 * HOUR + HOUR); // 3h, not multiple of day
+        assert_eq!(b, vec![HOUR_ENCODING | 6]); // zigzag(3)=6
+
+        // 11: day precision
+        let mut b = Vec::new();
+        write_tlong(&mut b, 2 * DAY);
+        assert_eq!(b, vec![DAY_ENCODING | 4]); // zigzag(2)=4
+
+        // day precision with continuation: 20 days => zigzag(20)=40=0b101000
+        let mut b = Vec::new();
+        write_tlong(&mut b, 20 * DAY);
+        assert_eq!(b, vec![DAY_ENCODING | 0x20 | 8, 1]); // low5=8, upper=1
+    }
+
+    #[test]
+    fn zfloat_branches() {
+        let mut b = Vec::new();
+        write_zfloat(&mut b, 1.0);
+        assert_eq!(b, vec![0x80 | 2]);
+        let mut b = Vec::new();
+        write_zfloat(&mut b, -1.0);
+        assert_eq!(b, vec![0x80]); // 0x80 | (1 + -1)
+
+        // -0.0 must NOT take the single-byte branch
+        let mut b = Vec::new();
+        write_zfloat(&mut b, -0.0);
+        assert_eq!(b.len(), 5);
+        assert_eq!(b[0], 0xFF);
+
+        // positive non-integral: 4 bytes
+        let mut b = Vec::new();
+        write_zfloat(&mut b, 1.5);
+        assert_eq!(b.len(), 4);
+        let bits = 1.5f32.to_bits();
+        assert_eq!(
+            b,
+            vec![
+                (bits >> 24) as u8,
+                (bits >> 8) as u8,        // LE short low byte: bits 8..16
+                ((bits >> 16) & 0xff) as u8, // LE short high byte: bits 16..24
+                bits as u8
+            ]
+        );
+
+        // negative non-integral: 5 bytes
+        let mut b = Vec::new();
+        write_zfloat(&mut b, -1.5);
+        assert_eq!(b.len(), 5);
+        assert_eq!(b[0], 0xFF);
+        assert_eq!(&b[1..], &(-1.5f32).to_bits().to_le_bytes());
+    }
+
+    #[test]
+    fn zdouble_branches() {
+        let mut b = Vec::new();
+        write_zdouble(&mut b, 3.0);
+        assert_eq!(b, vec![0x80 | 4]);
+
+        // float-representable: 5 bytes
+        let mut b = Vec::new();
+        write_zdouble(&mut b, 0.5);
+        assert_eq!(b.len(), 5);
+        assert_eq!(b[0], 0xFE);
+        assert_eq!(&b[1..], &0.5f32.to_bits().to_le_bytes());
+
+        // positive, not float-representable: 8 bytes
+        let mut b = Vec::new();
+        write_zdouble(&mut b, 0.1);
+        assert_eq!(b.len(), 8);
+        let bits = 0.1f64.to_bits();
+        assert_eq!(
+            b,
+            vec![
+                (bits >> 56) as u8,
+                (bits >> 24) as u8, // LE int of bits 24..56
+                (bits >> 32) as u8,
+                (bits >> 40) as u8,
+                (bits >> 48) as u8,
+                (bits >> 8) as u8, // LE short of bits 8..24
+                (bits >> 16) as u8,
+                bits as u8
+            ]
+        );
+
+        // negative: 9 bytes
+        let mut b = Vec::new();
+        write_zdouble(&mut b, -0.1);
+        assert_eq!(b.len(), 9);
+        assert_eq!(b[0], 0xFF);
+        assert_eq!(&b[1..], &(-0.1f64).to_bits().to_le_bytes());
+    }
+
+    #[test]
+    fn lz4_round_trip_block_format() {
+        // data with repetition so LZ4 actually finds matches
+        let mut raw = Vec::new();
+        for i in 0..2000 {
+            raw.extend_from_slice(format!("doc-{i:04}-the-quick-brown-fox. ").as_bytes());
+        }
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        compress_lz4(&raw, &mut out).unwrap();
+        let bytes = out.into_bytes();
+
+        // decode the stream: VInt dictLength, VInt blockLength, length table, data
+        let mut pos = 0;
+        let read_vint = |pos: &mut usize| -> usize {
+            let mut v = 0usize;
+            let mut shift = 0;
+            loop {
+                let b = bytes[*pos];
+                *pos += 1;
+                v |= ((b & 0x7f) as usize) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            v
+        };
+        let dict_length = read_vint(&mut pos);
+        let block_length = read_vint(&mut pos);
+        // single-sub-block layout: no dict, one whole-chunk block
+        assert_eq!(dict_length, 0);
+        assert_eq!(block_length, raw.len());
+        let num_blocks = (raw.len() - dict_length).div_ceil(block_length);
+        let mut lengths = Vec::new();
+        for _ in 0..=num_blocks {
+            lengths.push(read_vint(&mut pos));
+        }
+        // decompress dict and sub-blocks, concatenate
+        let mut decoded = Vec::new();
+        for (i, &l) in lengths.iter().enumerate() {
+            let want = if i == 0 {
+                dict_length
+            } else {
+                let remaining = raw.len() - dict_length - (i - 1) * block_length;
+                remaining.min(block_length)
+            };
+            let block = lz4::block::decompress(&bytes[pos..pos + l], Some(want as i32))
+                .expect("lz4 decompress");
+            decoded.extend_from_slice(&block);
+            pos += l;
+        }
+        assert_eq!(decoded, raw);
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn fdt_header_length_matches_java_assert() {
+        // writer ctor asserts indexHeaderLength(formatName, "") == filePointer (:142-143)
+        assert_eq!(index_header_length(FDT_CODEC_NAME, ""), 54);
+        assert_eq!(index_header_length("Lucene90FieldsIndexIdx", ""), 48);
+        assert_eq!(index_header_length("Lucene90FieldsIndexMeta", ""), 49);
+    }
+}

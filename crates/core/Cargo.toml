@@ -1,0 +1,7 @@
+[package]
+name = "rustlucene-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codec-lucene9 = { path = "../codec-lucene9" }

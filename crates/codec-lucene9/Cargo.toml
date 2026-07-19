@@ -1,0 +1,9 @@
+[package]
+name = "codec-lucene9"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast = "1.5.0"
+lz4 = "1.28"
+rand = "0.10.2"

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/codec-lucene9", "crates/jni-binding"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -37,9 +37,10 @@
 
 ### 工具与集成
 
-- CLI `rustlucene-cli`：`write` / `bench` / `index <文件或目录> [--positions] [--docs N]` / `logwrite` / `logbench`
-- JNI 绑定（`crates/jni-binding`，cdylib）：`RustIndexWriter` 供 Java 进程内调用
-- 互操作脚本：`interop/verify-index.sh`、`interop/verify-log.sh`、`interop/compare-index.sh`（同语料双侧建索引 + CheckIndex + term 级 diff）；`make interop-test` / `log-test` / `bench` / `log-bench` / `compare`
+- CLI `rustlucene-cli`：`write` / `bench` / `index <文件或目录> [--positions] [--docs N]` / `logwrite` / `logbench` / `jsonindex <jsonlFile> <indexDir> <schemaSpec>` / `jsongen`
+- JNI 绑定（`crates/jni-binding`，cdylib）：`RustIndexWriter` 供 Java 进程内调用；除逐字段 API 外提供**批量 JSON 写入** `addJsonBatch(byte[][])`——原始 JSON 字节整批一次 JNI 穿越，解析 / 强转 / 过滤 / 绑定全在 Rust 内闭环
+- JSON 绑定层（`core/src/json.rs`）：schema spec 声明类型与索引配置（`name:type+mods[@json键]`、`$policy=` 指令），未知字段三策略：`strict`（过滤）/ `dynamic`（按值类型推断并自动注册，对齐 Lucene 动态字段语义）/ `stored-only`
+- 互操作脚本：`interop/verify-index.sh`、`interop/verify-log.sh`、`interop/compare-index.sh`（同语料双侧建索引 + CheckIndex + term 级 diff，`--json` 模式为 rust / java-jni / java 三方对比）；`make interop-test` / `log-test` / `bench` / `log-bench` / `compare`
 
 ## 核心数据结构
 
@@ -97,6 +98,16 @@
 | add 延迟 p50 / p99 | 2.0–2.2 / 5.5–11.3 µs | 6.2–9.7 / 16.7–77.2 µs | ~3x / ~7x |
 
 索引体积与 Java 基本相当（差 ~2%，bigdict 场景 47.73MB vs 48.16MB）。瓶颈分布：postings 热路径（分词 + 词典）~31%、LZ4 ~12.5%——BKD/DV 写入合计仅 ~4%。
+
+JSONL 写入（20 万篇 7 字段日志 JSON，`compare-index.sh --json` 口径，单线程，含文件 IO 与 JSON 解析）：
+
+| writer | docs/s | user CPU | maxrss |
+|---|---|---|---|
+| rust jsonindex（纯 Rust 读文件） | 152k | 1.14 s | 95 MB |
+| **java + JNI 批量（`addJsonBatch`，1000 篇/批）** | 127k | 1.69 s | 181 MB |
+| java stock Lucene 9.12.3 | 46k | 8.45 s | 185 MB |
+
+JNI 批量路径达到纯 Rust 的 ~84%、stock Java 的 2.8×——每批一次 JNI 穿越摊薄了调用开销，JSON 解析只在 Rust 侧发生一次；剩余差距主要是 `byte[]` 拷贝。JIT 预热 / 火焰图 CPU 归因分析见 `docs/bench-jit-warmup-flamegraph.md`。
 
 ## 格式兼容验证
 

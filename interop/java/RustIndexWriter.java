@@ -33,6 +33,18 @@ public class RustIndexWriter implements AutoCloseable {
     public void addLong(String field, long value) { nativeAddLong(handle, field, value); }
     public void addInt(String field, int value) { nativeAddInt(handle, field, value); }
     public void endDocument() { nativeEndDocument(handle); }
+
+    /**
+     * Adds a batch of raw JSON documents (one flat JSON object per element,
+     * UTF-8 bytes). Parsing, schema binding, type coercion and the
+     * unknown-field policy (schema-spec {@code $policy=...}) all run inside
+     * Rust; the whole batch crosses JNI once. A malformed line or a failing
+     * document never aborts the batch.
+     *
+     * @return packed result: {@code (okCount << 32) | (failedCount & 0xffffffffL)}
+     */
+    public long addJsonBatch(byte[][] docs) { return nativeAddJsonBatch(handle, docs); }
+
     public void flush() { nativeFlush(handle); }
     public void commit() { nativeCommit(handle); }
 
@@ -51,6 +63,7 @@ public class RustIndexWriter implements AutoCloseable {
     private static native long nativeAddLong(long handle, String field, long value);
     private static native long nativeAddInt(long handle, String field, int value);
     private static native long nativeEndDocument(long handle);
+    private static native long nativeAddJsonBatch(long handle, byte[][] docs);
     private static native long nativeFlush(long handle);
     private static native long nativeCommit(long handle);
     private static native long nativeClose(long handle);

@@ -5,79 +5,31 @@
 //! serialized access (a single IndexWriter is single-threaded by design; use
 //! one writer per thread/shard for parallel ingestion).
 //!
-//! Schema spec string: comma-separated `name:type[+modifier...]` entries.
-//! Types: `text`, `keyword`, `longpoint`, `intpoint`, `numericdv`,
-//! `sorteddv`, `stored`. Modifiers: `positions` (text), `stored` (point/DV
-//! fields), `numericdv` (longpoint/intpoint), `sorteddv` (keyword).
+//! Schema spec string: comma-separated `name:type[+modifier...]` entries,
+//! each optionally suffixed with `@json键` (bind a differently named JSON
+//! key), plus a `$policy=strict|dynamic|stored-only` directive for unknown
+//! JSON fields. Types: `text`, `keyword`, `longpoint`, `intpoint`,
+//! `numericdv`, `sorteddv`, `stored`. Modifiers: `positions` (text),
+//! `stored` (point/DV fields), `numericdv` (longpoint/intpoint), `sorteddv`
+//! (keyword). The parser lives in `rustlucene_core::Schema::parse` so the
+//! CLI and this bridge share one syntax.
 //! Example:
 //! `timestamp:longpoint+numericdv+stored,level:keyword+sorteddv,message:text+positions,latency_ms:numericdv`
 
 use std::path::Path;
 use std::sync::Mutex;
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JByteArray, JClass, JObjectArray, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
-use rustlucene_core::{Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig, Schema};
+use rustlucene_core::{
+    BindOutcome, Document, FieldValue, IndexWriter, IndexWriterConfig, JsonBinder, Schema,
+};
 
 struct WriterHandle {
     writer: IndexWriter,
     current: Option<Document>,
-}
-
-fn parse_schema(spec: &str) -> Result<Schema, String> {
-    let mut schema = Schema::new();
-    for entry in spec.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let mut parts = entry.split(':');
-        let name = parts.next().ok_or("missing field name")?.trim();
-        let mut ty = parts.next().ok_or("missing field type")?.trim();
-        let mut modifiers = "";
-        if let Some((t, m)) = ty.split_once('+') {
-            ty = t.trim();
-            modifiers = m;
-        }
-        let has = |m: &str| modifiers.split('+').any(|x| x.trim() == m);
-        let spec = match ty {
-            "text" => {
-                if has("positions") {
-                    FieldSpec::text_with_positions(name)
-                } else {
-                    FieldSpec::text(name)
-                }
-            }
-            "keyword" => {
-                let mut s = FieldSpec::keyword(name);
-                if has("sorteddv") {
-                    s = s.with_sorted_dv();
-                }
-                s
-            }
-            "longpoint" => {
-                let mut s = FieldSpec::long_point(name);
-                if has("numericdv") {
-                    s = s.with_numeric_dv();
-                }
-                s.with_stored(has("stored"))
-            }
-            "intpoint" => {
-                let mut s = FieldSpec::int_point(name);
-                if has("numericdv") {
-                    s = s.with_numeric_dv();
-                }
-                s.with_stored(has("stored"))
-            }
-            "numericdv" => FieldSpec::numeric_dv(name).with_stored(has("stored")),
-            "sorteddv" => FieldSpec::sorted_dv(name).with_stored(has("stored")),
-            "stored" => FieldSpec::stored(name),
-            other => return Err(format!("unknown field type: {other}")),
-        };
-        schema.add(spec);
-    }
-    Ok(schema)
+    binder: JsonBinder,
 }
 
 fn handle<'a>(ptr: jlong) -> Result<&'a Mutex<WriterHandle>, String> {
@@ -112,7 +64,8 @@ pub extern "system" fn Java_RustIndexWriter_nativeCreate(
 ) -> jlong {
     let path: String = jni_try!(&mut env, env.get_string(&path).map(|s| s.to_string_lossy().into_owned()));
     let spec: String = jni_try!(&mut env, env.get_string(&schema_spec).map(|s| s.to_string_lossy().into_owned()));
-    let schema = jni_try!(&mut env, parse_schema(&spec));
+    let (schema, aliases, policy) = jni_try!(&mut env, Schema::parse(&spec));
+    let binder = JsonBinder::new(&schema, &aliases, policy);
     let writer = jni_try!(
         &mut env,
         IndexWriter::create(Path::new(&path), schema, IndexWriterConfig::default())
@@ -120,6 +73,7 @@ pub extern "system" fn Java_RustIndexWriter_nativeCreate(
     let handle = Box::new(Mutex::new(WriterHandle {
         writer,
         current: None,
+        binder,
     }));
     Box::into_raw(handle) as jlong
 }
@@ -210,6 +164,53 @@ pub extern "system" fn Java_RustIndexWriter_nativeEndDocument(mut env: JNIEnv, _
     }
 }
 
+/// JSON batch write: each element of `docs` is one raw JSON document
+/// (UTF-8 bytes, flat object). Parsing, schema binding, coercion and
+/// unknown-field policy all happen here, so a batch crosses JNI once.
+/// A bad line or a failing document never aborts the batch.
+///
+/// Returns a packed long: `(ok_count << 32) | (failed_count & 0xffffffff)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_RustIndexWriter_nativeAddJsonBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    docs: JObjectArray,
+) -> jlong {
+    let h = jni_try!(&mut env, handle(ptr));
+    let len = jni_try!(&mut env, env.get_array_length(&docs).map_err(|e| e.to_string()));
+    // one lock for the whole batch
+    let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
+    let WriterHandle { writer, binder, .. } = &mut *g;
+    let (mut ok, mut failed) = (0i64, 0i64);
+    for i in 0..len {
+        let elem = match env.get_object_array_element(&docs, i) {
+            Ok(e) => e,
+            Err(e) => {
+                throw(&mut env, "java/io/IOException", &e.to_string());
+                return (ok << 32) | (failed & 0xffff_ffff);
+            }
+        };
+        let bytes = match env.convert_byte_array(JByteArray::from(elem)) {
+            Ok(b) => b,
+            Err(e) => {
+                throw(&mut env, "java/io/IOException", &e.to_string());
+                return (ok << 32) | (failed & 0xffff_ffff);
+            }
+        };
+        match binder.bind(writer.schema_mut(), &bytes) {
+            // newly registered fields (Dynamic/StoredOnly) are already in the
+            // schema; the writer picks them up on add_document
+            BindOutcome::Doc(doc, _new_fields) => match writer.add_document(doc) {
+                Ok(()) => ok += 1,
+                Err(_) => failed += 1,
+            },
+            BindOutcome::Skip => failed += 1,
+        }
+    }
+    (ok << 32) | (failed & 0xffff_ffff)
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_RustIndexWriter_nativeFlush(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
@@ -244,7 +245,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeClose(mut env: JNIEnv, _class:
 
 #[cfg(test)]
 mod tests {
-    use super::parse_schema;
+    use rustlucene_core::Schema;
+
+    fn parse_schema(spec: &str) -> Result<Schema, String> {
+        Schema::parse(spec).map(|(s, _, _)| s)
+    }
 
     #[test]
     fn parses_log_schema() {

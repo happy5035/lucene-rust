@@ -63,6 +63,13 @@ impl IndexWriter {
         })
     }
 
+    /// Mutable access to the schema for dynamic field registration (JSON
+    /// Dynamic/StoredOnly policies). The schema is append-only; the current
+    /// segment builder picks up new fields on the next `add_document`.
+    pub fn schema_mut(&mut self) -> &mut Schema {
+        &mut self.schema
+    }
+
     pub fn add_document(&mut self, doc: Document) -> io::Result<()> {
         if self.builder.is_none() {
             self.builder = Some(SegmentBuilder::new(self.dir.clone(), self.segment_counter));

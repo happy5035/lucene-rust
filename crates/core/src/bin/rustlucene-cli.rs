@@ -18,8 +18,8 @@ use std::time::Instant;
 use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
 use codec_lucene9::FSDirectory;
 use rustlucene_core::{
-    commit_segments, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig, Schema,
-    SegmentBuilder,
+    commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
+    JsonBinder, Schema, SegmentBuilder,
 };
 
 /// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
@@ -494,8 +494,77 @@ fn index_files(
     );
     Ok(())
 }
+/// Indexes a JSONL file (one flat JSON object per line) through the shared
+/// schema-spec parser + JsonBinder: the same path the JNI batch API uses.
+/// Unparseable/non-object lines are counted as skipped.
+fn json_index(
+    jsonl_file: &Path,
+    index_dir: &Path,
+    schema_spec: &str,
+    target_docs: Option<u64>,
+) -> std::io::Result<()> {
+    let (schema, aliases, policy) =
+        Schema::parse(schema_spec).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let binder = JsonBinder::new(&schema, &aliases, policy);
+    let mut w = IndexWriter::create(index_dir, schema, IndexWriterConfig::default())?;
+    let reader = std::io::BufReader::new(File::open(jsonl_file)?);
+    let t0 = Instant::now();
+    let (mut docs, mut skipped) = (0u64, 0u64);
+    let target = target_docs.unwrap_or(u64::MAX);
+    for line in std::io::BufRead::split(reader, b'\n') {
+        if docs >= target {
+            break;
+        }
+        let line = line?;
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        match binder.bind(w.schema_mut(), &line) {
+            BindOutcome::Doc(doc, _) => {
+                w.add_document(doc)?;
+                docs += 1;
+            }
+            BindOutcome::Skip => skipped += 1,
+        }
+    }
+    w.commit()?;
+    let ms = t0.elapsed().as_millis().max(1);
+    println!(
+        "INDEXED docs={} skipped={} elapsed_ms={} docs_per_sec={:.0}",
+        docs,
+        skipped,
+        ms,
+        docs as f64 * 1000.0 / ms as f64
+    );
+    Ok(())
+}
+
+/// Deterministic JSONL corpus generator (same XorShift stream + vocab as the
+/// other generators). One flat object per line, hand-assembled — message
+/// characters are [a-z0-9 ] so no JSON escaping is needed. `noise_payload`
+/// is deliberately absent from every schema spec: it exercises the
+/// strict/dynamic unknown-field policies.
+fn json_gen(out_file: &Path, num_docs: u64, seed: u64) -> std::io::Result<()> {
+    let vocab = vocab();
+    let mut rng = XorShift::new(seed);
+    let mut out = BufWriter::new(File::create(out_file)?);
+    for doc_id in 0..num_docs {
+        let ts = TS_BASE + doc_id as i64 * 1000 + rng.next_int(1000) as i64;
+        let level = LEVELS[rng.next_int(5) as usize];
+        let trace_id = format!("t-{:016x}", rng.next());
+        let message = gen_message(&mut rng, &vocab, 200);
+        let latency = rng.next_int(10_000);
+        let noise = rng.next_int(1_000_000);
+        writeln!(
+            out,
+            "{{\"timestamp\":{ts},\"level\":\"{level}\",\"trace_id\":\"{trace_id}\",\"message\":\"{message}\",\"latency_ms\":{latency},\"noise_payload\":{noise}}}"
+        )?;
+    }
+    out.flush()
+}
 
 fn collect_files(path: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+
     if path.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
@@ -518,6 +587,8 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli index <inputFileOrDir> <indexDir> [--positions] [--docs N]");
     eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions]");
     eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
+    eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
+    eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
     std::process::exit(2);
 }
 
@@ -591,6 +662,33 @@ fn main() -> std::io::Result<()> {
                 positions,
                 sparse,
                 bigdict,
+            )
+        }
+        "jsonindex" => {
+            if args.len() < 5 {
+                usage();
+            }
+            let mut docs = None;
+            let mut rest = args[5..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--docs" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        docs = Some(v.parse::<u64>().unwrap_or_else(|_| usage()));
+                    }
+                    _ => usage(),
+                }
+            }
+            json_index(Path::new(&args[2]), Path::new(&args[3]), &args[4], docs)
+        }
+        "jsongen" => {
+            if args.len() < 5 {
+                usage();
+            }
+            json_gen(
+                Path::new(&args[2]),
+                args[3].parse().unwrap(),
+                args[4].parse().unwrap(),
             )
         }
         "logbench" => {

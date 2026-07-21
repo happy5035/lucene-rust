@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 codec-lucene9 = { path = "../codec-lucene9" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }

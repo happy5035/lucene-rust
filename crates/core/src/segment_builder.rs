@@ -98,11 +98,16 @@ impl SegmentBuilder {
 
         // 1. .fnm — fields in field-number order. Written first (attributes
         //    are known upfront: Lucene912/0 for indexed, Lucene90/0 for DV).
+        //    Fields the segment never saw data for (possible after dynamic
+        //    schema growth) lose their index/point flags — Lucene never marks
+        //    a field indexed/pointed without data either; all-missing DV
+        //    entries are written regardless (the .fnm/.dvm pairing is
+        //    required: docs/format-notes-docvalues.md §8).
         let mut field_infos_vec: Vec<FieldInfo> = Vec::new();
         for (number, spec) in dw.fields().iter().enumerate() {
             let number = number as i32;
             let mut fi = FieldInfo::stored(&spec.name, number);
-            if spec.is_indexed() {
+            if spec.is_indexed() && field_has_terms(&dw, number as usize) {
                 fi.index_options = spec.index_options;
                 fi.omit_norms = true;
                 fi.attributes
@@ -119,9 +124,11 @@ impl SegmentBuilder {
                     .insert(PFDVF_SUFFIX_KEY.to_string(), PFDVF_SUFFIX_VALUE.to_string());
             }
             if let Some(p) = spec.points {
-                fi.point_dimension_count = 1;
-                fi.point_index_dimension_count = 1;
-                fi.point_num_bytes = p.bytes_per_dim as i32;
+                if field_has_points(&dw, number as usize) {
+                    fi.point_dimension_count = 1;
+                    fi.point_index_dimension_count = 1;
+                    fi.point_num_bytes = p.bytes_per_dim as i32;
+                }
             }
             field_infos_vec.push(fi);
         }
@@ -136,11 +143,15 @@ impl SegmentBuilder {
 
         // 3. Postings (.tim/.tip/.tmd/.doc/.psm[/+.pos]) — only when indexed fields exist.
         let mut postings_files: Vec<String> = Vec::new();
-        let has_indexed = dw.fields().iter().any(|f| f.is_indexed());
+        let has_indexed = dw
+            .fields()
+            .iter()
+            .enumerate()
+            .any(|(n, f)| f.is_indexed() && field_has_terms(&dw, n));
         if has_indexed {
             let mut pw = PostingsWriter::new(&dir, &seg_name, &seg_id)?;
             for (number, spec) in dw.fields().iter().enumerate() {
-                if !spec.is_indexed() {
+                if !spec.is_indexed() || !field_has_terms(&dw, number) {
                     continue;
                 }
                 let buf = dw.field_buffer(number as u32).unwrap();
@@ -208,11 +219,18 @@ impl SegmentBuilder {
 
         // 5. Points (_N.kdd/.kdi/.kdm) — 1D BKD per point field.
         let mut point_files: Vec<String> = Vec::new();
-        let has_points = dw.fields().iter().any(|f| f.points.is_some());
+        let has_points = dw
+            .fields()
+            .iter()
+            .enumerate()
+            .any(|(n, f)| f.points.is_some() && field_has_points(&dw, n));
         if has_points {
             let mut ptw = PointsWriter::new(&dir, &seg_name, &seg_id)?;
             for number in 0..dw.fields().len() {
                 let Some(p) = dw.fields()[number].points else { continue };
+                if !field_has_points(&dw, number) {
+                    continue;
+                }
                 let buf = dw.field_buffer_mut(number as u32).unwrap();
                 let pts = &mut buf.points.as_mut().unwrap().points;
                 if p.bytes_per_dim == 8 {
@@ -246,6 +264,21 @@ impl SegmentBuilder {
 
         Ok(Some(SegmentCommitInfo::new(si, random_id())))
     }
+}
+
+/// Indexed field with at least one term in this segment?
+fn field_has_terms(dw: &DocWriter, number: usize) -> bool {
+    dw.field_buffer(number as u32)
+        .map(|b| b.doc_count > 0)
+        .unwrap_or(false)
+}
+
+/// Point field with at least one point in this segment?
+fn field_has_points(dw: &DocWriter, number: usize) -> bool {
+    dw.field_buffer(number as u32)
+        .and_then(|b| b.points.as_ref())
+        .map(|p| !p.points.is_empty())
+        .unwrap_or(false)
 }
 
 /// Long.toString(v, 36) equivalent for non-negative values.

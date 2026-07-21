@@ -349,6 +349,7 @@ impl DocWriter {
         doc: Document,
         mut sfw: Option<&mut StoredFieldsWriter>,
     ) -> std::io::Result<()> {
+        self.sync_schema(schema);
         let doc_id = self.max_doc;
         if let Some(w) = sfw.as_deref_mut() {
             w.start_document();
@@ -482,6 +483,20 @@ impl DocWriter {
         Ok(())
     }
 
+    /// The schema is append-only; keep the field table a prefix-copy of it so
+    /// field numbers always equal schema indices (Lucene FieldInfos
+    /// numbering), including fields registered mid-stream (dynamic JSON
+    /// schema). Fields not yet seen in this segment get empty buffers; the
+    /// segment builder omits index/point flags for fields with no data.
+    fn sync_schema(&mut self, schema: &Schema) {
+        while self.fields.len() < schema.fields().len() {
+            let spec = schema.fields()[self.fields.len()].clone();
+            self.fields.push(spec.clone());
+            self.buffers
+                .push(FieldBuf::needs_buffer(&spec).then(|| FieldBuf::new(spec)));
+        }
+    }
+
     fn field_number(&mut self, spec: &FieldSpec) -> u32 {
         if let Some(n) = self.fields.iter().position(|f| f.name == spec.name) {
             return n as u32;
@@ -583,6 +598,34 @@ mod tests {
         let pb = dict.postings(dict.find(b"INFO A").unwrap());
         assert_eq!(pb.docs, vec![0, 1]);
         assert!(dict.find(b"INFO").is_none());
+    }
+
+    #[test]
+    fn schema_growth_syncs_field_numbers_to_schema_indices() {
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::text("message"));
+        let mut dw = DocWriter::new();
+        for _ in 0..10 {
+            let mut d = Document::new();
+            d.add("message", FieldValue::Text("hello world".to_string()));
+            dw.add_document(&schema, d, None).unwrap();
+        }
+        // dynamic registration mid-stream (JsonBinder Dynamic policy)
+        schema.add(FieldSpec::keyword("level"));
+        for i in 0..10u32 {
+            let mut d = Document::new();
+            d.add("message", FieldValue::Text("hello".to_string()));
+            d.add("level", FieldValue::Keyword(format!("L{}", i % 2)));
+            dw.add_document(&schema, d, None).unwrap();
+        }
+        // field numbers == schema indices, buffers exist for both
+        assert_eq!(dw.fields()[0].name, "message");
+        assert_eq!(dw.fields()[1].name, "level");
+        let level = dw.field_buffer(1).unwrap();
+        assert_eq!(level.doc_count, 10);
+        let dict = level.dict.as_ref().unwrap();
+        let l0 = dict.postings(dict.find(b"L0").unwrap());
+        assert_eq!(l0.docs, vec![10, 12, 14, 16, 18]);
     }
 
     #[test]

@@ -49,7 +49,20 @@ impl Searcher {
         Ok(())
     }
 
+    /// ConstantScore TermQuery: count = sum of per-segment doc_freq (no
+    /// postings iteration needed — doc_freq is in the TermEntry after
+    /// seek_exact). Fallback to iteration for MatchAll and unknown terms.
     pub fn count(&mut self, query: &Query) -> io::Result<u64> {
+        if let Query::Term { field, term } = query {
+            let mut total = 0u64;
+            for (_doc_base, seg) in self.reader.leaves() {
+                if let Some((_, entry)) = seg.seek_term(field, term)? {
+                    total += entry.doc_freq as u64;
+                }
+            }
+            return Ok(total);
+        }
+        // MatchAll or future query types: iterate
         let mut c = CountCollector::default();
         self.search(query, &mut c)?;
         Ok(c.count)
@@ -62,7 +75,18 @@ impl Searcher {
         Ok((c.total, c.docs))
     }
 
+    /// ConstantScore TermQuery: freq_sum = total_term_freq from TermEntry
+    /// (no postings iteration needed).
     pub fn freq_sum(&mut self, query: &Query) -> io::Result<u64> {
+        if let Query::Term { field, term } = query {
+            let mut total = 0u64;
+            for (_doc_base, seg) in self.reader.leaves() {
+                if let Some((_, entry)) = seg.seek_term(field, term)? {
+                    total += entry.total_term_freq;
+                }
+            }
+            return Ok(total);
+        }
         let mut c = FreqSumCollector::default();
         self.search(query, &mut c)?;
         Ok(c.total_freq)

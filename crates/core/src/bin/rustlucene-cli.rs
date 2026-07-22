@@ -206,6 +206,173 @@ fn doc_csv(docs: &[i32]) -> String {
     s
 }
 
+/// Search benchmark following luceneutil methodology: open index, run term
+/// queries against sampled terms (bucketed by docFreq), measure QPS and
+/// latency percentiles. M1 only supports Term / MatchAll queries.
+///
+/// Uses Java SearchBench --dump-queries output as query source.
+/// Output is tab-separated: query_type freq qps p50_us p90_us p99_us count
+fn searchbench(
+    index_dir: &Path,
+    field: &str,
+    warmup: u32,
+    iter: u32,
+    tasks: usize,
+    seed: u64,
+    load_queries: Option<String>,
+) -> std::io::Result<()> {
+    let dir = FSDirectory::open(index_dir)?;
+    let mut searcher = Searcher::open(&dir)?;
+    let max_doc = searcher.max_doc();
+
+    // Read term file (format: TERM\t<freq>\t<term>\t<docFreq> from Java SearchBench --dump-queries)
+    let query_file = match load_queries {
+        Some(f) => f,
+        None => {
+            eprintln!("searchbench: --load-queries FILE is required (use Java SearchBench --dump-queries to generate)");
+            std::process::exit(2);
+        }
+    };
+    let content = std::fs::read_to_string(&query_file)?;
+    let terms: Vec<(String, String, u32)> = content
+        .lines()
+        .filter(|l| l.starts_with("TERM\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 4 {
+                Some((parts[1].to_string(), parts[2].to_string(), parts[3].parse::<u32>().unwrap_or(0)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if terms.is_empty() {
+        eprintln!("searchbench: no TERM lines in {query_file}");
+        std::process::exit(2);
+    }
+
+    // Classify into freq buckets (luceneutil convention)
+    let low_limit = 10u32;
+    let med_limit = (max_doc as u32 / 100).max(11);
+
+    let mut low_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 <= low_limit).collect();
+    let mut med_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 > low_limit && t.2 <= med_limit).collect();
+    let mut high_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 > med_limit).collect();
+
+    // Shuffle and sample per bucket
+    let mut rng = XorShift::new(seed);
+    let mut shuffle_sample = |v: &mut Vec<&(String, String, u32)>| {
+        // Fisher-Yates shuffle then truncate
+        for i in (1..v.len()).rev() {
+            let j = rng.next_int(i as u64 + 1) as usize;
+            v.swap(i, j);
+        }
+        v.truncate(v.len().min(tasks));
+    };
+    shuffle_sample(&mut low_terms);
+    shuffle_sample(&mut med_terms);
+    shuffle_sample(&mut high_terms);
+
+    // Build work list: (label, term_str)
+    let mut work: Vec<(String, String)> = Vec::new();
+    for t in &low_terms { work.push((format!("term\tlow"), t.1.clone())); }
+    for t in &med_terms { work.push((format!("term\tmed"), t.1.clone())); }
+    for t in &high_terms { work.push((format!("term\thigh"), t.1.clone())); }
+
+    if work.is_empty() {
+        eprintln!("searchbench: no terms after sampling");
+        std::process::exit(2);
+    }
+
+    // Per-group aggregation
+    let mut group_qps: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
+    let mut group_p50: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
+    let mut group_p90: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
+    let mut group_p99: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
+    let mut group_counts: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+
+    // Global warmup: run each query once to prime page cache
+    for (_, term) in &work {
+        let q = Query::term(field, term);
+        let _ = searcher.count(&q);
+    }
+
+    let mut term_counts: Vec<(String, u64)> = Vec::with_capacity(work.len());
+
+    for (label, term) in &work {
+        let q = Query::term(field, term);
+
+        // Warmup iterations
+        for _ in 0..warmup {
+            let _ = searcher.count(&q);
+        }
+
+        // Measurement iterations
+        let mut latencies_ns = Vec::with_capacity(iter as usize);
+        for _ in 0..iter {
+            let t0 = Instant::now();
+            let count = searcher.count(&q)?;
+            latencies_ns.push(t0.elapsed().as_nanos() as u64);
+            // Store count from last iteration for correctness check
+            if latencies_ns.len() == iter as usize {
+                term_counts.push((format!("term={term} bucket={label}"), count));
+            }
+        }
+
+        latencies_ns.sort_unstable();
+        let n = latencies_ns.len();
+        let median_ns = if n % 2 == 0 {
+            (latencies_ns[n / 2 - 1] + latencies_ns[n / 2]) as f64 / 2.0
+        } else {
+            latencies_ns[n / 2] as f64
+        };
+        let qps = 1_000_000_000.0 / median_ns;
+        let p50 = percentile(&latencies_ns, 50.0) / 1000.0;
+        let p90 = percentile(&latencies_ns, 90.0) / 1000.0;
+        let p99 = percentile(&latencies_ns, 99.0) / 1000.0;
+
+        group_qps.entry(label.clone()).or_default().push(qps);
+        group_p50.entry(label.clone()).or_default().push(p50);
+        group_p90.entry(label.clone()).or_default().push(p90);
+        group_p99.entry(label.clone()).or_default().push(p99);
+        group_counts.entry(label.clone()).or_default().push(term_counts.last().unwrap().1);
+    }
+
+    // Print results header
+    println!("query_type\tfreq\tqps\tp50_us\tp90_us\tp99_us\tcount_min\tcount_max");
+    for group in group_qps.keys() {
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let parts: Vec<&str> = group.split('\t').collect();
+        let counts = &group_counts[group];
+        let count_min = counts.iter().min().unwrap_or(&0);
+        let count_max = counts.iter().max().unwrap_or(&0);
+        println!(
+            "{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}",
+            parts[0], parts[1],
+            avg(&group_qps[group]),
+            avg(&group_p50[group]),
+            avg(&group_p90[group]),
+            avg(&group_p99[group]),
+            count_min,
+            count_max,
+        );
+    }
+
+    // Print per-term counts for correctness diff (compare with Java SearchBench)
+    eprintln!("\n# Per-term hit counts (for correctness verification vs Java)");
+    for (label, count) in &term_counts {
+        eprintln!("{label}\t{count}");
+    }
+
+    Ok(())
+}
+
+fn percentile(sorted: &[u64], pct: f64) -> f64 {
+    if sorted.is_empty() { return 0.0; }
+    let idx = ((pct / 100.0 * sorted.len() as f64).ceil() as usize).saturating_sub(1);
+    sorted[idx.min(sorted.len() - 1)] as f64
+}
+
 /// Replays the log corpus generator (same RNG stream as logwrite; the
 /// sparse/bigdict flags only gate whether fields are *added*, the draws are
 /// identical) to recover doc `n`'s trace_id without reading stored fields.
@@ -693,6 +860,7 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
     eprintln!("  rustlucene-cli searchdump <indexDir> <numDocs> <seed>");
+    eprintln!("  rustlucene-cli searchbench <indexDir> <field> [--warmup N] [--iter N] [--tasks N] [--seed S] [--load-queries FILE]");
     std::process::exit(2);
 }
 
@@ -820,6 +988,28 @@ fn main() -> std::io::Result<()> {
                 args[3].parse().unwrap(),
                 args[4].parse().unwrap(),
             )
+        }
+        "searchbench" => {
+            if args.len() < 4 {
+                usage();
+            }
+            let mut warmup = 10u32;
+            let mut iter = 20u32;
+            let mut tasks = 100usize;
+            let mut seed = 42u64;
+            let mut load_queries: Option<String> = None;
+            let mut i = 4;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--warmup" => { warmup = args[i+1].parse().unwrap(); i += 2; }
+                    "--iter"   => { iter   = args[i+1].parse().unwrap(); i += 2; }
+                    "--tasks"  => { tasks  = args[i+1].parse().unwrap(); i += 2; }
+                    "--seed"   => { seed   = args[i+1].parse().unwrap(); i += 2; }
+                    "--load-queries" => { load_queries = Some(args[i+1].clone()); i += 2; }
+                    _ => { eprintln!("unknown arg: {}", args[i]); usage(); }
+                }
+            }
+            searchbench(Path::new(&args[2]), &args[3], warmup, iter, tasks, seed, load_queries)
         }
         _ => usage(),
     }

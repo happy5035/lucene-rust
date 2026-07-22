@@ -69,7 +69,8 @@
   `trait DocIter { doc_id, next_doc, advance }`（DISI 语义照抄，继承体系不要）。
   conjunction 用 lead-iterator 两两对齐；phrase 用 position 合取（对齐 slop=0 路径）。
 - **Collector**：topN by docID / NumericDV / SortedDV 三种堆；MISSING 值规则照抄 9.12.3
-  `FieldComparator`（long 默认排尾、string ord 空排尾）。
+  `FieldComparator`（long 默认排尾、string ord 空排尾）。collector 本身是堆操作，不是热点；
+  查询耗时集中在**喂给它的解码循环**上，性能优化放在解码层（见 §5a SIMD 策略）。
 - **JNI 门面**：reader 句柄 = `Arc<Searcher>` + 句柄表（沿用写侧 IndexWriter 句柄模式）；
   query 以 JSON 字符串传入（复用 core 的 json 基础设施）。Java 类方法签名对齐 Lucene 常用子集
   （`open/close`、`search(query, n, sort) -> TopDocs` 形状），上层替换 Java Lucene 只改 import。
@@ -77,6 +78,29 @@
 ### 惰性加载
 
 open 时只读 segments_N + .si + .fnm；FST / BKD / DV 索引在首次触及该字段时加载。
+
+## 4a. 解码性能与 SIMD 策略
+
+写侧编码事实（`codec-lucene9/src/postings.rs`、`packed.rs`）决定读侧热点全部是
+**固定位宽整数块解码**，这正是 SIMD 的主战场（Lucene 10 对同一格式引入 VectorizedForUtil，
+证明格式与 SIMD 兼容——解码侧自由，字节格式不变）：
+
+| 热点 | 格式来源 | SIMD 方案 |
+|---|---|---|
+| postings .doc/.pos 的 128 块（doc delta + freq + position） | `pfor_util_encode`（ForUtil/PForDelta） | AVX2/SSE2 位移+or 做 128 值 bit-unpack，再标量 patch 异常值 |
+| NumericDV / SortedDV ords 块 | `DirectWriter` 单块、gcd=1（写侧既定简化） | 同一套 bit-unpack 核；写侧简化保证块对齐、无跨块接缝 |
+| BKD 叶 DocIdsWriter BPV24/BPV32 | `points.rs` | 同一套 bit-unpack 核 |
+| doc delta 前缀和 | postings .doc | 标量先行；SIMD prefix-sum 作为二阶优化（收益待 bench 验证） |
+| stored LZ4 块 | `stored_fields.rs` | 不自研——用 `lz4` crate 成熟解码 |
+
+**落地纪律（防止 SIMD 引入格式偏差）：**
+
+1. 先写**标量参考实现**，通过三层测试（round-trip + Java diff 终验）锁定正确性；
+2. SIMD 快路径作为等价实现追加：`is_x86_feature_detected!` 运行时分发（注意
+   x86_64-unknown-linux-musl target 下的 target_feature 检测），每条快路径配
+   "标量 vs SIMD 输出逐值相等"的对拍单测；
+3. SIMD 以 bench 数据为门槛——只对 profile 证实的热点启用，无数据不优化。
+   预期主要收益：高命中 term/boolean 查询的 .doc 全块扫描、DV 排序的列式取值。
 
 ## 4. 数据流（一次查询）
 
@@ -117,13 +141,15 @@ Java: search(handle, queryJson, topN, sortSpec)
 |---|---|
 | 读路径（postings+FST ~1.2k、BKD ~600、DV ~700、stored ~400、indexinput/segments ~300） | 3.5–4k 行 |
 | 执行层（Query/DocIter/conjunction/phrase/collector） | ~1k 行 |
+| SIMD bit-unpack 核 + 运行时分发 + 对拍测试 | ~500 行 |
 | JNI 门面 | ~400 行 |
 | 测试 | ~1.5k 行 |
-| **合计** | **6–7k 行** |
+| **合计** | **6.5–7.5k 行** |
 
 ## 8. 后续优化点（不在本期）
 
 - Wildcard 的自动机与 FST 求交（替代字典扫描）
+- doc delta 的 SIMD prefix-sum（待 bench 数据）
 - mmap IndexInput
 - NRT 原地 refresh（段文件 refcount + writer 删除协议，~800 行）
 - 段间并行搜索

@@ -453,126 +453,218 @@ impl Fst {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::io::IndexOutput;
+// --- Reader-side types and functions (pub(crate)) ---
 
-    /// Minimal reverse reader for unpacked (variable-length) nodes, used to
-    /// round-trip the compiler output. A node's address is the offset of its
-    /// last byte; arcs are read backwards in ascending label order, mirroring
-    /// FST.readArc (:943-991).
-    struct ReadArc {
-        label: u8,
-        flags: u8,
-        output: Option<Vec<u8>>,
-        final_output: Option<Vec<u8>>,
-        is_final: bool,
-        is_last: bool,
-        target: i64,
-    }
+/// A parsed arc from an FST node (reader side).
+/// An FST node's address is the offset of its last byte;
+/// arcs are read backwards in ascending label order, mirroring FST.readArc.
+pub(crate) struct ReadArc {
+    #[allow(dead_code)]
+    pub(crate) label: u8,
+    #[allow(dead_code)]
+    pub(crate) flags: u8,
+    pub(crate) output: Option<Vec<u8>>,
+    pub(crate) final_output: Option<Vec<u8>>,
+    pub(crate) is_final: bool,
+    #[allow(dead_code)]
+    pub(crate) is_last: bool,
+    pub(crate) target: i64,
+}
 
-    /// VInts/VLongs are written low-group-first, so reading the reversed bytes
-    /// from the node's end reassembles them with the first byte read holding
-    /// the lowest 7 bits.
-    fn read_vlong_rev(bytes: &[u8], pos: &mut i64) -> u64 {
-        let mut v = 0u64;
-        let mut shift = 0;
-        loop {
-            let b = bytes[*pos as usize];
-            *pos -= 1;
-            v |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
+/// VInts/VLongs are written low-group-first, so reading the reversed bytes
+/// from the node's end reassembles them with the first byte read holding
+/// the lowest 7 bits.
+pub(crate) fn read_vlong_rev(bytes: &[u8], pos: &mut i64) -> u64 {
+    let mut v = 0u64;
+    let mut shift = 0;
+    loop {
+        let b = bytes[*pos as usize];
+        *pos -= 1;
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            break;
         }
-        v
+        shift += 7;
     }
+    v
+}
 
-    /// ByteSequenceOutputs.read (:122-132) over reversed bytes.
-    fn read_output_rev(bytes: &[u8], pos: &mut i64) -> Vec<u8> {
-        let len = read_vlong_rev(bytes, pos) as usize;
-        let end = *pos as usize;
-        let start = end + 1 - len;
-        let mut v = bytes[start..=end].to_vec();
-        v.reverse();
-        *pos = start as i64 - 1;
-        v
+/// ByteSequenceOutputs.read (:122-132) over reversed bytes.
+pub(crate) fn read_output_rev(bytes: &[u8], pos: &mut i64) -> Vec<u8> {
+    let len = read_vlong_rev(bytes, pos) as usize;
+    let end = *pos as usize;
+    let start = end + 1 - len;
+    let mut v = bytes[start..=end].to_vec();
+    v.reverse();
+    *pos = start as i64 - 1;
+    v
+}
+
+/// Parses the node at `addr`; returns its arcs in label order and the
+/// position just below the node (= address of the node written
+/// immediately before it, which is what BIT_TARGET_NEXT resolves to).
+pub(crate) fn read_node(bytes: &[u8], addr: u64) -> (Vec<ReadArc>, i64) {
+    let mut pos = addr as i64;
+    let mut arcs = Vec::new();
+    loop {
+        let flags = bytes[pos as usize];
+        pos -= 1;
+        let label = bytes[pos as usize];
+        pos -= 1;
+        let output = if flags & BIT_ARC_HAS_OUTPUT != 0 {
+            Some(read_output_rev(bytes, &mut pos))
+        } else {
+            None
+        };
+        let final_output = if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
+            Some(read_output_rev(bytes, &mut pos))
+        } else {
+            None
+        };
+        let target = if flags & BIT_STOP_NODE != 0 {
+            if flags & BIT_FINAL_ARC != 0 {
+                FINAL_END_NODE
+            } else {
+                NON_FINAL_END_NODE
+            }
+        } else if flags & BIT_TARGET_NEXT != 0 {
+            i64::MIN // resolved below, once the whole node is parsed
+        } else {
+            read_vlong_rev(bytes, &mut pos) as i64
+        };
+        let is_last = flags & BIT_LAST_ARC != 0;
+        arcs.push(ReadArc {
+            label,
+            flags,
+            output,
+            final_output,
+            is_final: flags & BIT_FINAL_ARC != 0,
+            is_last,
+            target,
+        });
+        if is_last {
+            break;
+        }
     }
+    for arc in &mut arcs {
+        if arc.target == i64::MIN {
+            arc.target = pos;
+        }
+    }
+    (arcs, pos)
+}
 
-    /// Parses the node at `addr`; returns its arcs in label order and the
-    /// position just below the node (= address of the node written
-    /// immediately before it, which is what BIT_TARGET_NEXT resolves to).
-    fn read_node(bytes: &[u8], addr: u64) -> (Vec<ReadArc>, i64) {
-        let mut pos = addr as i64;
-        let mut arcs = Vec::new();
+// --- Traversal methods on Fst ---
+
+/// Stack frame for depth-first FST traversal.
+struct Frame {
+    arcs: Vec<ReadArc>,
+    output: Vec<u8>,
+    arc_idx: usize,
+    prefix: Vec<u8>,
+}
+
+/// Depth-first iterator over terms in an FST with a given prefix.
+///
+/// Yields `(term, output)` pairs where `output` is the accumulated byte
+/// sequence (empty vec means NO_OUTPUT).
+pub struct FstPrefixIter<'a> {
+    fst: &'a Fst,
+    stack: Vec<Frame>,
+    /// The prefix itself, if it is a term accepted by the FST (emitted first).
+    prefix_term: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl<'a> Iterator for FstPrefixIter<'a> {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Emit the prefix itself as a term first, if applicable.
+        if let Some(item) = self.prefix_term.take() {
+            return Some(item);
+        }
+
         loop {
-            let flags = bytes[pos as usize];
-            pos -= 1;
-            let label = bytes[pos as usize];
-            pos -= 1;
-            let output = if flags & BIT_ARC_HAS_OUTPUT != 0 {
-                Some(read_output_rev(bytes, &mut pos))
-            } else {
-                None
-            };
-            let final_output = if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
-                Some(read_output_rev(bytes, &mut pos))
-            } else {
-                None
-            };
-            let target = if flags & BIT_STOP_NODE != 0 {
-                if flags & BIT_FINAL_ARC != 0 {
-                    FINAL_END_NODE
-                } else {
-                    NON_FINAL_END_NODE
+            let top = self.stack.len().checked_sub(1)?;
+
+            // Extract arc data using an immutable borrow, then release it.
+            let (arc_label, arc_is_final, arc_output, arc_final_output, arc_target, parent_output, parent_prefix) = {
+                let frame = &self.stack[top];
+                if frame.arc_idx >= frame.arcs.len() {
+                    self.stack.pop();
+                    continue;
                 }
-            } else if flags & BIT_TARGET_NEXT != 0 {
-                i64::MIN // resolved below, once the whole node is parsed
-            } else {
-                read_vlong_rev(bytes, &mut pos) as i64
+                let arc = &frame.arcs[frame.arc_idx];
+                (
+                    arc.label,
+                    arc.is_final,
+                    arc.output.clone(),
+                    arc.final_output.clone(),
+                    arc.target,
+                    frame.output.clone(),
+                    frame.prefix.clone(),
+                )
             };
-            let is_last = flags & BIT_LAST_ARC != 0;
-            arcs.push(ReadArc {
-                label,
-                flags,
-                output,
-                final_output,
-                is_final: flags & BIT_FINAL_ARC != 0,
-                is_last,
-                target,
-            });
-            if is_last {
-                break;
-            }
-        }
-        for arc in &mut arcs {
-            if arc.target == i64::MIN {
-                arc.target = pos;
-            }
-        }
-        (arcs, pos)
-    }
 
-    /// Looks up an input, returning its full output (empty vec when the FST
-    /// maps it to NO_OUTPUT) or `None` when the input is not accepted.
-    fn lookup(fst: &Fst, input: &[u8]) -> Option<Vec<u8>> {
-        if input.is_empty() {
-            return fst.empty_output.clone();
+            // Advance the arc index (mutable borrow, no conflict with above).
+            self.stack[top].arc_idx += 1;
+
+            // Build the output for this arc's path.
+            let mut arc_out = parent_output;
+            if let Some(ref o) = arc_output {
+                arc_out.extend_from_slice(o);
+            }
+
+            // If the arc leads to a real node, push child frame.
+            if arc_target > 0 {
+                let (child_arcs, _) = read_node(&self.fst.bytes, arc_target as u64);
+                let mut child_prefix = parent_prefix.clone();
+                child_prefix.push(arc_label);
+                self.stack.push(Frame {
+                    arcs: child_arcs,
+                    output: arc_out.clone(),
+                    arc_idx: 0,
+                    prefix: child_prefix,
+                });
+            }
+
+            // Emit if this arc represents a final state.
+            if arc_is_final {
+                let mut term = parent_prefix;
+                term.push(arc_label);
+                let mut final_out = arc_out;
+                if let Some(ref fo) = arc_final_output {
+                    final_out.extend_from_slice(fo);
+                }
+                return Some((term, final_out));
+            }
+
+            // Non-final arc: continue to the next arc (or child, pushed above).
+            continue;
+        }
+    }
+}
+
+impl Fst {
+    /// Exact term lookup. Returns the accumulated output bytes (empty vec
+    /// means NO_OUTPUT), or `None` if the term is not accepted by the FST.
+    /// Follows Lucene FST.lookup algorithm.
+    pub fn lookup(&self, term: &[u8]) -> Option<Vec<u8>> {
+        if term.is_empty() {
+            return self.empty_output().map(|o| o.to_vec());
         }
         let mut out = Vec::new();
-        let mut node = fst.start_node as i64;
-        for (i, &b) in input.iter().enumerate() {
+        let mut node = self.start_node as i64;
+        for (i, &b) in term.iter().enumerate() {
             if node <= 0 {
-                return None; // walked into an end node: input not accepted
+                return None;
             }
-            let (arcs, _) = read_node(&fst.bytes, node as u64);
+            let (arcs, _) = read_node(&self.bytes, node as u64);
             let arc = arcs.iter().find(|a| a.label == b)?;
             if let Some(o) = &arc.output {
                 out.extend_from_slice(o);
             }
-            if i == input.len() - 1 {
+            if i == term.len() - 1 {
                 if !arc.is_final {
                     return None;
                 }
@@ -586,8 +678,94 @@ mod tests {
             }
             node = arc.target;
         }
-        unreachable!()
+        // We should never reach here because the loop returns or breaks
+        // when i == term.len() - 1.
+        None
     }
+
+    /// Iterate all terms with the given prefix.
+    pub fn prefix_iter(&self, prefix: &[u8]) -> FstPrefixIter<'_> {
+        let (node_addr, start_output, prefix_final_output) = self.walk_to_node(prefix);
+
+        // If the prefix itself is a term in the FST, emit it first.
+        let prefix_term = if let Some(fo) = prefix_final_output.clone() {
+            let mut output = start_output.clone();
+            output.extend_from_slice(&fo);
+            Some((prefix.to_vec(), output))
+        } else if prefix.is_empty() {
+            self.empty_output().map(|o| (Vec::new(), o.to_vec()))
+        } else {
+            None
+        };
+
+        let stack = if node_addr > 0 {
+            let (arcs, _) = read_node(&self.bytes, node_addr as u64);
+            vec![Frame {
+                arcs,
+                output: start_output,
+                arc_idx: 0,
+                prefix: prefix.to_vec(),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        FstPrefixIter {
+            fst: self,
+            stack,
+            prefix_term,
+        }
+    }
+
+    /// Iterate all terms in the FST.
+    pub fn scan_all(&self) -> FstPrefixIter<'_> {
+        self.prefix_iter(b"")
+    }
+
+    /// Walk the FST following `prefix`, returning:
+    /// - `node_addr`: the node at prefix end, or `<= 0` if the prefix is not found.
+    /// - `output`: accumulated output along the path (without final_output).
+    /// - `final_output`: `Some(final_output)` if the last arc in the prefix is
+    ///   final, meaning the prefix itself is an accepted term in the FST.
+    fn walk_to_node(&self, prefix: &[u8]) -> (i64, Vec<u8>, Option<Vec<u8>>) {
+        if prefix.is_empty() {
+            // Empty prefix lands at the root node.
+            if self.start_node == 0 {
+                return (0, Vec::new(), None);
+            }
+            return (self.start_node as i64, Vec::new(), None);
+        }
+        let mut node = self.start_node as i64;
+        let mut output = Vec::new();
+        let last = prefix.len() - 1;
+        for (i, &label) in prefix.iter().enumerate() {
+            if node <= 0 {
+                return (0, Vec::new(), None);
+            }
+            let (arcs, _) = read_node(&self.bytes, node as u64);
+            let arc = match arcs.iter().find(|a| a.label == label) {
+                Some(a) => a,
+                None => return (0, Vec::new(), None),
+            };
+            if let Some(o) = &arc.output {
+                output.extend_from_slice(o);
+            }
+            if i == last {
+                if arc.is_final {
+                    return (arc.target, output, arc.final_output.clone());
+                }
+            }
+            node = arc.target;
+        }
+        (node, output, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::IndexOutput;
+
 
     /// Walks every node reachable from the root checking structural
     /// invariants of the serialized image.
@@ -640,7 +818,7 @@ mod tests {
         for (input, output) in entries {
             let expected = output.unwrap_or(&[]).to_vec();
             assert_eq!(
-                lookup(&fst, input).as_deref(),
+                fst.lookup(input).as_deref(),
                 Some(expected.as_slice()),
                 "lookup {:?}",
                 String::from_utf8_lossy(input)
@@ -660,11 +838,11 @@ mod tests {
             (b"cabd", Some(b"\x09\x09\x09")),
         ];
         let fst = check_round_trip(entries);
-        assert_eq!(lookup(&fst, b""), None);
-        assert_eq!(lookup(&fst, b"ac"), None);
-        assert_eq!(lookup(&fst, b"abb"), None);
-        assert_eq!(lookup(&fst, b"bX"), None);
-        assert_eq!(lookup(&fst, b"d"), None);
+        assert_eq!(fst.lookup(b""), None);
+        assert_eq!(fst.lookup(b"ac"), None);
+        assert_eq!(fst.lookup(b"abb"), None);
+        assert_eq!(fst.lookup(b"bX"), None);
+        assert_eq!(fst.lookup(b"d"), None);
         assert_eq!(fst.empty_output(), None);
     }
 
@@ -689,16 +867,16 @@ mod tests {
             (b"dogs", None),
         ];
         let fst = check_round_trip(entries);
-        assert_eq!(lookup(&fst, b"cat"), Some(vec![]));
-        assert_eq!(lookup(&fst, b"ca"), None);
-        assert_eq!(lookup(&fst, b"do"), None);
+        assert_eq!(fst.lookup(b"cat"), Some(vec![]));
+        assert_eq!(fst.lookup(b"ca"), None);
+        assert_eq!(fst.lookup(b"do"), None);
     }
 
     #[test]
     fn single_input() {
         let fst = check_round_trip(&[(b"hello", Some(b"world"))]);
-        assert_eq!(lookup(&fst, b"hell"), None);
-        assert_eq!(lookup(&fst, b"helloo"), None);
+        assert_eq!(fst.lookup(b"hell"), None);
+        assert_eq!(fst.lookup(b"helloo"), None);
     }
 
     #[test]
@@ -710,7 +888,7 @@ mod tests {
         ];
         let fst = check_round_trip(entries);
         assert_eq!(fst.empty_output(), Some(&b"rc"[..]));
-        assert_eq!(lookup(&fst, b""), Some(b"rc".to_vec()));
+        assert_eq!(fst.lookup(b""), Some(b"rc".to_vec()));
     }
 
     #[test]
@@ -722,8 +900,8 @@ mod tests {
         assert_eq!(fst.bytes(), &[0u8]);
         assert_eq!(fst.num_bytes(), 1);
         assert_eq!(fst.empty_output(), Some(&[][..]));
-        assert_eq!(lookup(&fst, b""), Some(vec![]));
-        assert_eq!(lookup(&fst, b"a"), None);
+        assert_eq!(fst.lookup(b""), Some(vec![]));
+        assert_eq!(fst.lookup(b"a"), None);
     }
 
     #[test]
@@ -793,11 +971,11 @@ mod tests {
         assert!(fst.num_bytes() > 127, "exercises multi-byte VLong targets");
         for (input, output) in &entries {
             let expected = output.clone().unwrap_or_default();
-            assert_eq!(lookup(&fst, input).as_deref(), Some(expected.as_slice()));
+            assert_eq!(fst.lookup(input).as_deref(), Some(expected.as_slice()));
         }
         // Misses: label outside the used alphabet, and an over-long input.
-        assert_eq!(lookup(&fst, b"z"), None);
-        assert_eq!(lookup(&fst, &[b'a'; 13]), None);
+        assert_eq!(fst.lookup(b"z"), None);
+        assert_eq!(fst.lookup(&[b'a'; 13]), None);
     }
 
     #[test]
@@ -874,5 +1052,79 @@ mod tests {
         let mut compiler = FstCompiler::new();
         compiler.add(b"", None);
         compiler.add(b"", Some(b"x"));
+    }
+
+    #[test]
+    fn test_fst_lookup_and_prefix() {
+        let mut compiler = FstCompiler::new();
+        let terms: &[(&[u8], Option<&[u8]>)] = &[
+            (b"aa", Some(b"\x01")),
+            (b"ab", Some(b"\x02")),
+            (b"abc", Some(b"\x03")),
+            (b"b", Some(b"\x04")),
+            (b"ba", Some(b"\x05")),
+            (b"bb", Some(b"\x06")),
+        ];
+        // Sort required by FST.
+        let mut sorted: Vec<_> = terms.to_vec();
+        sorted.sort_by_key(|(t, _)| *t);
+        for (term, output) in &sorted {
+            compiler.add(term, *output);
+        }
+        let fst = compiler.finish();
+
+        // Exact lookup
+        assert_eq!(fst.lookup(b"aa"), Some(vec![1]));
+        assert_eq!(fst.lookup(b"abc"), Some(vec![3]));
+        assert_eq!(fst.lookup(b"z"), None);
+        assert_eq!(fst.lookup(b""), None);
+
+        // Prefix iteration
+        let result: Vec<_> = fst.prefix_iter(b"a").collect();
+        assert_eq!(result.len(), 3);
+        assert_eq!(&result[0].0, b"aa");
+        assert_eq!(&result[1].0, b"ab");
+        assert_eq!(&result[2].0, b"abc");
+
+        // Scan all
+        let all: Vec<_> = fst.scan_all().collect();
+        assert_eq!(all.len(), 6);
+
+        // Verify scan_all order matches sorted input
+        let mut idx = 0;
+        for (term, output) in sorted.iter() {
+            assert_eq!(&all[idx].0, term);
+            let expected_out = output.unwrap_or(&[]);
+            assert_eq!(&all[idx].1, expected_out);
+            idx += 1;
+        }
+
+        // Edge case: when the prefix itself is a term, it should be emitted first.
+        let mut compiler2 = FstCompiler::new();
+        let entries: &[(&[u8], Option<&[u8]>)] = &[
+            (b"a", Some(b"\x01")),
+            (b"ab", Some(b"\x02")),
+        ];
+        let mut sorted2: Vec<_> = entries.to_vec();
+        sorted2.sort_by_key(|(t, _)| *t);
+        for (term, output) in &sorted2 {
+            compiler2.add(term, *output);
+        }
+        let fst2 = compiler2.finish();
+        let result: Vec<_> = fst2.prefix_iter(b"a").collect();
+        assert_eq!(result.len(), 2, "prefix 'a' is a term and has child 'ab'");
+        assert_eq!(&result[0].0, b"a");
+        assert_eq!(&result[1].0, b"ab");
+
+        // Empty string scan: test that empty output is emitted when present.
+        let mut compiler3 = FstCompiler::new();
+        compiler3.add(b"", Some(b"EMPTY"));
+        compiler3.add(b"a", Some(b"\x01"));
+        let fst3 = compiler3.finish();
+        let all: Vec<_> = fst3.scan_all().collect();
+        assert_eq!(all.len(), 2);
+        assert_eq!(&all[0].0, b"");
+        assert_eq!(&all[0].1, b"EMPTY");
+        assert_eq!(&all[1].0, b"a");
     }
 }

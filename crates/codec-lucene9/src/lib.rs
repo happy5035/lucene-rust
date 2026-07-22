@@ -22,6 +22,7 @@ pub mod postings_ll;
 pub mod segment_info;
 pub mod segment_infos;
 pub mod stored_fields;
+pub mod terms_read;
 
 pub use directory::FSDirectory;
 pub use field_infos::{DocValuesType, FieldInfo, FieldInfos, IndexOptions};
@@ -29,3 +30,4 @@ pub use io::{ChecksumIndexInput, ChecksumIndexOutput, DataInput, IndexInput, Ind
 pub use segment_info::SegmentInfo;
 pub use segment_infos::{SegmentCommitInfo, SegmentInfos};
 pub use stored_fields::{StoredField, StoredFieldsWriter};
+pub use terms_read::{TermEntry, TermState, TermsDict};

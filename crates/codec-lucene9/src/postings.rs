@@ -14,23 +14,23 @@ use crate::field_infos::{FieldInfo, IndexOptions};
 use crate::fst::FstCompiler;
 use crate::io::{ChecksumIndexOutput, IndexOutput};
 use crate::postings_ll::{
-    for_delta_util_encode, pfor_util_encode, write_group_vints, write_msb_vlong, write_vint15,
-    write_vlong15, BLOCK_SIZE,
+    BLOCK_SIZE, for_delta_util_encode, pfor_util_encode, write_group_vints, write_msb_vlong,
+    write_vint15, write_vlong15,
 };
 
 // Lucene912PostingsFormat.java:324-361
-const DOC_CODEC: &str = "Lucene912PostingsWriterDoc";
-const POS_CODEC: &str = "Lucene912PostingsWriterPos";
-const PSM_CODEC: &str = "Lucene912PostingsWriterMeta";
-const TERMS_CODEC: &str = "Lucene90PostingsWriterTerms";
-const POSTINGS_VERSION: u32 = 0;
+pub(crate) const DOC_CODEC: &str = "Lucene912PostingsWriterDoc";
+pub(crate) const POS_CODEC: &str = "Lucene912PostingsWriterPos";
+pub(crate) const PSM_CODEC: &str = "Lucene912PostingsWriterMeta";
+pub(crate) const TERMS_CODEC: &str = "Lucene90PostingsWriterTerms";
+pub(crate) const POSTINGS_VERSION: u32 = 0;
 // Lucene90BlockTreeTermsReader.java:78-104
-const TIM_CODEC: &str = "BlockTreeTermsDict";
-const TIP_CODEC: &str = "BlockTreeTermsIndex";
-const TMD_CODEC: &str = "BlockTreeTermsMeta";
-const BLOCKTREE_VERSION: u32 = 2;
+pub(crate) const TIM_CODEC: &str = "BlockTreeTermsDict";
+pub(crate) const TIP_CODEC: &str = "BlockTreeTermsIndex";
+pub(crate) const TMD_CODEC: &str = "BlockTreeTermsMeta";
+pub(crate) const BLOCKTREE_VERSION: u32 = 2;
 /// PerFieldPostingsFormat assigns suffix 0 to the first (only) format.
-const SEGMENT_SUFFIX: &str = "Lucene912_0";
+pub(crate) const SEGMENT_SUFFIX: &str = "Lucene912_0";
 
 /// Lucene912PostingsFormat.java:347-352
 const LEVEL1_MASK: usize = 4095;
@@ -39,10 +39,10 @@ const MIN_BLOCK: usize = 25;
 const MAX_BLOCK: usize = 48;
 
 /// Lucene90BlockTreeTermsReader.java:72-75
-const OUTPUT_FLAG_IS_FLOOR: u64 = 0x1;
-const OUTPUT_FLAG_HAS_TERMS: u64 = 0x2;
+pub(crate) const OUTPUT_FLAG_IS_FLOOR: u64 = 0x1;
+pub(crate) const OUTPUT_FLAG_HAS_TERMS: u64 = 0x2;
 
-fn file_name(segment: &str, ext: &str) -> String {
+pub(crate) fn file_name(segment: &str, ext: &str) -> String {
     format!("{segment}_{SEGMENT_SUFFIX}.{ext}")
 }
 
@@ -166,7 +166,10 @@ enum Pending {
         doc_freq: u32,
         ttf: u64,
     },
-    Block { prefix: Vec<u8>, fp: u64 },
+    Block {
+        prefix: Vec<u8>,
+        fp: u64,
+    },
 }
 
 impl Pending {
@@ -217,18 +220,54 @@ pub struct PostingsWriter {
 impl PostingsWriter {
     pub fn new(dir: &FSDirectory, segment: &str, segment_id: &[u8; 16]) -> io::Result<Self> {
         let mut doc_out = dir.create_output(&file_name(segment, "doc"))?;
-        write_index_header(&mut doc_out, DOC_CODEC, POSTINGS_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut doc_out,
+            DOC_CODEC,
+            POSTINGS_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         let mut tim_out = dir.create_output(&file_name(segment, "tim"))?;
-        write_index_header(&mut tim_out, TIM_CODEC, BLOCKTREE_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut tim_out,
+            TIM_CODEC,
+            BLOCKTREE_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         let mut tip_out = dir.create_output(&file_name(segment, "tip"))?;
-        write_index_header(&mut tip_out, TIP_CODEC, BLOCKTREE_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut tip_out,
+            TIP_CODEC,
+            BLOCKTREE_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         let mut tmd_out = dir.create_output(&file_name(segment, "tmd"))?;
-        write_index_header(&mut tmd_out, TMD_CODEC, BLOCKTREE_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut tmd_out,
+            TMD_CODEC,
+            BLOCKTREE_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         // PostingsHeader lives in .tmd (Lucene912PostingsWriter.init:209-213).
-        write_index_header(&mut tmd_out, TERMS_CODEC, POSTINGS_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut tmd_out,
+            TERMS_CODEC,
+            POSTINGS_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         tmd_out.write_vint(BLOCK_SIZE as i32)?;
         let mut psm_out = dir.create_output(&file_name(segment, "psm"))?;
-        write_index_header(&mut psm_out, PSM_CODEC, POSTINGS_VERSION, segment_id, SEGMENT_SUFFIX)?;
+        write_index_header(
+            &mut psm_out,
+            PSM_CODEC,
+            POSTINGS_VERSION,
+            segment_id,
+            SEGMENT_SUFFIX,
+        )?;
         Ok(Self {
             dir: dir.clone(),
             segment: segment.to_string(),
@@ -267,9 +306,7 @@ impl PostingsWriter {
             // Lazily create .pos on the first field with positions
             // (Lucene912PostingsWriter:148-189 decides from hasProx upfront;
             // for an empty positions field the file is simply absent — legal).
-            let mut pos_out = self
-                .dir
-                .create_output(&file_name(&self.segment, "pos"))?;
+            let mut pos_out = self.dir.create_output(&file_name(&self.segment, "pos"))?;
             write_index_header(
                 &mut pos_out,
                 POS_CODEC,
@@ -315,11 +352,7 @@ impl PostingsWriter {
 
         // --- .doc
         let doc_start_fp = self.doc_out.file_pointer();
-        let singleton_doc_id = if doc_freq == 1 {
-            docs[0] as i64
-        } else {
-            -1
-        };
+        let singleton_doc_id = if doc_freq == 1 { docs[0] as i64 } else { -1 };
         if doc_freq > 1 {
             self.write_doc_postings(docs, freqs, pos_start_fp, &pos_block_index)?;
         }
@@ -542,8 +575,10 @@ impl PostingsWriter {
                 // --- assemble level-0 skip fields + packed blocks
                 let mut level0 = IndexOutput::in_memory();
                 if has_freqs {
-                    let block_max_freq =
-                        freqs[block_start..block_start + BLOCK_SIZE].iter().max().unwrap();
+                    let block_max_freq = freqs[block_start..block_start + BLOCK_SIZE]
+                        .iter()
+                        .max()
+                        .unwrap();
                     let impacts = [(*block_max_freq, 1u64)];
                     let mut scratch = IndexOutput::in_memory();
                     write_impacts(&mut scratch, &impacts)?;
@@ -644,16 +679,14 @@ impl PostingsWriter {
                         scratch.write_byte(pos_buffer_upto)?;
                         level1_last_pos_fp = pos_fp;
                     }
-                    let level1_len =
-                        2 * 2 + scratch.file_pointer() + level1_buf.file_pointer();
+                    let level1_len = 2 * 2 + scratch.file_pointer() + level1_buf.file_pointer();
                     self.doc_out.write_vlong(level1_len as i64)?;
                     self.doc_out
                         .write_short((scratch.file_pointer() + 2) as i16)?;
                     self.doc_out.write_short(num_impact_bytes as i16)?;
                     self.doc_out.write_bytes(&scratch.into_bytes())?;
                 } else {
-                    self.doc_out
-                        .write_vlong(level1_buf.file_pointer() as i64)?;
+                    self.doc_out.write_vlong(level1_buf.file_pointer() as i64)?;
                 }
                 let drained = std::mem::replace(&mut level1_buf, IndexOutput::in_memory());
                 self.doc_out.write_bytes(&drained.into_bytes())?;
@@ -719,7 +752,8 @@ impl PostingsWriter {
             let top = f.pending.len() - f.prefix_starts[i] as usize;
             if top >= MIN_BLOCK {
                 Self::write_blocks(f, i + 1, top, tim_out)?;
-                f.prefix_starts[i] -= (top - 1) as u32;
+                // write_blocks replaces `top` entries with a single Block at the
+                // same starting position, so prefix_starts[i] is already correct.
             }
         }
         if f.prefix_starts.len() < term.len() {
@@ -819,7 +853,9 @@ impl PostingsWriter {
             out.write_vint((new_blocks.len() - 1) as i32)?;
             for (_, sub_fp, sub_has_terms, _, sub_lead) in &new_blocks[1..] {
                 out.write_byte(*sub_lead as u8)?;
-                out.write_vlong((((sub_fp - fp) << 1) | if *sub_has_terms { 1 } else { 0 }) as i64)?;
+                out.write_vlong(
+                    (((sub_fp - fp) << 1) | if *sub_has_terms { 1 } else { 0 }) as i64,
+                )?;
             }
         }
         f.fst_entries.push((prefix.clone(), out.into_bytes()));

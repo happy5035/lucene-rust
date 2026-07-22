@@ -26,6 +26,9 @@ const TYPE_SORTED: u8 = 2;
 
 /// DirectMonotonic block shift (doc_values.rs:43).
 const DM_BLOCK_SHIFT: u32 = 16;
+/// Terms dict block size: 64 terms per LZ4 block.
+const TERMS_DICT_BLOCK_LZ4_SHIFT: u32 = 6;
+const TERMS_DICT_BLOCK_SIZE: usize = 1 << TERMS_DICT_BLOCK_LZ4_SHIFT;
 /// Reverse-index sample interval (doc_values.rs:48-49).
 const TERMS_DICT_REVERSE_INDEX_SHIFT: u32 = 10;
 const TERMS_DICT_REVERSE_INDEX_SIZE: usize = 1 << TERMS_DICT_REVERSE_INDEX_SHIFT;
@@ -190,12 +193,12 @@ impl IndexedDISIReader {
 
 /// Reads per-document numeric values from `.dvm` / `.dvd` files.
 pub struct NumericDocValuesReader {
-    disi: IndexedDISIReader,
-    min_value: i64,
-    gcd: i64,
+    pub(crate) disi: IndexedDISIReader,
+    pub(crate) min_value: i64,
+    pub(crate) gcd: i64,
     #[allow(dead_code)]
-    bpv: u8,
-    values: DirectReader,
+    pub(crate) bpv: u8,
+    pub(crate) values: DirectReader,
 }
 
 impl NumericDocValuesReader {
@@ -409,6 +412,18 @@ impl<'a> ByteReader<'a> {
         b
     }
 
+    fn read_n_bytes(&mut self, n: usize) -> Vec<u8> {
+        let b = self.bytes[self.pos..self.pos + n].to_vec();
+        self.pos += n;
+        b
+    }
+
+    fn read_u8(&mut self) -> u8 {
+        let b = self.bytes[self.pos];
+        self.pos += 1;
+        b
+    }
+
     fn read_le_u16(&mut self) -> u16 {
         u16::from_le_bytes(self.read_bytes(2).try_into().unwrap())
     }
@@ -417,14 +432,398 @@ impl<'a> ByteReader<'a> {
         u64::from_le_bytes(self.read_bytes(8).try_into().unwrap())
     }
 
+    fn read_vint(&mut self) -> i32 {
+        let mut v = 0u32;
+        let mut shift = 0;
+        loop {
+            let b = self.read_u8();
+            v |= ((b & 0x7f) as u32) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        v as i32
+    }
+
     fn skip(&mut self, n: usize) {
         self.pos += n;
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+// ---------------------------------------------------------------------------
+// DvDirectMonotonicReader — DocValues-specific DM format
+// ---------------------------------------------------------------------------
+
+/// Reads DirectMonotonic values in the DocValues wire format:
+/// 21-byte-per-block meta records in .dvm (min:i64 LE, avgInc:f32 LE,
+/// offset:i64 LE, bpv:u8), with packed delta data in a separate .dvd slice.
+struct DvDirectMonotonicReader {
+    mins: Vec<i64>,
+    avgs: Vec<f32>,
+    offsets: Vec<u64>,
+    bpvs: Vec<u8>,
+    data: Vec<u8>,
+    block_shift: u32,
+    num_values: usize,
+}
+
+impl DvDirectMonotonicReader {
+    /// Read DM meta records from `dvm` (positioned at the first block's min)
+    /// and slice the packed delta data from `dvd_bytes`.
+    fn read_meta(
+        dvm: &mut dyn IndexInput,
+        dvd_bytes: &[u8],
+        data_offset: i64,
+        data_length: i64,
+        num_values: usize,
+        block_shift: u32,
+    ) -> io::Result<Self> {
+        let num_blocks = if num_values == 0 {
+            0
+        } else {
+            ((num_values - 1) / (1 << block_shift)) + 1
+        };
+        let mut mins = Vec::with_capacity(num_blocks);
+        let mut avgs = Vec::with_capacity(num_blocks);
+        let mut offsets = Vec::with_capacity(num_blocks);
+        let mut bpvs = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            mins.push(read_le_i64(dvm)?);
+            let avg_bits = read_le_i32(dvm)?;
+            avgs.push(f32::from_bits(avg_bits as u32));
+            offsets.push(read_le_i64(dvm)? as u64);
+            bpvs.push(dvm.read_byte()?);
+        }
+        let data = if data_length > 0 {
+            dvd_bytes[data_offset as usize..][..data_length as usize].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(DvDirectMonotonicReader {
+            mins,
+            avgs,
+            offsets,
+            bpvs,
+            data,
+            block_shift,
+            num_values,
+        })
+    }
+
+    fn get(&self, index: usize) -> u64 {
+        if index >= self.num_values {
+            return 0;
+        }
+        let block = index >> self.block_shift;
+        let in_block = (index - (block << self.block_shift)) as u64;
+        let bpv = self.bpvs[block] as usize;
+        let delta = if bpv == 0 {
+            0u64
+        } else {
+            let bit_offset = self.offsets[block] as usize * 8 + in_block as usize * bpv;
+            let byte_offset = bit_offset / 8;
+            let shift = bit_offset % 8;
+            let mut buf = [0u8; 8];
+            let available = self.data.len().saturating_sub(byte_offset);
+            let take = available.min(8);
+            buf[..take].copy_from_slice(&self.data[byte_offset..byte_offset + take]);
+            let raw = u64::from_le_bytes(buf) >> shift;
+            if bpv == 64 {
+                raw
+            } else {
+                raw & ((1u64 << bpv) - 1)
+            }
+        };
+        (self.mins[block]
+            .wrapping_add((self.avgs[block] * in_block as f32) as i64)
+            .wrapping_add(delta as i64)) as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReverseTermsIndex
+// ---------------------------------------------------------------------------
+
+/// Reverse index for sorted terms: maps ord ranges to sort-key prefixes.
+struct ReverseTermsIndex {
+    index_data: Vec<u8>,
+    addresses: DvDirectMonotonicReader,
+}
+
+// ---------------------------------------------------------------------------
+// SortedDocValuesReader
+// ---------------------------------------------------------------------------
+
+/// Reads per-document sorted values (ordinals + terms dictionary) from
+/// `.dvm` / `.dvd` files produced by a SORTED `DocValuesWriter`.
+pub struct SortedDocValuesReader {
+    ords: NumericDocValuesReader,
+    max_ord: u32,
+    terms_dict: Vec<u8>,
+    block_addrs: DvDirectMonotonicReader,
+    reverse_index: ReverseTermsIndex,
+}
+
+impl SortedDocValuesReader {
+    /// Open a sorted field from in-memory `.dvm` and `.dvd` bytes.
+    pub fn open(dvm_bytes: &[u8], dvd_bytes: &[u8], field_number: i32) -> io::Result<Self> {
+        let mut dvm = HeapIndexInput::new(dvm_bytes.to_vec());
+        skip_index_header(&mut dvm)?;
+
+        loop {
+            let fn_field = read_le_i32(&mut dvm)?;
+            if fn_field == -1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("field {field_number} not found in .dvm"),
+                ));
+            }
+            let field_type = dvm.read_byte()?;
+
+            // --- common numeric metadata prefix ---------------------------
+            let docs_offset = read_le_i64(&mut dvm)?;
+            let docs_length = read_le_i64(&mut dvm)?;
+            let jump_count = read_le_i16(&mut dvm)?;
+            let _dense_rank_power = dvm.read_byte()? as i8;
+            let num_values = read_le_i64(&mut dvm)?;
+            let table_size = read_le_i32(&mut dvm)?;
+            for _ in 0..table_size.max(0) {
+                read_le_i64(&mut dvm)?;
+            }
+            let bpv = dvm.read_byte()?;
+            let min_value = read_le_i64(&mut dvm)?;
+            let gcd = read_le_i64(&mut dvm)?;
+            let values_offset = read_le_i64(&mut dvm)?;
+            let values_length = read_le_i64(&mut dvm)?;
+            let _value_jump_table_offset = read_le_i64(&mut dvm)?;
+
+            // --- sorted metadata tail -------------------------------
+            if fn_field != field_number {
+                if field_type == TYPE_SORTED {
+                    skip_sorted_metadata(&mut dvm)?;
+                }
+                continue;
+            }
+
+            if field_type != TYPE_SORTED {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "field {field_number} is not SORTED (type byte {field_type})"
+                    ),
+                ));
+            }
+
+            // --- build NumericDocValuesReader for ordinals ----------
+            let disi = IndexedDISIReader::parse(
+                dvd_bytes,
+                docs_offset,
+                docs_length,
+                jump_count,
+                num_values as u32,
+            )?;
+
+            let ords_input: Box<dyn IndexInput> = if values_length > 0 {
+                Box::new(HeapIndexInput::new(
+                    dvd_bytes[values_offset as usize..]
+                        [..values_length as usize]
+                        .to_vec(),
+                ))
+            } else {
+                Box::new(HeapIndexInput::new(Vec::new()))
+            };
+            let ords_values =
+                DirectReader::new(ords_input, bpv as u32, num_values as usize, 0);
+
+            let ords = NumericDocValuesReader {
+                disi,
+                min_value,
+                gcd,
+                bpv,
+                values: ords_values,
+            };
+            let max_ord = num_values as u32;
+
+            // --- terms dict metadata --------------------------------
+            let dict_size = dvm.read_vlong()?;
+            let block_shift = read_le_i32(&mut dvm)?;
+            debug_assert_eq!(block_shift as u32, DM_BLOCK_SHIFT);
+
+            // Number of DM values = number of 64-term blocks
+            let num_dm_values = if dict_size == 0 {
+                0usize
+            } else {
+                (dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE)
+            };
+
+            let block_addrs = DvDirectMonotonicReader::read_meta(
+                &mut dvm,
+                dvd_bytes,
+                -1, // dummy — we read meta inline from dvm first, data later
+                0, // dummy
+                num_dm_values,
+                block_shift as u32,
+            )?;
+
+            // After read_meta consumes the meta records, we continue with
+            // the rest of the fields.  The packed data for block addresses
+            // comes later (termsAddressesOffset/Length), so we'll rebuild
+            // block_addrs once we know those offsets.
+
+            let _max_term_length = read_le_i32(&mut dvm)?;
+            let _max_block_length = read_le_i32(&mut dvm)?;
+            let terms_data_offset = read_le_i64(&mut dvm)?;
+            let terms_data_length = read_le_i64(&mut dvm)?;
+            let terms_addresses_offset = read_le_i64(&mut dvm)?;
+            let terms_addresses_length = read_le_i64(&mut dvm)?;
+
+            // Rebuild block_addrs with the correct packed data
+            let block_addrs = DvDirectMonotonicReader {
+                data: if terms_addresses_length > 0 {
+                    dvd_bytes[terms_addresses_offset as usize..]
+                        [..terms_addresses_length as usize]
+                        .to_vec()
+                } else {
+                    Vec::new()
+                },
+                ..block_addrs
+            };
+
+            // Terms dictionary raw bytes
+            let terms_dict = if terms_data_length > 0 {
+                dvd_bytes[terms_data_offset as usize..]
+                    [..terms_data_length as usize]
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+
+            // --- reverse index metadata ----------------------------
+            let index_shift = read_le_i32(&mut dvm)?;
+            debug_assert_eq!(index_shift as u32, TERMS_DICT_REVERSE_INDEX_SHIFT);
+
+            let num_index_records = if dict_size == 0 {
+                1
+            } else {
+                1 + (dict_size as usize).div_ceil(TERMS_DICT_REVERSE_INDEX_SIZE)
+            };
+
+            let rev_addrs = DvDirectMonotonicReader::read_meta(
+                &mut dvm,
+                dvd_bytes,
+                -1,
+                0,
+                num_index_records,
+                block_shift as u32,
+            )?;
+
+            let terms_index_offset = read_le_i64(&mut dvm)?;
+            let terms_index_length = read_le_i64(&mut dvm)?;
+            let terms_index_addresses_offset = read_le_i64(&mut dvm)?;
+            let terms_index_addresses_length = read_le_i64(&mut dvm)?;
+
+            let reverse_index = ReverseTermsIndex {
+                index_data: if terms_index_length > 0 {
+                    dvd_bytes[terms_index_offset as usize..]
+                        [..terms_index_length as usize]
+                        .to_vec()
+                } else {
+                    Vec::new()
+                },
+                addresses: DvDirectMonotonicReader {
+                    data: if terms_index_addresses_length > 0 {
+                        dvd_bytes[terms_index_addresses_offset as usize..]
+                            [..terms_index_addresses_length as usize]
+                            .to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                    ..rev_addrs
+                },
+            };
+
+            return Ok(SortedDocValuesReader {
+                ords,
+                max_ord,
+                terms_dict,
+                block_addrs,
+                reverse_index,
+            });
+        }
+    }
+
+    /// Returns the ordinal for `doc_id`, or `None` when the doc has no value.
+    pub fn get_ord(&mut self, doc_id: u32) -> io::Result<Option<u32>> {
+        match self.ords.get(doc_id)? {
+            None => Ok(None),
+            Some(v) => Ok(Some(v as u32)),
+        }
+    }
+
+    /// Returns the term bytes for the given ordinal.
+    ///
+    /// Returns an empty vec when `ord` is out of range or the dictionary is
+    /// empty.
+    pub fn lookup_ord(&self, ord: u32) -> Vec<u8> {
+        if self.terms_dict.is_empty() || ord as usize >= self.max_ord as usize {
+            return Vec::new();
+        }
+
+        let block_index = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+        let in_block = ord & (TERMS_DICT_BLOCK_SIZE as u32 - 1);
+
+        let block_start = self.block_addrs.get(block_index as usize) as usize;
+        let block_end = if (block_index as usize + 1) < self.block_addrs.num_values {
+            self.block_addrs.get(block_index as usize + 1) as usize
+        } else {
+            self.terms_dict.len()
+        };
+
+        let region = &self.terms_dict[block_start..block_end];
+        let mut r = ByteReader::new(region);
+
+        // First term — always verbatim: VInt length + bytes
+        let first_len = r.read_vint() as usize;
+        let mut term = r.read_n_bytes(first_len);
+        if in_block == 0 {
+            return term;
+        }
+
+        // Remaining terms are LZ4-compressed prefix-compressed entries.
+        // One-term blocks have no LZ4 section (addTermsDict :607-611).
+        if r.pos >= region.len() {
+            // Single-term block — but we asked for in_block > 0, should not happen
+            return Vec::new();
+        }
+
+        let uncompressed = r.read_vint() as usize;
+        let decompressed = lz4::block::decompress(
+            &region[r.pos..],
+            Some(uncompressed as i32),
+        )
+        .expect("LZ4 decompress should succeed for well-formed blocks");
+        let mut dr = ByteReader::new(&decompressed);
+
+        // Walk prefix-compressed entries until the target in-block ordinal
+        for _ in 0..in_block {
+            let token = dr.read_u8() as usize;
+            let mut prefix = token & 0x0F;
+            let mut suffix_len = 1 + (token >> 4);
+            if prefix == 15 {
+                prefix += dr.read_vint() as usize;
+            }
+            if suffix_len == 16 {
+                suffix_len += dr.read_vint() as usize;
+            }
+            let suffix = dr.read_n_bytes(suffix_len);
+            term.truncate(prefix);
+            term.extend_from_slice(&suffix);
+        }
+
+        term
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -594,5 +993,159 @@ mod tests {
 
         // Field 99 not in the file
         assert!(NumericDocValuesReader::open(&dvm, &dvd, 99).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Sorted doc values round-trip tests
+    // ------------------------------------------------------------------
+
+    /// Round-trip for sorted fields: write → read → compare ords + terms.
+    fn sorted_round_trip(
+        tag: &str,
+        max_doc: u32,
+        dict: &[&[u8]],
+        ords: &[(u32, u32)],
+        check_docs: &[u32],
+    ) {
+        let root = temp_dir(tag);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut w = DocValuesWriter::new(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        w.add_sorted_field(1, max_doc, dict, ords).unwrap();
+        let names = w.finish().unwrap();
+        let dvd = fs::read(root.join(&names[0])).unwrap();
+        let dvm = fs::read(root.join(&names[1])).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let mut reader = SortedDocValuesReader::open(&dvm, &dvd, 1).unwrap();
+
+        // Build expected maps
+        let ord_map: std::collections::BTreeMap<u32, u32> =
+            ords.iter().map(|&(d, o)| (d, o)).collect();
+
+        // Test get_ord() for check_docs
+        for &doc in check_docs {
+            let got = reader.get_ord(doc).unwrap();
+            let want = ord_map.get(&doc).copied();
+            assert_eq!(
+                got, want,
+                "get_ord({doc}): got {got:?}, want {want:?}"
+            );
+        }
+
+        // Test get_ord() for all docs 0..max_doc
+        for doc in 0..max_doc {
+            let got = reader.get_ord(doc).unwrap();
+            let want = ord_map.get(&doc).copied();
+            assert_eq!(
+                got, want,
+                "get_ord({doc}): got {got:?}, want {want:?}"
+            );
+        }
+
+        // Test lookup_ord() for all known ords
+        for ord in 0..dict.len() as u32 {
+            let term = reader.lookup_ord(ord);
+            assert_eq!(
+                &term, dict[ord as usize],
+                "lookup_ord({ord}): got {term:?}, want {:?}",
+                dict[ord as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn sorted_single_block() {
+        let dict: Vec<String> = (0..50).map(|i| format!("term-{i:03}")).collect();
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = (0..500u32).map(|d| (d, d % 50)).collect();
+        sorted_round_trip(
+            "srt-single",
+            500,
+            &dict_refs,
+            &ords,
+            &[0, 1, 49, 50, 250, 499],
+        );
+    }
+
+    #[test]
+    fn sorted_multi_block_with_vint_extensions() {
+        // 150 terms → 3 dict blocks; tests prefix/suffix VInt extensions
+        let dict150: Vec<String> = (0..150).map(|i| format!("term-{i:04}")).collect();
+        let dict150_refs: Vec<&[u8]> = dict150.iter().map(|s| s.as_bytes()).collect();
+        let ords150: Vec<(u32, u32)> = (0..300u32).map(|d| (d, d % 150)).collect();
+        sorted_round_trip(
+            "srt-150",
+            300,
+            &dict150_refs,
+            &ords150,
+            &[0, 75, 149, 150, 299],
+        );
+
+        // 1030 terms → 17 dict blocks; >15-byte common prefix (prefix VInt)
+        // and >=16-byte suffixes (suffix VInt)
+        let mut dict1030: Vec<String> = (0..700)
+            .map(|i| format!("shared-prefix-is-here-{i:04}"))
+            .collect();
+        dict1030.extend((0..330).map(|i| format!("z{i:03}tail-padding-padding")));
+        let dict1030_refs: Vec<&[u8]> = dict1030.iter().map(|s| s.as_bytes()).collect();
+        let ords1030: Vec<(u32, u32)> = (0..2060u32).map(|d| (d, d % 1030)).collect();
+        sorted_round_trip(
+            "srt-1030",
+            2060,
+            &dict1030_refs,
+            &ords1030,
+            &[0, 512, 1024, 1025, 1500, 2059],
+        );
+    }
+
+    #[test]
+    fn sorted_sparse_ords() {
+        // Sparse ords — every ord must be referenced (writer requirement)
+        let dict: Vec<String> = (0..8).map(|i| format!("color-{i}")).collect();
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let max_doc = 100_000u32;
+        let ords: Vec<(u32, u32)> = vec![
+            (0, 0),
+            (1000, 1),
+            (2000, 4),   // ord 4 used
+            (3000, 2),
+            (4000, 5),   // ord 5 used
+            (50000, 3),
+            (65536, 6),  // ord 6 used
+            (65537, 7),
+            (90000, 3),
+        ];
+        sorted_round_trip("srt-sparse", max_doc, &dict_refs, &ords, &[0, 1, 999, 1000, 65536]);
+    }
+
+    #[test]
+    fn sorted_all_docs_same_ord() {
+        let dict: Vec<String> = vec!["only-term".to_string()];
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = (0..1000u32).map(|d| (d, 0)).collect();
+        sorted_round_trip("srt-same", 1000, &dict_refs, &ords, &[0, 500, 999]);
+    }
+
+    #[test]
+    fn sorted_empty_field() {
+        let dict: Vec<&[u8]> = vec![];
+        let ords: Vec<(u32, u32)> = vec![];
+        sorted_round_trip("srt-empty", 10, &dict, &ords, &[0, 5, 9]);
+    }
+
+    #[test]
+    fn sorted_field_not_found_is_error() {
+        let root = temp_dir("srt-notfound");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut w = DocValuesWriter::new(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        w.add_sorted_field(1, 10, &[b"hello"], &[(0, 0)])
+            .unwrap();
+        let names = w.finish().unwrap();
+        let dvd = fs::read(root.join(&names[0])).unwrap();
+        let dvm = fs::read(root.join(&names[1])).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        // Field 99 not in the file
+        assert!(SortedDocValuesReader::open(&dvm, &dvd, 99).is_err());
     }
 }

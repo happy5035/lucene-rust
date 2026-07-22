@@ -157,78 +157,149 @@ pub fn direct_monotonic_write(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Read side (DirectReader / DirectMonotonicReader), mirrors of the writers.
+// ---------------------------------------------------------------------------
+
+/// DirectReader.getInstance + per-bpv `get` (DirectReader.java:58-91,199-461):
+/// values are packed LSB-first in the byte stream; a little-endian container
+/// read at the value's bit offset, shifted and masked, yields the value.
+/// The single generic form below covers every supported bpv (Java's
+/// specializations read 1/2/4/8-byte containers; a clamped 8-byte LE window
+/// is semantically identical given DirectWriter.finish's container padding,
+/// DirectWriter.java:156-173).
+pub struct DirectReader<'a> {
+    data: &'a [u8],
+    bits_per_value: u32,
+    /// Byte offset of bit 0 of value 0.
+    offset: u64,
+}
+
+impl<'a> DirectReader<'a> {
+    pub fn new(data: &'a [u8], bits_per_value: u32, offset: u64) -> io::Result<Self> {
+        if !SUPPORTED_BITS_PER_VALUE.contains(&bits_per_value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bitsPerValue {bits_per_value} (DirectReader.java:89)"),
+            ));
+        }
+        Ok(DirectReader {
+            data,
+            bits_per_value,
+            offset,
+        })
+    }
+
+    /// DirectReader.get: bit position = offset*8 + index*bpv, LSB-first.
+    pub fn get(&self, index: u64) -> u64 {
+        let bpv = self.bits_per_value as u64;
+        let bit_offset = self.offset * 8 + index * bpv;
+        let byte_offset = (bit_offset / 8) as usize;
+        let shift = (bit_offset % 8) as u32;
+        let mut buf = [0u8; 8];
+        let available = self.data.len() - byte_offset;
+        let take = available.min(8);
+        buf[..take].copy_from_slice(&self.data[byte_offset..byte_offset + take]);
+        let raw = u64::from_le_bytes(buf) >> shift;
+        if bpv == 64 {
+            raw
+        } else {
+            raw & ((1u64 << bpv) - 1)
+        }
+    }
+}
+
+/// DirectMonotonicReader (DirectMonotonicReader.java): monotone sequence
+/// reconstructed per block as `min + (long)(avgInc * blockIndex) + delta`
+/// (:160-165). Meta records are 21 bytes each: LE long min, LE int
+/// Float.floatToIntBits(avgInc), LE long data offset, byte bpv
+/// (loadMeta :84-100).
+pub struct DirectMonotonicReader<'a> {
+    mins: Vec<i64>,
+    avgs: Vec<f32>,
+    offsets: Vec<u64>,
+    bpvs: Vec<u8>,
+    data: &'a [u8],
+    block_shift: u32,
+}
+
+impl<'a> DirectMonotonicReader<'a> {
+    /// Bytes per meta record (DirectMonotonicReader.loadMeta :88-96).
+    pub const META_RECORD_BYTES: usize = 21;
+
+    pub fn new(
+        meta: &[u8],
+        data: &'a [u8],
+        num_values: usize,
+        block_shift: u32,
+    ) -> io::Result<Self> {
+        // Meta constructor (:56-67): numBlocks = ceil(numValues >>> blockShift)
+        let num_blocks = if num_values == 0 {
+            0
+        } else {
+            (num_values - 1) >> block_shift
+        } + 1;
+        if meta.len() < num_blocks * Self::META_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "DirectMonotonic meta too short: {} bytes for {num_blocks} blocks",
+                    meta.len()
+                ),
+            ));
+        }
+        let mut mins = Vec::with_capacity(num_blocks);
+        let mut avgs = Vec::with_capacity(num_blocks);
+        let mut offsets = Vec::with_capacity(num_blocks);
+        let mut bpvs = Vec::with_capacity(num_blocks);
+        for b in 0..num_blocks {
+            let pos = b * Self::META_RECORD_BYTES;
+            mins.push(i64::from_le_bytes(meta[pos..pos + 8].try_into().unwrap()));
+            avgs.push(f32::from_bits(u32::from_le_bytes(
+                meta[pos + 8..pos + 12].try_into().unwrap(),
+            )));
+            offsets.push(u64::from_le_bytes(
+                meta[pos + 12..pos + 20].try_into().unwrap(),
+            ));
+            bpvs.push(meta[pos + 20]);
+        }
+        Ok(DirectMonotonicReader {
+            mins,
+            avgs,
+            offsets,
+            bpvs,
+            data,
+            block_shift,
+        })
+    }
+
+    /// DirectMonotonicReader.get (:160-165): min + (long)(avgInc * blockIndex)
+    /// + delta, with Java's float multiply + truncate-toward-zero semantics
+    /// and wrapping long arithmetic. bpv==0 blocks read as zero (:113-114).
+    pub fn get(&self, index: u64) -> u64 {
+        let block = (index >> self.block_shift) as usize;
+        let block_index = index & ((1u64 << self.block_shift) - 1);
+        let bpv = self.bpvs[block];
+        let delta = if bpv == 0 {
+            0
+        } else {
+            DirectReader {
+                data: self.data,
+                bits_per_value: bpv as u32,
+                offset: self.offsets[block],
+            }
+            .get(block_index)
+        };
+        self.mins[block]
+            .wrapping_add((self.avgs[block] * block_index as f32) as i64)
+            .wrapping_add(delta as i64) as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::IndexOutput;
-
-    /// Decoder mirroring DirectMonotonicReader.get (:161-167) for round-trip tests.
-    struct MonotonicReader<'a> {
-        mins: Vec<i64>,
-        avgs: Vec<f32>,
-        offsets: Vec<u64>,
-        bpvs: Vec<u8>,
-        data: &'a [u8],
-        block_shift: u32,
-    }
-
-    impl<'a> MonotonicReader<'a> {
-        fn parse(meta: &'a [u8], data: &'a [u8], num_values: usize, block_shift: u32) -> Self {
-            let num_blocks = if num_values == 0 {
-                0
-            } else {
-                (num_values - 1) >> block_shift
-            } + 1;
-            let mut mins = Vec::new();
-            let mut avgs = Vec::new();
-            let mut offsets = Vec::new();
-            let mut bpvs = Vec::new();
-            let mut pos = 0;
-            for _ in 0..num_blocks {
-                mins.push(i64::from_le_bytes(meta[pos..pos + 8].try_into().unwrap()));
-                avgs.push(f32::from_bits(u32::from_le_bytes(
-                    meta[pos + 8..pos + 12].try_into().unwrap(),
-                )));
-                offsets.push(u64::from_le_bytes(meta[pos + 12..pos + 20].try_into().unwrap()));
-                bpvs.push(meta[pos + 20]);
-                pos += 21;
-            }
-            MonotonicReader {
-                mins,
-                avgs,
-                offsets,
-                bpvs,
-                data,
-                block_shift,
-            }
-        }
-
-        fn get(&self, index: usize) -> u64 {
-            let block = index >> self.block_shift;
-            let block_index = (index as u64) & ((1u64 << self.block_shift) - 1);
-            let bpv = self.bpvs[block] as usize;
-            let delta = if bpv == 0 {
-                0
-            } else {
-                let bit_offset = self.offsets[block] as usize * 8 + block_index as usize * bpv;
-                let byte_offset = bit_offset / 8;
-                let shift = bit_offset % 8;
-                let mut buf = [0u8; 8];
-                let available = self.data.len() - byte_offset;
-                let take = available.min(8);
-                buf[..take].copy_from_slice(&self.data[byte_offset..byte_offset + take]);
-                let raw = u64::from_le_bytes(buf) >> shift;
-                if bpv == 64 {
-                    raw
-                } else {
-                    raw & ((1u64 << bpv) - 1)
-                }
-            };
-            self.mins[block]
-                .wrapping_add((self.avgs[block] * block_index as f32) as i64)
-                .wrapping_add(delta as i64) as u64
-        }
-    }
 
     fn round_trip(values: &[u64], block_shift: u32) {
         let mut meta = ChecksumIndexOutput::new(IndexOutput::in_memory());
@@ -236,9 +307,11 @@ mod tests {
         direct_monotonic_write(&mut meta, &mut data, values, block_shift).unwrap();
         let meta_bytes = meta.into_bytes();
         let data_bytes = data.into_bytes();
-        let reader = MonotonicReader::parse(&meta_bytes, &data_bytes, values.len(), block_shift);
+        let reader =
+            DirectMonotonicReader::new(&meta_bytes, &data_bytes, values.len(), block_shift)
+                .unwrap();
         for (i, &v) in values.iter().enumerate() {
-            assert_eq!(reader.get(i), v, "value {i} of {values:?}");
+            assert_eq!(reader.get(i as u64), v, "value {i} of {values:?}");
         }
     }
 
@@ -301,10 +374,7 @@ mod tests {
             vec![0x45, 0x23, 0xE1, 0xCD, 0xAB, 0x55, 0x00, 0x00, 0x00, 0x00]
         );
         // bpv 32: LE int, no padding
-        assert_eq!(
-            direct_writer_encode(&[0x04030201], 32),
-            vec![1, 2, 3, 4]
-        );
+        assert_eq!(direct_writer_encode(&[0x04030201], 32), vec![1, 2, 3, 4]);
         // bpv 40: 5 LE bytes + 3 padding bytes
         assert_eq!(
             direct_writer_encode(&[0x0504030201], 40),
@@ -324,5 +394,55 @@ mod tests {
         assert_eq!(direct_writer_unsigned_bits_required(0xffff), 16);
         assert_eq!(direct_writer_unsigned_bits_required(0x1_0000), 20);
         assert_eq!(direct_writer_unsigned_bits_required(u64::MAX), 64);
+    }
+
+    #[test]
+    fn direct_reader_round_trip_all_bpv() {
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bpv in SUPPORTED_BITS_PER_VALUE {
+            let mask = if bpv == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bpv) - 1
+            };
+            let values: Vec<u64> = (0..100).map(|_| rand() & mask).collect();
+            let bytes = direct_writer_encode(&values, bpv);
+            let reader = DirectReader::new(&bytes, bpv, 0).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(reader.get(i as u64), v, "bpv {bpv} index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn direct_reader_known_layouts() {
+        // bpv 8: plain LE bytes
+        let r = DirectReader::new(&[1, 2, 255], 8, 0).unwrap();
+        assert_eq!(r.get(0), 1);
+        assert_eq!(r.get(1), 2);
+        assert_eq!(r.get(2), 255);
+        // bpv 1: 3 bits packed low-first in one byte
+        let r = DirectReader::new(&[0b101], 1, 0).unwrap();
+        assert_eq!(r.get(0), 1);
+        assert_eq!(r.get(1), 0);
+        assert_eq!(r.get(2), 1);
+        // bpv 12: l1 | l2<<12 in 3 bytes (+ padding)
+        let r = DirectReader::new(&[0xbc, 0xfa, 0xde, 0x00], 12, 0).unwrap();
+        assert_eq!(r.get(0), 0xabc);
+        assert_eq!(r.get(1), 0xdef);
+        // bpv 16 LE shorts
+        let r = DirectReader::new(&[1, 2], 16, 0).unwrap();
+        assert_eq!(r.get(0), 0x0201);
+        // nonzero base offset
+        let r = DirectReader::new(&[0xFF, 1, 2], 16, 1).unwrap();
+        assert_eq!(r.get(0), 0x0201);
+        // unsupported bpv rejected
+        assert!(DirectReader::new(&[0u8; 8], 3, 0).is_err());
     }
 }

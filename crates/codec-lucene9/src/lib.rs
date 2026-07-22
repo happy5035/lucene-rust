@@ -23,7 +23,7 @@ pub mod stored_fields;
 
 pub use directory::FSDirectory;
 pub use field_infos::{DocValuesType, FieldInfo, FieldInfos, IndexOptions};
-pub use io::{ChecksumIndexOutput, IndexOutput};
+pub use io::{BufferedIndexInput, ChecksumIndexOutput, HeapIndexInput, IndexInput, IndexOutput};
 pub use segment_info::SegmentInfo;
 pub use segment_infos::{SegmentCommitInfo, SegmentInfos};
 pub use stored_fields::{StoredField, StoredFieldsWriter};

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 
 /// Large output buffer; avoids per-byte syscalls (cf. BufferedIndexOutput).
 const BUFFER_CAPACITY: usize = 1 << 16;
@@ -470,5 +470,302 @@ impl DataOutput for ChecksumIndexOutput {
     }
     fn write_zlong(&mut self, v: i64) -> io::Result<()> {
         ChecksumIndexOutput::write_zlong(self, v)
+    }
+}
+
+// ============================================================================
+// IndexInput — read counterpart to IndexOutput
+// ============================================================================
+
+/// Random-access input mirroring Lucene `store/IndexInput.java` (9.12.3).
+pub trait IndexInput: Read {
+    fn read_byte(&mut self) -> io::Result<u8>;
+    fn read_bytes(&mut self, buf: &mut [u8], offset: usize, len: usize) -> io::Result<()>;
+    fn read_vlong(&mut self) -> io::Result<i64>;
+    fn read_vint(&mut self) -> io::Result<i32>;
+    fn read_zint(&mut self) -> io::Result<i32>;
+    fn read_string(&mut self) -> io::Result<String>;
+    fn file_pointer(&self) -> u64;
+    fn seek(&mut self, pos: u64) -> io::Result<()>;
+    fn length(&self) -> u64;
+    fn slice(&self, offset: u64, len: u64) -> io::Result<Box<dyn IndexInput>>;
+}
+
+/// In-memory input backed by `Vec<u8>`. Used for small files (.fnm, .si, .tip, .kdm).
+pub struct HeapIndexInput {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl HeapIndexInput {
+    pub fn new(buf: Vec<u8>) -> Self {
+        HeapIndexInput { buf, pos: 0 }
+    }
+}
+
+impl Read for HeapIndexInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let avail = self.buf.len() - self.pos;
+        let n = buf.len().min(avail);
+        buf[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl IndexInput for HeapIndexInput {
+    fn read_byte(&mut self) -> io::Result<u8> {
+        if self.pos >= self.buf.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past end"));
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8], offset: usize, len: usize) -> io::Result<()> {
+        let end = self.pos + len;
+        if end > self.buf.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read_bytes past end"));
+        }
+        buf[offset..offset + len].copy_from_slice(&self.buf[self.pos..end]);
+        self.pos = end;
+        Ok(())
+    }
+
+    fn read_vlong(&mut self) -> io::Result<i64> {
+        // Lucene VLong: varint where the high bit of each byte is continuation flag.
+        // Relevant source: DataInput.readVLong (DataInput.java:471-498).
+        let b = self.read_byte()?;
+        if b & 0x80 == 0 { return Ok(b as i64); }
+        let mut v = (b & 0x7F) as i64;
+        let mut shift = 7;
+        loop {
+            let b = self.read_byte()?;
+            v |= ((b & 0x7F) as i64) << shift;
+            shift += 7;
+            if b & 0x80 == 0 { break; }
+        }
+        Ok(v)
+    }
+
+    fn read_vint(&mut self) -> io::Result<i32> {
+        self.read_vlong().map(|v| v as i32)
+    }
+
+    fn read_zint(&mut self) -> io::Result<i32> {
+        let v = self.read_vlong()? as u64;
+        // zigzag decode: (v >>> 1) ^ -(v & 1)
+        Ok(((v >> 1) as i64 ^ -((v & 1) as i64)) as i32)
+    }
+
+    fn read_string(&mut self) -> io::Result<String> {
+        let len = self.read_vint()? as usize;
+        let mut buf = vec![0u8; len];
+        self.read_bytes(&mut buf, 0, len)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    fn file_pointer(&self) -> u64 { self.pos as u64 }
+    fn seek(&mut self, pos: u64) -> io::Result<()> {
+        if pos as usize > self.buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+        }
+        self.pos = pos as usize;
+        Ok(())
+    }
+    fn length(&self) -> u64 { self.buf.len() as u64 }
+
+    fn slice(&self, offset: u64, len: u64) -> io::Result<Box<dyn IndexInput>> {
+        let start = offset as usize;
+        let end = start + len as usize;
+        if end > self.buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "slice past end"));
+        }
+        Ok(Box::new(HeapIndexInput::new(self.buf[start..end].to_vec())))
+    }
+}
+
+/// Buffered file reader for large files (.doc, .dvd, .kdd, .fdt).
+/// 8 KB read buffer; seek invalidates the buffer.
+pub struct BufferedIndexInput {
+    file: std::fs::File,
+    buf: [u8; 8192],
+    buf_start: u64,  // file offset of buf[0]
+    buf_len: usize,   // valid bytes in buf
+    pos: u64,         // logical position
+    file_len: u64,
+}
+
+impl BufferedIndexInput {
+    pub fn new(file: std::fs::File) -> io::Result<Self> {
+        let file_len = file.metadata()?.len();
+        Ok(BufferedIndexInput {
+            file,
+            buf: [0u8; 8192],
+            buf_start: 0,
+            buf_len: 0,
+            pos: 0,
+            file_len,
+        })
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(self.pos))?;
+        self.buf_start = self.pos;
+        self.buf_len = self.file.read(&mut self.buf)?;
+        Ok(())
+    }
+
+    fn ensure_buffer(&mut self) -> io::Result<()> {
+        if self.pos >= self.buf_start && self.pos < self.buf_start + self.buf_len as u64 {
+            return Ok(()); // already buffered
+        }
+        self.fill_buffer()
+    }
+}
+
+impl Read for BufferedIndexInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.ensure_buffer()?;
+        let mut total = 0usize;
+        while total < buf.len() && self.pos < self.file_len {
+            let buf_offset = (self.pos - self.buf_start) as usize;
+            let avail = (self.buf_len - buf_offset).min(buf.len() - total);
+            buf[total..total + avail].copy_from_slice(&self.buf[buf_offset..buf_offset + avail]);
+            total += avail;
+            self.pos += avail as u64;
+            if total < buf.len() && self.pos < self.file_len {
+                self.fill_buffer()?;
+            }
+        }
+        Ok(total)
+    }
+}
+
+impl IndexInput for BufferedIndexInput {
+    fn read_byte(&mut self) -> io::Result<u8> {
+        self.ensure_buffer()?;
+        if self.pos >= self.file_len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read_byte past end"));
+        }
+        let b = self.buf[(self.pos - self.buf_start) as usize];
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8], offset: usize, len: usize) -> io::Result<()> {
+        self.ensure_buffer()?;
+        let mut remaining = len;
+        let mut dst_off = offset;
+        while remaining > 0 && self.pos < self.file_len {
+            let buf_offset = (self.pos - self.buf_start) as usize;
+            let avail = (self.buf_len - buf_offset).min(remaining);
+            buf[dst_off..dst_off + avail].copy_from_slice(&self.buf[buf_offset..buf_offset + avail]);
+            dst_off += avail;
+            remaining -= avail;
+            self.pos += avail as u64;
+            if remaining > 0 {
+                self.fill_buffer()?;
+            }
+        }
+        if remaining > 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read_bytes past end"));
+        }
+        Ok(())
+    }
+
+    fn read_vlong(&mut self) -> io::Result<i64> {
+        let b = self.read_byte()?;
+        if b & 0x80 == 0 { return Ok(b as i64); }
+        let mut v = (b & 0x7F) as i64;
+        let mut shift = 7;
+        loop {
+            let b = self.read_byte()?;
+            v |= ((b & 0x7F) as i64) << shift;
+            shift += 7;
+            if b & 0x80 == 0 { break; }
+        }
+        Ok(v)
+    }
+
+    fn read_vint(&mut self) -> io::Result<i32> { self.read_vlong().map(|v| v as i32) }
+    fn read_zint(&mut self) -> io::Result<i32> {
+        let v = self.read_vlong()? as u64;
+        Ok(((v >> 1) as i64 ^ -((v & 1) as i64)) as i32)
+    }
+    fn read_string(&mut self) -> io::Result<String> {
+        let len = self.read_vint()? as usize;
+        let mut buf = vec![0u8; len];
+        self.read_bytes(&mut buf, 0, len)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+    fn file_pointer(&self) -> u64 { self.pos }
+    fn seek(&mut self, pos: u64) -> io::Result<()> {
+        if pos > self.file_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek past end"));
+        }
+        self.pos = pos;
+        Ok(())
+    }
+    fn length(&self) -> u64 { self.file_len }
+    fn slice(&self, _offset: u64, _len: u64) -> io::Result<Box<dyn IndexInput>> {
+        // For buffered files, slices are created by reading the range into memory.
+        // Caller should use this sparingly (postings .doc slices are the main use).
+        let mut buf = vec![0u8; _len as usize];
+        // clone-like: open a new reader at offset
+        let mut file = self.file.try_clone()?;
+        file.seek(SeekFrom::Start(_offset))?;
+        file.read_exact(&mut buf)?;
+        Ok(Box::new(HeapIndexInput::new(buf)))
+    }
+}
+
+#[cfg(test)]
+mod tests_read {
+    use super::*;
+
+    #[test]
+    fn test_vlong_round_trip() {
+        // write_vlong rejects negatives, so only test non-negative values
+        let test_values: &[i64] = &[0, 1, 127, 128, 16383, 16384, i64::MAX];
+        for &val in test_values {
+            let mut out = IndexOutput::in_memory();
+            out.write_vlong(val).unwrap();
+            out.flush().unwrap();
+            let bytes = out.into_bytes();
+            let mut input = HeapIndexInput::new(bytes);
+            assert_eq!(input.read_vlong().unwrap(), val, "vlong round-trip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_zint_round_trip() {
+        for &val in &[0i32, 1, -1, 100, -100, i32::MAX, i32::MIN] {
+            let mut out = IndexOutput::in_memory();
+            out.write_zint(val).unwrap();
+            out.flush().unwrap();
+            let bytes = out.into_bytes();
+            let mut input = HeapIndexInput::new(bytes);
+            assert_eq!(input.read_zint().unwrap(), val, "zint round-trip failed for {}", val);
+        }
+    }
+
+    #[test]
+    fn test_heap_slice() {
+        let data: Vec<u8> = (0..200u8).collect();
+        let input = HeapIndexInput::new(data);
+        let mut slice = input.slice(50, 100).unwrap();
+        assert_eq!(slice.length(), 100);
+        assert_eq!(slice.read_byte().unwrap(), 50);
+    }
+
+    #[test]
+    fn test_heap_seek_and_read() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut input = HeapIndexInput::new(data);
+        input.seek(50).unwrap();
+        assert_eq!(input.read_byte().unwrap(), 50);
+        assert_eq!(input.file_pointer(), 51);
     }
 }

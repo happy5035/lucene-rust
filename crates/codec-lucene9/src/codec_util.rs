@@ -14,7 +14,7 @@ pub const FOOTER_MAGIC: u32 = 0xC02893E8;
 /// CodecUtil.footerLength() (:421): magic(4) + algorithmID(4) + crc(8).
 pub const FOOTER_LENGTH: usize = 16;
 /// Footer checksum algorithm id: 0 = zlib CRC32 (writeFooter javadoc:401).
-const FOOTER_ALGORITHM_ID: u32 = 0;
+pub(crate) const FOOTER_ALGORITHM_ID: u32 = 0;
 
 /// Big-endian int (CodecUtil.writeBEInt:653-658).
 pub fn write_be_int(out: &mut ChecksumIndexOutput, v: u32) -> io::Result<()> {
@@ -59,15 +59,15 @@ pub fn write_index_header(
 /// Mirror of CodecUtil.checkHeader (CodecUtil.java:125-146).
 pub fn check_header(input: &mut dyn IndexInput, magic: &[u8], expected_version: u32) -> io::Result<()> {
     let mut actual_magic = vec![0u8; magic.len()];
-    for (i, b) in actual_magic.iter_mut().enumerate() {
-        *b = input.read_byte()?;
-        if *b != magic[i] {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("invalid codec header: expected magic byte {:02x} at position {}, got {:02x}",
-                    magic[i], i, *b)));
-        }
+    input.read_bytes(&mut actual_magic, 0, magic.len())?;
+    if actual_magic != magic {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("invalid codec header: expected magic {magic:02x?}, got {actual_magic:02x?}")));
     }
-    let version = input.read_vint()? as u32;
+    // Version is BE int (matches write_index_header's write_be_int)
+    let mut version_bytes = [0u8; 4];
+    input.read_bytes(&mut version_bytes, 0, 4)?;
+    let version = u32::from_be_bytes(version_bytes);
     if version != expected_version {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
             format!("version mismatch: expected {expected_version}, got {version}")));
@@ -79,13 +79,31 @@ pub fn check_header(input: &mut dyn IndexInput, magic: &[u8], expected_version: 
 /// Mirror of CodecUtil.checkFooter (CodecUtil.java:300-320).
 pub fn check_footer(input: &mut dyn IndexInput) -> io::Result<()> {
     let fp = input.file_pointer();
-    input.seek(input.length() - 8)?;
-    let _checksum = input.read_vlong()? as u64;
-    let footer_magic = input.read_vint()? as u32;
+    input.seek(input.length() - FOOTER_LENGTH as u64)?;
+
+    // Read BE footer magic (4 bytes)
+    let mut magic_bytes = [0u8; 4];
+    input.read_bytes(&mut magic_bytes, 0, 4)?;
+    let footer_magic = u32::from_be_bytes(magic_bytes);
     if footer_magic != FOOTER_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
-            format!("invalid footer magic: expected {FOOTER_MAGIC}, got {footer_magic}")));
+            format!("invalid footer magic: expected {FOOTER_MAGIC:#010x}, got {footer_magic:#010x}")));
     }
+
+    // Read BE algorithm ID (4 bytes)
+    let mut algo_bytes = [0u8; 4];
+    input.read_bytes(&mut algo_bytes, 0, 4)?;
+    let algo_id = u32::from_be_bytes(algo_bytes);
+    if algo_id != FOOTER_ALGORITHM_ID {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("invalid footer algorithm ID: expected {FOOTER_ALGORITHM_ID}, got {algo_id}")));
+    }
+
+    // Read BE CRC (8 bytes) — validation deferred until ChecksumIndexInput is available
+    let mut crc_bytes = [0u8; 8];
+    input.read_bytes(&mut crc_bytes, 0, 8)?;
+    let _checksum = u64::from_be_bytes(crc_bytes);
+
     input.seek(fp)?; // restore position
     Ok(())
 }

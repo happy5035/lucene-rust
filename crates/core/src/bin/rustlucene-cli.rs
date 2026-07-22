@@ -21,6 +21,7 @@ use rustlucene_core::{
     commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
     JsonBinder, Schema, SegmentBuilder,
 };
+use rustlucene_core::search::{Query, Searcher};
 
 /// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
 struct XorShift {
@@ -89,7 +90,11 @@ fn schema() -> Schema {
 /// to exercise the terms-dict multi-block + reverse-index paths end to end.
 fn log_schema(positions: bool, bigdict: bool) -> Schema {
     let mut s = Schema::new();
-    s.add(FieldSpec::long_point("timestamp").with_numeric_dv().with_stored(true));
+    s.add(
+        FieldSpec::long_point("timestamp")
+            .with_numeric_dv()
+            .with_stored(true),
+    );
     s.add(FieldSpec::keyword("level").with_sorted_dv());
     s.add(FieldSpec::keyword("trace_id"));
     if bigdict {
@@ -153,6 +158,71 @@ fn gen_log_document(
     doc
 }
 
+/// Search battery over a log-corpus index, printed line by line in the exact
+/// format of interop/java/VerifySearchIndex.java — the two outputs are
+/// diffed by interop/verify-search.sh (make log-test).
+fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()> {
+    let dir = FSDirectory::open(index_dir)?;
+    let mut searcher = Searcher::open(&dir)?;
+    let mut out = String::new();
+    out.push_str(&format!("maxDoc={}\n", searcher.max_doc()));
+
+    for level in LEVELS {
+        let count = searcher.count(&Query::term("level", level))?;
+        out.push_str(&format!("term level={level} count={count}\n"));
+    }
+    let (_, docs) = searcher.top_docs(&Query::term("level", "INFO"), 20)?;
+    out.push_str(&format!("term level=INFO first20={}\n", doc_csv(&docs)));
+
+    for w in ["connection0", "query23", "queue39"] {
+        let q = Query::term("message", w);
+        let count = searcher.count(&q)?;
+        let freqsum = searcher.freq_sum(&q)?;
+        out.push_str(&format!("term message={w} count={count} freqsum={freqsum}\n"));
+    }
+    let count = searcher.count(&Query::term("message", "nosuchterm42"))?;
+    out.push_str(&format!("term message=nosuchterm42 count={count}\n"));
+
+    if num_docs > 7 {
+        let tid = trace_id_of_doc(seed, 7);
+        let count = searcher.count(&Query::term("trace_id", &tid))?;
+        out.push_str(&format!("term trace_id(doc7)={tid} count={count}\n"));
+    }
+
+    let count = searcher.count(&Query::MatchAll)?;
+    out.push_str(&format!("matchall count={count}\n"));
+    let (_, docs) = searcher.top_docs(&Query::MatchAll, 20)?;
+    out.push_str(&format!("matchall first20={}\n", doc_csv(&docs)));
+    print!("{out}");
+    Ok(())
+}
+
+fn doc_csv(docs: &[i32]) -> String {
+    let mut s = String::new();
+    for d in docs {
+        s.push_str(&d.to_string());
+        s.push(',');
+    }
+    s
+}
+
+/// Replays the log corpus generator (same RNG stream as logwrite; the
+/// sparse/bigdict flags only gate whether fields are *added*, the draws are
+/// identical) to recover doc `n`'s trace_id without reading stored fields.
+fn trace_id_of_doc(seed: u64, n: u64) -> String {
+    let vocab = vocab();
+    let mut rng = XorShift::new(seed);
+    let mut tid = String::new();
+    for doc_id in 0..=n {
+        let doc = gen_log_document(&mut rng, &vocab, doc_id, false, false);
+        tid = match doc.fields.iter().find(|(name, _)| name == "trace_id") {
+            Some((_, FieldValue::Keyword(k))) => k.clone(),
+            _ => panic!("trace_id must be a keyword field"),
+        };
+    }
+    tid
+}
+
 /// Sharded log-schema bench, mirroring `bench` (private SegmentBuilder per
 /// thread, unioned commit).
 fn logbench(
@@ -172,31 +242,33 @@ fn logbench(
         for tid in 0..threads {
             let vocab = &vocab;
             let name_counter = &name_counter;
-            handles.push(scope.spawn(move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128, Vec<u64>)> {
-                let dir = FSDirectory::open(index_dir)?;
-                let schema = log_schema(positions, false);
-                let name = name_counter.fetch_add(1, Ordering::Relaxed);
-                let mut builder = SegmentBuilder::new(dir, name);
-                let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
-                let mut indexed_bytes = 0u64;
-                let mut scis = Vec::new();
-                // add-latency samples (every 16th add) for p50/p99 reporting
-                let mut samples: Vec<u64> = Vec::with_capacity(per_thread as usize / 16 + 2);
-                for doc_id in 0..per_thread {
-                    let doc = gen_log_document(&mut rng, vocab, doc_id as u64, false, false);
-                    indexed_bytes += 200 + 40; // message + trace_id payload approximation
-                    let t_add = Instant::now();
-                    builder.add_document(&schema, doc)?;
-                    if doc_id % 16 == 0 {
-                        samples.push(t_add.elapsed().as_nanos() as u64);
+            handles.push(scope.spawn(
+                move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128, Vec<u64>)> {
+                    let dir = FSDirectory::open(index_dir)?;
+                    let schema = log_schema(positions, false);
+                    let name = name_counter.fetch_add(1, Ordering::Relaxed);
+                    let mut builder = SegmentBuilder::new(dir, name);
+                    let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
+                    let mut indexed_bytes = 0u64;
+                    let mut scis = Vec::new();
+                    // add-latency samples (every 16th add) for p50/p99 reporting
+                    let mut samples: Vec<u64> = Vec::with_capacity(per_thread as usize / 16 + 2);
+                    for doc_id in 0..per_thread {
+                        let doc = gen_log_document(&mut rng, vocab, doc_id as u64, false, false);
+                        indexed_bytes += 200 + 40; // message + trace_id payload approximation
+                        let t_add = Instant::now();
+                        builder.add_document(&schema, doc)?;
+                        if doc_id % 16 == 0 {
+                            samples.push(t_add.elapsed().as_nanos() as u64);
+                        }
                     }
-                }
-                let t_flush = Instant::now();
-                if let Some(sci) = builder.finalize()? {
-                    scis.push(sci);
-                }
-                Ok((scis, indexed_bytes, t_flush.elapsed().as_millis(), samples))
-            }));
+                    let t_flush = Instant::now();
+                    if let Some(sci) = builder.finalize()? {
+                        scis.push(sci);
+                    }
+                    Ok((scis, indexed_bytes, t_flush.elapsed().as_millis(), samples))
+                },
+            ));
         }
         handles
             .into_iter()
@@ -252,11 +324,21 @@ fn logwrite(
     bigdict: bool,
 ) -> std::io::Result<()> {
     let vocab = vocab();
-    let mut w = IndexWriter::create(index_dir, log_schema(positions, bigdict), IndexWriterConfig::default())?;
+    let mut w = IndexWriter::create(
+        index_dir,
+        log_schema(positions, bigdict),
+        IndexWriterConfig::default(),
+    )?;
     let mut rng = XorShift::new(seed);
     let t0 = Instant::now();
     for doc_id in 0..num_docs {
-        w.add_document(gen_log_document(&mut rng, &vocab, doc_id as u64, sparse, bigdict))?;
+        w.add_document(gen_log_document(
+            &mut rng,
+            &vocab,
+            doc_id as u64,
+            sparse,
+            bigdict,
+        ))?;
     }
     w.commit()?;
     let ms = t0.elapsed().as_millis().max(1);
@@ -287,27 +369,29 @@ fn bench(
         for tid in 0..threads {
             let vocab = &vocab;
             let name_counter = &name_counter;
-            handles.push(scope.spawn(move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128)> {
-                let dir = FSDirectory::open(index_dir)?;
-                let schema = schema();
-                let name = name_counter.fetch_add(1, Ordering::Relaxed);
-                let mut builder = SegmentBuilder::new(dir, name);
-                let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
-                let mut indexed_bytes = 0u64;
-                let mut scis = Vec::new();
-                for _ in 0..per_thread {
-                    let msg = gen_message(&mut rng, vocab, doc_bytes);
-                    indexed_bytes += msg.len() as u64;
-                    let mut doc = Document::new();
-                    doc.add("message", FieldValue::Text(msg));
-                    builder.add_document(&schema, doc)?;
-                }
-                let t_flush = Instant::now();
-                if let Some(sci) = builder.finalize()? {
-                    scis.push(sci);
-                }
-                Ok((scis, indexed_bytes, t_flush.elapsed().as_millis()))
-            }));
+            handles.push(scope.spawn(
+                move || -> std::io::Result<(Vec<SegmentCommitInfo>, u64, u128)> {
+                    let dir = FSDirectory::open(index_dir)?;
+                    let schema = schema();
+                    let name = name_counter.fetch_add(1, Ordering::Relaxed);
+                    let mut builder = SegmentBuilder::new(dir, name);
+                    let mut rng = XorShift::new(seed.wrapping_add(tid as u64 * 0x9E3779B97F4A7C15));
+                    let mut indexed_bytes = 0u64;
+                    let mut scis = Vec::new();
+                    for _ in 0..per_thread {
+                        let msg = gen_message(&mut rng, vocab, doc_bytes);
+                        indexed_bytes += msg.len() as u64;
+                        let mut doc = Document::new();
+                        doc.add("message", FieldValue::Text(msg));
+                        builder.add_document(&schema, doc)?;
+                    }
+                    let t_flush = Instant::now();
+                    if let Some(sci) = builder.finalize()? {
+                        scis.push(sci);
+                    }
+                    Ok((scis, indexed_bytes, t_flush.elapsed().as_millis()))
+                },
+            ));
         }
         handles
             .into_iter()
@@ -369,7 +453,12 @@ fn write_docs(
     Ok((t0.elapsed().as_millis(), indexed_bytes))
 }
 
-fn write_golden_terms(golden: &mut dyn Write, num_docs: u32, doc_bytes: usize, seed: u64) -> std::io::Result<()> {
+fn write_golden_terms(
+    golden: &mut dyn Write,
+    num_docs: u32,
+    doc_bytes: usize,
+    seed: u64,
+) -> std::io::Result<()> {
     // Re-generate the same corpus and accumulate postings for a sample of terms.
     use std::collections::BTreeMap;
     let vocab = vocab();
@@ -389,11 +478,20 @@ fn write_golden_terms(golden: &mut dyn Write, num_docs: u32, doc_bytes: usize, s
     let n = terms.len().min(200);
     writeln!(golden, "TERMS message {n}")?;
     for i in 0..n {
-        let idx = if n > 1 { i * (terms.len() - 1) / (n - 1) } else { 0 };
+        let idx = if n > 1 {
+            i * (terms.len() - 1) / (n - 1)
+        } else {
+            0
+        };
         let term = terms[idx];
         let docs = &postings[term];
         let ids: Vec<String> = docs.iter().map(u32::to_string).collect();
-        writeln!(golden, "{}\t{}", String::from_utf8_lossy(term), ids.join(","))?;
+        writeln!(
+            golden,
+            "{}\t{}",
+            String::from_utf8_lossy(term),
+            ids.join(",")
+        )?;
     }
     Ok(())
 }
@@ -437,7 +535,10 @@ fn index_files(
         let pass_start_docs = docs;
         for f in &files {
             let source = if input.is_dir() {
-                f.strip_prefix(input).unwrap_or(f).to_string_lossy().into_owned()
+                f.strip_prefix(input)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .into_owned()
             } else {
                 f.file_name().unwrap().to_string_lossy().into_owned()
             };
@@ -506,8 +607,8 @@ fn json_index(
     schema_spec: &str,
     target_docs: Option<u64>,
 ) -> std::io::Result<()> {
-    let (schema, aliases, policy) =
-        Schema::parse(schema_spec).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let (schema, aliases, policy) = Schema::parse(schema_spec)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let binder = JsonBinder::new(&schema, &aliases, policy);
     let mut w = IndexWriter::create(index_dir, schema, IndexWriterConfig::default())?;
     let reader = std::io::BufReader::new(File::open(jsonl_file)?);
@@ -567,7 +668,6 @@ fn json_gen(out_file: &Path, num_docs: u64, seed: u64) -> std::io::Result<()> {
 }
 
 fn collect_files(path: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
-
     if path.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
@@ -592,6 +692,7 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
+    eprintln!("  rustlucene-cli searchdump <indexDir> <numDocs> <seed>");
     std::process::exit(2);
 }
 
@@ -610,7 +711,9 @@ fn main() -> std::io::Result<()> {
             let doc_bytes: usize = args[4].parse().unwrap();
             let seed: u64 = args[5].parse().unwrap();
             if args[1] == "write" {
-                let mut golden = args.get(6).map(|p| BufWriter::new(File::create(p).unwrap()));
+                let mut golden = args
+                    .get(6)
+                    .map(|p| BufWriter::new(File::create(p).unwrap()));
                 if let Some(g) = golden.as_mut() {
                     writeln!(g, "DOCS {num_docs}")?;
                 }
@@ -706,6 +809,16 @@ fn main() -> std::io::Result<()> {
                 args[4].parse().unwrap(),
                 threads,
                 positions,
+            )
+        }
+        "searchdump" => {
+            if args.len() < 5 {
+                usage();
+            }
+            searchdump(
+                Path::new(&args[2]),
+                args[3].parse().unwrap(),
+                args[4].parse().unwrap(),
             )
         }
         _ => usage(),

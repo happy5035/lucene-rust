@@ -37,4 +37,7 @@ java -cp "$CP" VerifyLogIndex "$JAVA_DIR" "$EXPECT_POSITIONS" > /tmp/rl-log-java
 diff -u /tmp/rl-log-rust.out /tmp/rl-log-java.out
 cat /tmp/rl-log-rust.out
 
+echo "== Search diff: searchdump vs VerifySearchIndex"
+"$ROOT/interop/verify-search.sh" "$RUST_DIR" "$JAVA_DIR" "$NUM_DOCS" "$SEED"
+
 echo "LOG_INTEROP_OK"

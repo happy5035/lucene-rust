@@ -342,13 +342,21 @@ fn skip_sorted_metadata(input: &mut dyn IndexInput) -> io::Result<()> {
     let block_shift = read_le_i32(input)?;
     debug_assert_eq!(block_shift as u32, DM_BLOCK_SHIFT);
 
-    // Terms-dict addresses: DirectMonotonic meta
-    let num_dict_blocks = if dict_size == 0 {
+    // Terms-dict addresses: DirectMonotonic meta.
+    // First compute the number of DM *values* (64-term block addresses),
+    // then the number of DM *blocks* (meta records) from that — matching
+    // the formula used by DvDirectMonotonicReader::read_meta.
+    let num_dict_dm_values = if dict_size == 0 {
         0
     } else {
-        ((dict_size as usize - 1) >> DM_BLOCK_SHIFT) + 1
+        (dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE)
     };
-    skip_dm_meta(input, num_dict_blocks)?;
+    let num_dict_dm_blocks = if num_dict_dm_values == 0 {
+        0
+    } else {
+        ((num_dict_dm_values - 1) >> DM_BLOCK_SHIFT) + 1
+    };
+    skip_dm_meta(input, num_dict_dm_blocks)?;
 
     // maxTermLength, maxBlockLength, termsDataOffset, termsDataLength,
     // termsAddressesOffset, termsAddressesLength
@@ -363,13 +371,20 @@ fn skip_sorted_metadata(input: &mut dyn IndexInput) -> io::Result<()> {
     let index_shift = read_le_i32(input)?;
     debug_assert_eq!(index_shift as u32, TERMS_DICT_REVERSE_INDEX_SHIFT);
 
-    // Reverse-index addresses: DirectMonotonic meta
+    // Reverse-index addresses: DirectMonotonic meta.
+    // num_index_records is the count of DM *values*; we must compute the
+    // number of DM *blocks* (meta records) the same way read_meta does.
     let num_index_records = if dict_size == 0 {
         1
     } else {
         1 + (dict_size as usize).div_ceil(TERMS_DICT_REVERSE_INDEX_SIZE)
     };
-    skip_dm_meta(input, num_index_records)?;
+    let num_index_dm_blocks = if num_index_records == 0 {
+        0
+    } else {
+        ((num_index_records - 1) >> DM_BLOCK_SHIFT) + 1
+    };
+    skip_dm_meta(input, num_index_dm_blocks)?;
 
     // termsIndexOffset, termsIndexLength, termsIndexAddressesOffset,
     // termsIndexAddressesLength
@@ -546,6 +561,7 @@ impl DvDirectMonotonicReader {
 // ---------------------------------------------------------------------------
 
 /// Reverse index for sorted terms: maps ord ranges to sort-key prefixes.
+#[allow(dead_code)]
 struct ReverseTermsIndex {
     index_data: Vec<u8>,
     addresses: DvDirectMonotonicReader,
@@ -562,6 +578,7 @@ pub struct SortedDocValuesReader {
     max_ord: u32,
     terms_dict: Vec<u8>,
     block_addrs: DvDirectMonotonicReader,
+    #[allow(dead_code)]
     reverse_index: ReverseTermsIndex,
 }
 
@@ -643,10 +660,10 @@ impl SortedDocValuesReader {
                 bpv,
                 values: ords_values,
             };
-            let max_ord = num_values as u32;
 
             // --- terms dict metadata --------------------------------
             let dict_size = dvm.read_vlong()?;
+            let max_ord = dict_size as u32;
             let block_shift = read_le_i32(&mut dvm)?;
             debug_assert_eq!(block_shift as u32, DM_BLOCK_SHIFT);
 
@@ -660,7 +677,7 @@ impl SortedDocValuesReader {
             let block_addrs = DvDirectMonotonicReader::read_meta(
                 &mut dvm,
                 dvd_bytes,
-                -1, // dummy — we read meta inline from dvm first, data later
+                0, // dummy — we read meta inline from dvm first, data later
                 0, // dummy
                 num_dm_values,
                 block_shift as u32,
@@ -712,7 +729,7 @@ impl SortedDocValuesReader {
             let rev_addrs = DvDirectMonotonicReader::read_meta(
                 &mut dvm,
                 dvd_bytes,
-                -1,
+                0,
                 0,
                 num_index_records,
                 block_shift as u32,

@@ -5,7 +5,7 @@
 
 use std::io;
 
-use crate::io::ChecksumIndexOutput;
+use crate::io::{ChecksumIndexOutput, IndexInput};
 
 /// CodecUtil.CODEC_MAGIC (:46).
 pub const CODEC_MAGIC: u32 = 0x3fd76c17;
@@ -53,6 +53,41 @@ pub fn write_index_header(
     out.write_bytes(id)?;
     out.write_byte(suffix.len() as u8)?;
     out.write_bytes(suffix.as_bytes())
+}
+
+/// Validates codec header magic bytes and version.
+/// Mirror of CodecUtil.checkHeader (CodecUtil.java:125-146).
+pub fn check_header(input: &mut dyn IndexInput, magic: &[u8], expected_version: u32) -> io::Result<()> {
+    let mut actual_magic = vec![0u8; magic.len()];
+    for (i, b) in actual_magic.iter_mut().enumerate() {
+        *b = input.read_byte()?;
+        if *b != magic[i] {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("invalid codec header: expected magic byte {:02x} at position {}, got {:02x}",
+                    magic[i], i, *b)));
+        }
+    }
+    let version = input.read_vint()? as u32;
+    if version != expected_version {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("version mismatch: expected {expected_version}, got {version}")));
+    }
+    Ok(())
+}
+
+/// Validates codec footer (magic + checksum).
+/// Mirror of CodecUtil.checkFooter (CodecUtil.java:300-320).
+pub fn check_footer(input: &mut dyn IndexInput) -> io::Result<()> {
+    let fp = input.file_pointer();
+    input.seek(input.length() - 8)?;
+    let _checksum = input.read_vlong()? as u64;
+    let footer_magic = input.read_vint()? as u32;
+    if footer_magic != FOOTER_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("invalid footer magic: expected {FOOTER_MAGIC}, got {footer_magic}")));
+    }
+    input.seek(fp)?; // restore position
+    Ok(())
 }
 
 /// CodecUtil.writeFooter (:409-413): BE FOOTER_MAGIC + BE algorithmID(0) +

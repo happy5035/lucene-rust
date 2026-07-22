@@ -69,8 +69,9 @@
   `trait DocIter { doc_id, next_doc, advance }`（DISI 语义照抄，继承体系不要）。
   conjunction 用 lead-iterator 两两对齐；phrase 用 position 合取（对齐 slop=0 路径）。
 - **Collector**：topN by docID / NumericDV / SortedDV 三种堆；MISSING 值规则照抄 9.12.3
-  `FieldComparator`（long 默认排尾、string ord 空排尾）。collector 本身是堆操作，不是热点；
-  查询耗时集中在**喂给它的解码循环**上，性能优化放在解码层（见 §5a SIMD 策略）。
+  `FieldComparator`（long 默认排尾、string ord 空排尾）。collector 采用**块级批处理**接口
+  （一次消费一个 128-doc 解码块，而非 Lucene 式 per-doc `collect()`），与解码层 SIMD 协同——
+  详见 §4b。
 - **JNI 门面**：reader 句柄 = `Arc<Searcher>` + 句柄表（沿用写侧 IndexWriter 句柄模式）；
   query 以 JSON 字符串传入（复用 core 的 json 基础设施）。Java 类方法签名对齐 Lucene 常用子集
   （`open/close`、`search(query, n, sort) -> TopDocs` 形状），上层替换 Java Lucene 只改 import。
@@ -101,6 +102,34 @@ open 时只读 segments_N + .si + .fnm；FST / BKD / DV 索引在首次触及该
    "标量 vs SIMD 输出逐值相等"的对拍单测；
 3. SIMD 以 bench 数据为门槛——只对 profile 证实的热点启用，无数据不优化。
    预期主要收益：高命中 term/boolean 查询的 .doc 全块扫描、DV 排序的列式取值。
+
+## 4b. 批处理 collector（SIMD 协同）
+
+Lucene 的 `LeafCollector.collect(doc)` 是逐文档回调，每次调用都要过一遍堆比较；
+而 postings 天然按 128 块解码，**整块在手时再逐 doc 喂堆是对解码成果的浪费**。
+设计为块级批处理：
+
+**接口**：`DocIter` 在 `next_doc/advance` 之外暴露 `next_block() -> Option<DocBlock>`
+（`DocBlock { docs: [u32; 128], len, freqs: Option<&[u32]> }`，tail 块 len<128）。
+非 postings 来源（BKD、phrase 校验后的结果）把命中物化进同一 `DocBlock` 形状，
+collector 对来源无感知。
+
+**collector 侧的块级优化（按排序类型分）：**
+
+- **topN by docID**：天然批处理——docID 递增时 topN 就是尾部窗口，整块比较堆顶阈值，
+  全块小于阈值则一次跳过（零堆操作）；块内命中走批量替换
+- **count 查询**（验证电池的主力形态）：短路——`docs` 全块直接 `len += block.len`；
+  DOCS 字段的稠密场景可进一步退化为 bitset popcount（AVX2 nibble 查表 popcount；
+  有 AVX512VPOPCNTDQ 时切换原生指令）
+- **topN by DV**：两阶段过滤——先对块做 SIMD 预筛（块的 DV 值域与堆顶比较，
+  值域来自 DV 块头 min/max 或块采样），过不了筛的块不进堆；过筛选出候选 doc
+  再取向量化的 DV gather（AVX2 gather 指令，收益待 bench 验证，可退化为标量批量取）
+- **Boolean 合取**：两块 128-doc 已解码块的交集走 SIMD intersect
+  （`_mm_shuffle_epi8` 查表法，Lemire 式；标量 galloping 作为对照实现）
+
+**正确性纪律**：批处理只是消费形态变化，命中集合与排序结果必须与 per-doc 标量路径
+**逐位一致**——每个批处理 collector 配"标量 collect 路径对拍"单测，并随三层测试
+（round-trip / 语义电池 / Java diff 终验）锁定。
 
 ## 4. 数据流（一次查询）
 
@@ -140,11 +169,12 @@ Java: search(handle, queryJson, topN, sortSpec)
 | 部分 | 估计 |
 |---|---|
 | 读路径（postings+FST ~1.2k、BKD ~600、DV ~700、stored ~400、indexinput/segments ~300） | 3.5–4k 行 |
-| 执行层（Query/DocIter/conjunction/phrase/collector） | ~1k 行 |
+| 执行层（Query/DocIter/conjunction/phrase） | ~1k 行 |
+| 批处理 collector（DocBlock 接口 + 三类块级 collector + 标量对拍） | ~600 行 |
 | SIMD bit-unpack 核 + 运行时分发 + 对拍测试 | ~500 行 |
 | JNI 门面 | ~400 行 |
 | 测试 | ~1.5k 行 |
-| **合计** | **6.5–7.5k 行** |
+| **合计** | **7–8k 行** |
 
 ## 8. 后续优化点（不在本期）
 

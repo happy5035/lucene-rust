@@ -5,11 +5,13 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use crate::codec_util::{write_footer, write_index_header};
+use crate::codec_util::{check_footer, check_index_header, corrupt, write_footer, write_index_header};
 use crate::directory::FSDirectory;
+use crate::io::DataInput;
 
 const CODEC_NAME: &str = "Lucene94FieldInfos"; // :422
 const FORMAT_CURRENT: u32 = 1; // FORMAT_PARENT_FIELD (:423-426)
+const FORMAT_START: u32 = 0; // :423
 pub const EXTENSION: &str = "fnm"; // :419
 
 // bits byte flags (:429-433)
@@ -172,12 +174,128 @@ impl FieldInfos {
         out.flush()?;
         Ok(file_name)
     }
+
+    pub fn by_number(&self, number: i32) -> Option<&FieldInfo> {
+        self.fields.iter().find(|f| f.number == number)
+    }
+
+    /// Lucene94FieldInfosFormat.read (:127-234): mirror of
+    /// [`FieldInfos::write`].
+    pub fn read(
+        dir: &FSDirectory,
+        segment: &str,
+        segment_id: &[u8; 16],
+        suffix: &str,
+    ) -> io::Result<FieldInfos> {
+        let file_name = format!("{segment}{suffix}.{EXTENSION}");
+        let mut input = dir.open_checksum_input(&file_name)?;
+        check_index_header(
+            &mut input,
+            CODEC_NAME,
+            FORMAT_START,
+            FORMAT_CURRENT,
+            segment_id,
+            suffix,
+        )?;
+        let size = input.read_vint()?;
+        if size < 0 {
+            return Err(corrupt(format!("invalid field count {size}")));
+        }
+        let mut fields = Vec::with_capacity(size as usize);
+        for _ in 0..size {
+            let name = input.read_string()?;
+            let number = input.read_vint()?;
+            let bits = input.read_byte()?;
+            if bits & 0xE0 != 0 {
+                return Err(corrupt(format!("invalid field bits {bits:#x}")));
+            }
+            let index_options = index_options_from_byte(input.read_byte()?)?;
+            let doc_values_type = doc_values_type_from_byte(input.read_byte()?)?;
+            let doc_values_gen = input.read_long()?;
+            let attributes = input.read_map_of_strings()?;
+            let point_dimension_count = input.read_vint()?;
+            let (point_index_dimension_count, point_num_bytes) = if point_dimension_count != 0 {
+                (input.read_vint()?, input.read_vint()?)
+            } else {
+                (0, 0)
+            };
+            let vector_dimension = input.read_vint()?;
+            let vector_encoding = match input.read_byte()? {
+                0 => VectorEncoding::Byte,
+                1 => VectorEncoding::Float32,
+                b => return Err(corrupt(format!("invalid vector encoding {b}"))),
+            };
+            let vector_similarity = match input.read_byte()? {
+                0 => VectorSimilarity::Euclidean,
+                1 => VectorSimilarity::DotProduct,
+                2 => VectorSimilarity::Cosine,
+                3 => VectorSimilarity::MaximumInnerProduct,
+                b => return Err(corrupt(format!("invalid vector similarity {b}"))),
+            };
+            fields.push(FieldInfo {
+                name,
+                number,
+                store_termvector: bits & STORE_TERMVECTOR != 0,
+                omit_norms: bits & OMIT_NORMS != 0,
+                store_payloads: bits & STORE_PAYLOADS != 0,
+                soft_deletes: bits & SOFT_DELETES_FIELD != 0,
+                parent_field: bits & PARENT_FIELD_FIELD != 0,
+                index_options,
+                doc_values_type,
+                doc_values_gen,
+                attributes,
+                point_dimension_count,
+                point_index_dimension_count,
+                point_num_bytes,
+                vector_dimension,
+                vector_encoding,
+                vector_similarity,
+            });
+        }
+        check_footer(&mut input)?;
+        Ok(FieldInfos { fields })
+    }
+}
+
+/// getIndexOptions (:349-365).
+fn index_options_from_byte(b: u8) -> io::Result<IndexOptions> {
+    match b {
+        0 => Ok(IndexOptions::None),
+        1 => Ok(IndexOptions::Docs),
+        2 => Ok(IndexOptions::DocsAndFreqs),
+        3 => Ok(IndexOptions::DocsAndFreqsAndPositions),
+        4 => Ok(IndexOptions::DocsAndFreqsAndPositionsAndOffsets),
+        _ => Err(corrupt(format!("invalid index options {b}"))),
+    }
+}
+
+/// getDocValuesType (:263-280).
+fn doc_values_type_from_byte(b: u8) -> io::Result<DocValuesType> {
+    match b {
+        0 => Ok(DocValuesType::None),
+        1 => Ok(DocValuesType::Numeric),
+        2 => Ok(DocValuesType::Binary),
+        3 => Ok(DocValuesType::Sorted),
+        4 => Ok(DocValuesType::SortedSet),
+        5 => Ok(DocValuesType::SortedNumeric),
+        _ => Err(corrupt(format!("invalid doc values type {b}"))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::{ChecksumIndexOutput, IndexOutput};
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codec-lucene9-fnm-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     #[test]
     fn enum_ordinals() {
@@ -243,5 +361,35 @@ mod tests {
                 0,    // vectorSimilarity EUCLIDEAN
             ]
         );
+    }
+
+    #[test]
+    fn fnm_round_trip() {
+        let root = temp_dir("fnm_read");
+        let dir = crate::directory::FSDirectory::open(&root).unwrap();
+        let mut indexed = FieldInfo::stored("message", 0);
+        indexed.omit_norms = true;
+        indexed.index_options = IndexOptions::DocsAndFreqs;
+        let mut point = FieldInfo::stored("timestamp", 1);
+        point.point_dimension_count = 1;
+        point.point_index_dimension_count = 1;
+        point.point_num_bytes = 8;
+        point.doc_values_type = DocValuesType::Numeric;
+        let fis = FieldInfos::new(vec![indexed, point]);
+        fis.write(&dir, "_0", &[3u8; 16], "").unwrap();
+
+        let back = FieldInfos::read(&dir, "_0", &[3u8; 16], "").unwrap();
+        assert_eq!(back.fields.len(), 2);
+        let f0 = back.by_name("message").unwrap();
+        assert_eq!(f0.number, 0);
+        assert!(f0.omit_norms);
+        assert!(matches!(f0.index_options, IndexOptions::DocsAndFreqs));
+        let f1 = back.by_number(1).unwrap();
+        assert_eq!(f1.name, "timestamp");
+        assert_eq!(f1.point_dimension_count, 1);
+        assert_eq!(f1.point_num_bytes, 8);
+        assert!(matches!(f1.doc_values_type, DocValuesType::Numeric));
+        assert!(back.by_number(2).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

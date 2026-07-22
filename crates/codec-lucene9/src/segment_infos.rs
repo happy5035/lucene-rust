@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use crate::codec_util::{write_be_int, write_be_long, write_footer, write_index_header};
+use crate::codec_util::{check_footer, check_header, check_index_header_suffix, corrupt, read_be_int, read_be_long, write_be_int, write_be_long, write_footer, write_index_header};
 use crate::directory::FSDirectory;
-use crate::io::ChecksumIndexOutput;
+use crate::io::{ChecksumIndexOutput, DataInput};
 use crate::segment_info::SegmentInfo;
 
 const CODEC_NAME: &str = "segments";
@@ -111,7 +111,13 @@ impl SegmentInfos {
     pub fn write(&self, out: &mut ChecksumIndexOutput, generation: i64) -> io::Result<()> {
         let id = random_id();
         // header suffix = Long.toString(generation, 36) (:597-602)
-        write_index_header(out, CODEC_NAME, VERSION_CURRENT, &id, &to_base36(generation))?;
+        write_index_header(
+            out,
+            CODEC_NAME,
+            VERSION_CURRENT,
+            &id,
+            &to_base36(generation),
+        )?;
         let (major, minor, bugfix) = LUCENE_VERSION;
         out.write_vint(major)?;
         out.write_vint(minor)?;
@@ -199,6 +205,122 @@ impl SegmentInfos {
         }
         Ok(())
     }
+
+    /// SegmentInfos.readCommit (:327-389) + parseSegmentInfos (:391-519).
+    /// Reads `segments_<base36 generation>`; the commit id is parsed but not
+    /// validated (:341-342 reads it without comparison). Enforces the spec §1
+    /// premise: no deletes, no field-info/docvalues updates.
+    pub fn read_commit(dir: &FSDirectory, generation: i64) -> io::Result<SegmentInfos> {
+        let file_name = file_name_from_generation(SEGMENTS, generation);
+        let mut input = dir.open_checksum_input(&file_name)?;
+        let _format = check_header(&mut input, CODEC_NAME, 7, VERSION_CURRENT)?; // VERSION_70..=VERSION_86
+        let mut commit_id = [0u8; 16];
+        input.read_bytes(&mut commit_id)?; // :341-342, unverified by design
+        check_index_header_suffix(&mut input, &to_base36(generation))?; // :343
+        let _lucene_version = (input.read_vint()?, input.read_vint()?, input.read_vint()?); // :345-346
+        let index_created_version_major = input.read_vint()?; // :347
+        let version = read_be_long(&mut input)? as i64; // :393
+        let counter = input.read_vlong()?; // :395-399
+        let num_segments = read_be_int(&mut input)? as usize; // :400
+        let min_segment_version = if num_segments > 0 {
+            Some((input.read_vint()?, input.read_vint()?, input.read_vint()?)) // :405-410
+        } else {
+            None
+        };
+        let mut segments = Vec::with_capacity(num_segments);
+        for _ in 0..num_segments {
+            let seg_name = input.read_string()?; // :414
+            let mut seg_id = [0u8; 16];
+            input.read_bytes(&mut seg_id)?; // :415-416
+            let codec = input.read_string()?; // :417
+            if codec != "Lucene912" {
+                return Err(corrupt(format!("unsupported codec {codec}")));
+            }
+            let del_gen = read_be_long(&mut input)? as i64; // :422
+            let del_count = read_be_int(&mut input)? as i32; // :423
+            let field_infos_gen = read_be_long(&mut input)? as i64; // :428
+            let doc_values_gen = read_be_long(&mut input)? as i64; // :429
+            let soft_del_count = read_be_int(&mut input)? as i32; // :430
+            let id = match input.read_byte()? {
+                // :441-457
+                1 => {
+                    let mut b = [0u8; 16];
+                    input.read_bytes(&mut b)?;
+                    Some(b)
+                }
+                0 => None,
+                b => return Err(corrupt(format!("invalid SCI id marker {b}"))),
+            };
+            let field_infos_files = input.read_set_of_strings()?; // :460
+            let num_dv_fields = read_be_int(&mut input)?; // :462-471
+            let mut doc_values_updates = BTreeMap::new();
+            for _ in 0..num_dv_fields {
+                let field_number = read_be_int(&mut input)? as i32;
+                let files = input.read_set_of_strings()?;
+                doc_values_updates.insert(field_number, files);
+            }
+            // spec §1 premise: our own indexes only (no deletes/updates)
+            if del_gen != -1
+                || del_count != 0
+                || field_infos_gen != -1
+                || doc_values_gen != -1
+                || soft_del_count != 0
+                || !doc_values_updates.is_empty()
+            {
+                return Err(corrupt(
+                    "unsupported: live docs / field-info / docvalues updates (spec §1)",
+                ));
+            }
+            // codec.segmentInfoFormat().read (:418-422): the .si file is
+            // parsed here, between codec name and delGen in stream order.
+            let info = SegmentInfo::read(dir, &seg_name, &seg_id, "")?;
+            segments.push(SegmentCommitInfo {
+                info,
+                del_gen,
+                del_count,
+                field_infos_gen,
+                doc_values_gen,
+                soft_del_count,
+                id,
+                field_infos_files,
+                doc_values_updates,
+            });
+        }
+        let user_data = input.read_map_of_strings()?; // :508
+        check_footer(&mut input)?; // :379-387
+        Ok(SegmentInfos {
+            version,
+            counter,
+            index_created_version_major,
+            min_segment_version,
+            segments,
+            user_data,
+        })
+    }
+
+    /// SegmentInfos.readLatestCommit (:539-557) over
+    /// getLastCommitGeneration (:201-215): highest base36 generation among
+    /// `segments_*` files (excluding `segments.gen` and pending commits).
+    pub fn read_latest(dir: &FSDirectory) -> io::Result<(SegmentInfos, i64)> {
+        let mut best: Option<i64> = None;
+        for name in dir.list_all()? {
+            if !name.starts_with(SEGMENTS) || name == "segments.gen" {
+                continue;
+            }
+            let Some(gen_str) = name[SEGMENTS.len()..].strip_prefix('_') else {
+                continue; // bare "segments" is not a commit file
+            };
+            // generationFromSegmentsFileName (:254-266)
+            let Ok(gen_val) = i64::from_str_radix(gen_str, BASE36) else {
+                continue;
+            };
+            best = Some(best.map_or(gen_val, |b: i64| b.max(gen_val)));
+        }
+        let generation = best.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no segments_N commit found")
+        })?;
+        Ok((Self::read_commit(dir, generation)?, generation))
+    }
 }
 
 /// 16 random bytes, equivalent of StringHelper.randomId()
@@ -210,6 +332,24 @@ pub fn random_id() -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment_info::SegmentInfo;
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codec-lucene9-sis-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn commit_one(dir: &FSDirectory, infos: &mut SegmentInfos, name: &str, id: [u8; 16], generation: i64) {
+        let mut si = SegmentInfo::new(name, id, 10);
+        si.files.insert(format!("{name}.si"));
+        si.write(dir, "").unwrap();
+        infos.segments.push(SegmentCommitInfo::new(si, id));
+        infos.commit(dir, generation).unwrap();
+    }
 
     #[test]
     fn generation_file_names() {
@@ -229,5 +369,50 @@ mod tests {
         assert_eq!(to_base36(10), "a");
         assert_eq!(to_base36(36), "10");
         assert_eq!(to_base36(36 * 36 + 35), "10z");
+    }
+
+    #[test]
+    fn segments_round_trip_and_latest_generation() {
+        let root = temp_dir("read_commit");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut infos = SegmentInfos::new();
+        infos.user_data.insert("commit".to_string(), "first".to_string());
+        commit_one(&dir, &mut infos, "_0", [1u8; 16], 1);
+        commit_one(&dir, &mut infos, "_1", [2u8; 16], 2);
+
+        // read_latest picks the highest generation and parses both segments
+        let (back, gen_val) = SegmentInfos::read_latest(&dir).unwrap();
+        assert_eq!(gen_val, 2);
+        assert_eq!(back.segments.len(), 2);
+        assert_eq!(back.segments[0].info.name, "_0");
+        assert_eq!(back.segments[0].info.doc_count, 10);
+        assert_eq!(back.segments[0].id, Some([1u8; 16]));
+        assert_eq!(back.segments[1].info.name, "_1");
+        assert_eq!(back.segments[1].del_gen, -1);
+        assert_eq!(back.segments[1].field_infos_gen, -1);
+        assert_eq!(back.segments[1].doc_values_gen, -1);
+        assert_eq!(back.user_data.get("commit").unwrap(), "first");
+
+        // read_commit reads a specific older generation
+        let gen1 = SegmentInfos::read_commit(&dir, 1).unwrap();
+        assert_eq!(gen1.segments.len(), 1);
+        assert_eq!(gen1.segments[0].info.name, "_0");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupted_commit_rejected() {
+        let root = temp_dir("corrupt_commit");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut infos = SegmentInfos::new();
+        commit_one(&dir, &mut infos, "_0", [1u8; 16], 1);
+        // flip a byte in the middle of segments_1
+        let path = root.join("segments_1");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(SegmentInfos::read_commit(&dir, 1).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

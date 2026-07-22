@@ -12,8 +12,8 @@
 
 use std::io;
 
-use crate::codec_util::{self, write_be_int};
-use crate::io::ChecksumIndexOutput;
+use crate::codec_util::{self, check_header, corrupt, write_be_int};
+use crate::io::{ChecksumIndexOutput, DataInput, IndexInput};
 
 // Arc flag bits (FST.java:78-88).
 const BIT_FINAL_ARC: u8 = 1 << 0;
@@ -53,11 +53,7 @@ fn write_vlong_to_vec(out: &mut Vec<u8>, mut v: u64) {
 /// an empty prefix is NO_OUTPUT.
 fn outputs_common(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     let n = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-    if n == 0 {
-        None
-    } else {
-        Some(a[..n].to_vec())
-    }
+    if n == 0 { None } else { Some(a[..n].to_vec()) }
 }
 
 /// ByteSequenceOutputs.subtract (:74-93): strip the `inc` prefix from `output`.
@@ -136,7 +132,10 @@ impl UnCompiledNode {
         next_final_output: Option<Vec<u8>>,
         is_final: bool,
     ) {
-        let arc = self.arcs.last_mut().expect("replaceLast on node without arcs");
+        let arc = self
+            .arcs
+            .last_mut()
+            .expect("replaceLast on node without arcs");
         debug_assert_eq!(arc.label, label);
         arc.target = Target::Compiled(target);
         arc.next_final_output = next_final_output;
@@ -453,10 +452,274 @@ impl Fst {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read side (FST.readMetadata :455-500, readArc :943-991, linear-scan
+// findTargetArc :1100-1126). Our writer only produces unpacked,
+// variable-length-arc nodes (allowFixedLengthArcs == false), so the reader
+// implements exactly that node shape.
+// ---------------------------------------------------------------------------
+
+/// FST metadata (FST.FSTMetadata), parsed from the .tmd stream right after a
+/// field's indexStartFP (FieldReader constructor :91).
+#[derive(Clone)]
+pub struct FstMetadata {
+    pub start_node: u64,
+    pub num_bytes: u64,
+    pub empty_output: Option<Vec<u8>>,
+}
+
+impl FstMetadata {
+    /// FST.readMetadata (:455-500): header("FST", 6..=9) + emptyOutput flag +
+    /// inputType byte (BYTE1 = 0) + VLong startNode + VLong numBytes.
+    pub fn read(input: &mut impl DataInput) -> io::Result<FstMetadata> {
+        check_header(input, FILE_FORMAT_NAME, 6, VERSION_CURRENT)?; // VERSION_START=6 (:114)
+        let empty_output = match input.read_byte()? {
+            1 => {
+                // Serialized output reversed wholesale (FSTMetadata.save
+                // :1234-1244); undo the reversal, then
+                // ByteSequenceOutputs.read (:122-132).
+                let num_bytes = input.read_vint()? as usize;
+                let mut bytes = vec![0u8; num_bytes];
+                input.read_bytes(&mut bytes)?;
+                bytes.reverse();
+                let mut cursor = IndexInput::in_memory(bytes);
+                let len = cursor.read_vint()? as usize;
+                let mut out = vec![0u8; len];
+                cursor.read_bytes(&mut out)?;
+                Some(out)
+            }
+            0 => None,
+            b => return Err(corrupt(format!("invalid FST emptyOutput flag {b}"))),
+        };
+        let input_type = input.read_byte()?;
+        if input_type != 0 {
+            return Err(corrupt(format!(
+                "unsupported FST input type {input_type} (only BYTE1)"
+            )));
+        }
+        let start_node = input.read_vlong()? as u64;
+        let num_bytes = input.read_vlong()? as u64;
+        Ok(FstMetadata {
+            start_node,
+            num_bytes,
+            empty_output,
+        })
+    }
+}
+
+/// One arc of an unpacked node (FST.Arc).
+#[derive(Clone, Debug)]
+pub struct FstArc {
+    pub label: u8,
+    pub output: Option<Vec<u8>>,
+    pub final_output: Option<Vec<u8>>,
+    pub is_final: bool,
+    pub target: i64,
+}
+
+/// Read side of a compiled FST image: reverse arc traversal over the
+/// variable-length node format. A node's address is the offset of its last
+/// byte; arcs are read backwards in ascending label order.
+pub struct FstReader {
+    bytes: Vec<u8>,
+    start_node: u64,
+    empty_output: Option<Vec<u8>>,
+}
+
+impl FstReader {
+    pub fn new(bytes: Vec<u8>, metadata: &FstMetadata) -> FstReader {
+        debug_assert_eq!(bytes.len() as u64, metadata.num_bytes);
+        FstReader {
+            bytes,
+            start_node: metadata.start_node,
+            empty_output: metadata.empty_output.clone(),
+        }
+    }
+
+    /// Output of the empty string (`None` when the empty input is rejected).
+    pub fn empty_output(&self) -> Option<&[u8]> {
+        self.empty_output.as_deref()
+    }
+
+    /// VInts/VLongs are written low-group-first, so reading the reversed
+    /// bytes from the node's end reassembles them with the first byte read
+    /// holding the lowest 7 bits.
+    fn read_vlong_rev(&self, pos: &mut i64) -> io::Result<u64> {
+        let mut v = 0u64;
+        let mut shift = 0;
+        loop {
+            if *pos < 0 {
+                return Err(corrupt("FST node overruns the image"));
+            }
+            let b = self.bytes[*pos as usize];
+            *pos -= 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(corrupt("FST: vLong too long"));
+            }
+        }
+    }
+
+    /// ByteSequenceOutputs.read (:122-132) over reversed bytes.
+    fn read_output_rev(&self, pos: &mut i64) -> io::Result<Vec<u8>> {
+        let len = self.read_vlong_rev(pos)? as usize;
+        let end = *pos as usize;
+        if len > end + 1 {
+            return Err(corrupt("FST output overruns the image"));
+        }
+        let start = end + 1 - len;
+        let mut v = self.bytes[start..=end].to_vec();
+        v.reverse();
+        *pos = start as i64 - 1;
+        Ok(v)
+    }
+
+    /// FST.readArc (:943-991) over a whole node: arcs in ascending label
+    /// order plus the position just below the node, which is what
+    /// BIT_TARGET_NEXT resolves to (:966-990).
+    fn read_node(&self, addr: u64) -> io::Result<(Vec<FstArc>, i64)> {
+        if addr as usize >= self.bytes.len() {
+            return Err(corrupt("FST node address out of bounds"));
+        }
+        let mut pos = addr as i64;
+        let mut arcs = Vec::new();
+        loop {
+            let flags = self.bytes[pos as usize];
+            pos -= 1;
+            if pos < 0 {
+                return Err(corrupt("FST arc overruns the image"));
+            }
+            let label = self.bytes[pos as usize];
+            pos -= 1;
+            let output = if flags & BIT_ARC_HAS_OUTPUT != 0 {
+                Some(self.read_output_rev(&mut pos)?)
+            } else {
+                None
+            };
+            let final_output = if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
+                Some(self.read_output_rev(&mut pos)?)
+            } else {
+                None
+            };
+            let target = if flags & BIT_STOP_NODE != 0 {
+                if flags & BIT_FINAL_ARC != 0 {
+                    FINAL_END_NODE
+                } else {
+                    NON_FINAL_END_NODE
+                }
+            } else if flags & BIT_TARGET_NEXT != 0 {
+                i64::MIN // resolved below, once the whole node is parsed
+            } else {
+                self.read_vlong_rev(&mut pos)? as i64
+            };
+            arcs.push(FstArc {
+                label,
+                output,
+                final_output,
+                is_final: flags & BIT_FINAL_ARC != 0,
+                target,
+            });
+            if flags & BIT_LAST_ARC != 0 {
+                break;
+            }
+        }
+        for arc in &mut arcs {
+            if arc.target == i64::MIN {
+                arc.target = pos;
+            }
+        }
+        Ok((arcs, pos))
+    }
+
+    /// findTargetArc linear scan (:1100-1126): labels ascend, so the first
+    /// arc with `label >= target` decides (match or miss).
+    fn find_arc(arcs: &[FstArc], label: u8) -> Option<&FstArc> {
+        arcs
+            .iter()
+            .find(|a| a.label >= label)
+            .filter(|a| a.label == label)
+    }
+
+    /// FST.Util.get semantics: the full output of `input` (empty vec when
+    /// the FST maps it to NO_OUTPUT), or `None` when `input` is rejected.
+    pub fn lookup(&self, input: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        if input.is_empty() {
+            return Ok(self.empty_output.clone());
+        }
+        let mut out = Vec::new();
+        let mut node = self.start_node as i64;
+        for (i, &b) in input.iter().enumerate() {
+            if node <= 0 {
+                return Ok(None); // walked into an end node: not accepted
+            }
+            let (arcs, _) = self.read_node(node as u64)?;
+            let Some(arc) = Self::find_arc(&arcs, b) else {
+                return Ok(None);
+            };
+            if let Some(o) = &arc.output {
+                out.extend_from_slice(o);
+            }
+            if i == input.len() - 1 {
+                if !arc.is_final {
+                    return Ok(None);
+                }
+                if let Some(fo) = &arc.final_output {
+                    out.extend_from_slice(fo);
+                }
+                return Ok(Some(out));
+            }
+            if arc.target <= 0 {
+                return Ok(None);
+            }
+            node = arc.target;
+        }
+        unreachable!()
+    }
+
+    /// Walks `input` from the root, returning `(bytes consumed, full output)`
+    /// at every final arc on the matched path — the candidate block frames
+    /// of the block-tree seek (SegmentTermsEnum.seekExact :477-545). The
+    /// root frame (empty output at depth 0) is *not* included; callers add
+    /// it from the field's rootCode.
+    pub fn trace_path(&self, input: &[u8]) -> io::Result<Vec<(usize, Vec<u8>)>> {
+        let mut frames = Vec::new();
+        if self.start_node == 0 || input.is_empty() {
+            return Ok(frames);
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut node = self.start_node as i64;
+        for (i, &b) in input.iter().enumerate() {
+            if node <= 0 {
+                break;
+            }
+            let (arcs, _) = self.read_node(node as u64)?;
+            let Some(arc) = Self::find_arc(&arcs, b) else {
+                break;
+            };
+            if let Some(o) = &arc.output {
+                out.extend_from_slice(o);
+            }
+            if arc.is_final {
+                let mut full = out.clone();
+                if let Some(fo) = &arc.final_output {
+                    full.extend_from_slice(fo);
+                }
+                frames.push((i + 1, full));
+            }
+            node = arc.target;
+        }
+        Ok(frames)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::IndexOutput;
+    use crate::io::{ChecksumIndexOutput, IndexInput, IndexOutput};
 
     /// Minimal reverse reader for unpacked (variable-length) nodes, used to
     /// round-trip the compiler output. A node's address is the offset of its
@@ -606,7 +869,10 @@ mod tests {
                 continue;
             }
             let (arcs, prev_pos) = read_node(&fst.bytes, addr);
-            assert!(arcs.last().unwrap().is_last, "last arc must have BIT_LAST_ARC");
+            assert!(
+                arcs.last().unwrap().is_last,
+                "last arc must have BIT_LAST_ARC"
+            );
             assert!(arcs[..arcs.len() - 1].iter().all(|a| !a.is_last));
             for w in arcs.windows(2) {
                 assert!(w[0].label < w[1].label, "arc labels ascending");
@@ -703,11 +969,8 @@ mod tests {
 
     #[test]
     fn empty_string_first() {
-        let entries: &[(&[u8], Option<&[u8]>)] = &[
-            (b"", Some(b"rc")),
-            (b"a", Some(b"1")),
-            (b"ab", Some(b"2")),
-        ];
+        let entries: &[(&[u8], Option<&[u8]>)] =
+            &[(b"", Some(b"rc")), (b"a", Some(b"1")), (b"ab", Some(b"2"))];
         let fst = check_round_trip(entries);
         assert_eq!(fst.empty_output(), Some(&b"rc"[..]));
         assert_eq!(lookup(&fst, b""), Some(b"rc".to_vec()));
@@ -874,5 +1137,118 @@ mod tests {
         let mut compiler = FstCompiler::new();
         compiler.add(b"", None);
         compiler.add(b"", Some(b"x"));
+    }
+
+    fn fst_reader(entries: &[(&[u8], Option<&[u8]>)]) -> (FstReader, Vec<u8>) {
+        let mut compiler = FstCompiler::new();
+        for (input, output) in entries {
+            compiler.add(input, *output);
+        }
+        let fst = compiler.finish();
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        fst.write_metadata(&mut out).unwrap();
+        let meta_bytes = out.into_bytes();
+        let metadata =
+            FstMetadata::read(&mut IndexInput::in_memory(meta_bytes)).unwrap();
+        assert_eq!(metadata.start_node, fst.start_node());
+        assert_eq!(metadata.num_bytes, fst.num_bytes());
+        (
+            FstReader::new(fst.bytes().to_vec(), &metadata),
+            fst.bytes().to_vec(),
+        )
+    }
+
+    #[test]
+    fn reader_lookup_round_trip() {
+        let entries: &[(&[u8], Option<&[u8]>)] = &[
+            (b"a", Some(b"\x01")),
+            (b"ab", Some(b"\x02\x03")),
+            (b"abc", Some(b"\x02")),
+            (b"b", Some(b"\x05")),
+            (b"ca", None),
+            (b"cabd", Some(b"\x09\x09\x09")),
+        ];
+        let (reader, _) = fst_reader(entries);
+        for (input, output) in entries {
+            assert_eq!(
+                reader.lookup(input).unwrap().as_deref(),
+                Some(output.unwrap_or(&[])),
+                "lookup {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(reader.lookup(b"").unwrap(), None);
+        assert_eq!(reader.lookup(b"ac").unwrap(), None);
+        assert_eq!(reader.lookup(b"abb").unwrap(), None);
+        assert_eq!(reader.lookup(b"d").unwrap(), None);
+    }
+
+    #[test]
+    fn reader_metadata_empty_output() {
+        let (reader, bytes) = fst_reader(&[(b"", Some(b"xy"))]);
+        assert_eq!(bytes, vec![0u8]);
+        assert_eq!(reader.empty_output(), Some(&b"xy"[..]));
+        assert_eq!(reader.lookup(b"").unwrap(), Some(b"xy".to_vec()));
+        assert_eq!(reader.lookup(b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn reader_trace_path() {
+        // block-tree usage: output = block pointer encoding; final arcs on
+        // the path give candidate frames
+        let entries: &[(&[u8], Option<&[u8]>)] = &[
+            (b"", Some(b"R")),
+            (b"ab", Some(b"X")),
+            (b"abc", Some(b"Y")),
+            (b"b", Some(b"Z")),
+        ];
+        let (reader, _) = fst_reader(entries);
+        // "abc" full path: depth 2 ("ab") and depth 3 ("abc") both final
+        assert_eq!(
+            reader.trace_path(b"abc").unwrap(),
+            vec![(2usize, b"X".to_vec()), (3usize, b"Y".to_vec())]
+        );
+        // "abd" walks to depth 2 then no arc: only ("ab", X)
+        assert_eq!(reader.trace_path(b"abd").unwrap(), vec![(2usize, b"X".to_vec())]);
+        // "c" no arc at root byte: empty
+        assert_eq!(reader.trace_path(b"c").unwrap(), Vec::<(usize, Vec<u8>)>::new());
+    }
+
+    #[test]
+    fn reader_generated_round_trip() {
+        // deterministic xorshift64* PRNG, same generator as the write-side test
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for _ in 0..2000 {
+            let len = 1 + (rand() % 12) as usize;
+            let input: Vec<u8> = (0..len).map(|_| b'a' + (rand() % 6) as u8).collect();
+            let olen = (rand() % 9) as usize;
+            let output = if olen == 0 {
+                None
+            } else {
+                Some((0..olen).map(|_| (rand() % 256) as u8).collect::<Vec<u8>>())
+            };
+            entries.push((input, output));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        let refs: Vec<(&[u8], Option<&[u8]>)> = entries
+            .iter()
+            .map(|(i, o)| (i.as_slice(), o.as_deref()))
+            .collect();
+        let (reader, _) = fst_reader(&refs);
+        for (input, output) in &entries {
+            assert_eq!(
+                reader.lookup(input).unwrap().as_deref(),
+                Some(output.clone().unwrap_or_default().as_slice())
+            );
+        }
+        assert_eq!(reader.lookup(b"z").unwrap(), None);
     }
 }

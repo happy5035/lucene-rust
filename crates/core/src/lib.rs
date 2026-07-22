@@ -12,6 +12,7 @@ pub mod document;
 pub mod index_writer;
 pub mod json;
 pub mod schema;
+pub mod search;
 pub mod segment_builder;
 pub mod tokenizer;
 

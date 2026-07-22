@@ -16,14 +16,19 @@
 | Boolean must/should | 上述组合 | lead-iterator 对齐 / 堆合并 |
 | Terms（IN 语义） | term 的批量入口 | Boolean SHOULD 语法糖 |
 | Prefix | terms dict（FST） | FST seek + 顺序扫 |
-| Wildcard（仅 `*`，不含 `?`） | terms dict | 第一版：字典扫描 + glob 匹配；自动机求交留作优化 |
+| Wildcard（`*` 与 `?`） | terms dict | 按 pattern 形状分类：前缀形走 FST 前缀扫 + 尾过滤，其余走字典扫描 + 模式匹配；自动机求交留作优化 |
 | PointRange（1D） | LongPoint / IntPoint BKD | 边界包含语义对齐 Java |
+| MatchAll | 段元数据 | [0..maxDoc) 扫描，构造验证基线用 |
 | Sort by NumericDV / SortedDV | DocValues | MISSING 规则照抄 FieldComparator |
 | stored 取回 | stored fields（LZ4） | 命中后批量取回 |
 
 **明确不做（YAGNI）**：评分 / norms / impact / Block-Max；模糊查询（Levenshtein 自动机）；
 聚合 / facet；delete / merge；NRT 原地 refresh（open 即快照，重开即刷新）；查询并发
 （第一版单线程逐段，段间并行仅留接口）；mmap（先 buffered FileChannel 读，留优化点）。
+
+**前提假设**：读侧只保证读**本系统写出的**索引（无 delete、无 .liv、无 norms、无 vector 等）。
+读 Java 写的索引不在本期范围——若将来需要，至少补 LiveDocs（.liv FixedBitSet）与
+skip 数据之外的删除语义，届时单独立项。
 
 ## 2. 选型理由（A/B/C 比较结论）
 
@@ -33,7 +38,7 @@
   BKD 边界、MISSING 排序等细节里，验收标准要求与 Java 逐条 diff 一致，偏差即失败。否决。
 - **C（采纳）**：执行语义逐行对照 9.12.3 源码（保持 docs 中 file:line 引用的项目惯例），
   对象结构用 `enum Query` + `trait DocIter` 表达；JNI 层做 Lucene 形状的可替换门面。
-  估计总量 6–7k 行（含测试 ~1.5k）。
+  估计总量 7–8k 行（含测试 ~1.5k）。
 
 ## 3. 架构
 
@@ -65,7 +70,7 @@
   一切格式读的地基。
 - **SegmentReader**：打开一个段的全部文件（.fnm/.tim/.tip/.doc/.pos/.kdd/.kdi/.dvd/.dvm/.fdx/.fdt），
   持有各 format reader。查询按段执行（对齐 Lucene leaf-level 执行）。
-- **Query 与执行**：`enum Query { Term, Phrase, Boolean, Terms, Prefix, Wildcard, PointRange }`；
+- **Query 与执行**：`enum Query { Term, Phrase, Boolean, Terms, Prefix, Wildcard, PointRange, MatchAll }`；
   `trait DocIter { doc_id, next_doc, advance }`（DISI 语义照抄，继承体系不要）。
   conjunction 用 lead-iterator 两两对齐；phrase 用 position 合取（对齐 slop=0 路径）。
 - **Collector**：topN by docID / NumericDV / SortedDV 三种堆；MISSING 值规则照抄 9.12.3
@@ -79,6 +84,57 @@
 ### 惰性加载
 
 open 时只读 segments_N + .si + .fnm；FST / BKD / DV 索引在首次触及该字段时加载。
+
+### 模块分解（镜像写侧的格式边界）
+
+原则：codec 只懂字节，一种文件格式一个解码器；聚合层（SegmentReader / IndexSearcher）放 core，
+因为它是搜索概念而非格式概念。terms dict 与 postings 枚举分两层——prefix / wildcard / terms
+只碰 terms dict 不碰 postings，分层后这些查询的实现更干净。
+
+**codec-lucene9（在既有写侧文件上追加 / 新增 `*_read.rs`）：**
+
+| 模块 | 位置 | 职责 |
+|---|---|---|
+| IndexInput | `io.rs` 追加 | 随机访问读：`read_vlong/vint/zint`、`slice`、`file_pointer`；buffered FileChannel 实现 |
+| `open_input` | `directory.rs` 追加 | FSDirectory 打开输入流 |
+| FST 读 | `fst.rs` 追加 | `lookup(term)` / `prefix_scan(prefix)` / `scan_all()`，供 terms dict 定位与通配枚举 |
+| 解码原语 | `postings_ll.rs` / `packed.rs` 追加 | `for_util_decode` / `pfor_util_decode`（写侧 encode 的镜像）；`DirectReader` / `DirectMonotonicReader` |
+| terms dict 读 | `terms_read.rs` 新增 | .tip（FST）+ .tim（TermState 元数据）：term → postings 入口 fp/df 元数据；枚举接口 |
+| postings 枚举 | `postings_read.rs` 新增 | .doc / .pos：Docs / DocsAndFreqs / DocsFreqsPositions 三种枚举，含 df=1 singleton 捷径、skip list、PFOR 块解码 |
+| DV 读 | `doc_values_read.rs` 新增 | .dvm/.dvd：Numeric（gcd/min 重建 + IndexedDISI 三分支）与 Sorted（ords + LZ4 terms dict + reverse index） |
+| BKD 读 | `points_read.rs` 新增 | .kdi/.kdd：1D 树遍历 + `intersect(lower, upper)`，DocIdsWriter 五分支解码 |
+| stored 读 | `stored_fields_read.rs` 新增 | .fdt/.fdx/.fdm：LZ4 块解压 + 六种值类型文档重建 |
+| 提交点读 | `segment_infos.rs` / `segment_info.rs` / `field_infos.rs` 追加 | segments_N / .si / .fnm 解析 |
+
+**rustlucene-core `search/` 模块：**
+
+| 模块 | 职责 |
+|---|---|
+| `segment_reader.rs` | 段聚合：持有一个段的各 format reader + FieldInfos + max_doc，对查询层暴露字段视图 |
+| `reader.rs` | 多段聚合：解析 segments_N，持有 SegmentReader 列表 |
+| `query.rs` | Query enum + JSON 解析 + wildcard 分类（前缀形 → FST 前缀扫 + 尾过滤；其余 → 字典扫描 + 模式匹配） |
+| `doc_iter.rs` | `trait DocIter { doc_id, next_doc, advance, next_block }` 及各实现：term/postings、conjunction（lead-iterator 对齐）、disjunction（堆合并去重）、phrase（合取 + position 校验）、MatchAll、BKD 结果 |
+| `collector.rs` | DocBlock + 三类块级 collector（§4b）+ 段间 merge |
+| `searcher.rs` | IndexSearcher：query × 段 → collector → TopDocs |
+
+### 实施顺序（薄切片先行，验证设施尽早转起来）
+
+与"先读完全部格式再做搜索"的顺序不同——先打通 term 查询端到端，让 Java diff 验证设施
+尽早生效，之后每个阶段都新增一类可 diff 的查询能力：
+
+1. **地基**：IndexInput + open_input + 解码原语（for/pfor decode、DirectReader、DirectMonotonicReader）
+   + segments_N/.si/.fnm 读 —— round-trip 单测
+2. **Term 查询端到端**：terms dict 读 + postings 枚举 + SegmentReader/reader + DocIter +
+   docID collector + MatchAll —— 第一版 Java diff 电池（term count / 精确命中 / MatchAll）
+3. **Boolean + Terms**：conjunction / disjunction —— diff 电池扩展
+4. **DV 读 + 排序**：Numeric/Sorted 读 + 两种 DV collector —— diff 电池扩展（sort、MISSING）
+5. **BKD 读 + PointRange** —— diff 电池扩展（范围 count / docID 序列）
+6. **Phrase**（positions 枚举 + position 校验）—— diff 电池扩展
+7. **Prefix / Wildcard**（FST 枚举 + 分类 rewrite）—— diff 电池扩展
+8. **stored 取回 + JNI 门面** —— TopDocs 带字段返回；Java 类 + 句柄表
+9. **SIMD 快路径**（§4a/§4b，bench 驱动逐项启用）—— 对拍单测 + bench 报告
+
+每个阶段交付 = 代码 + 对应测试绿 + diff 电池增量全绿。
 
 ## 4a. 解码性能与 SIMD 策略
 
@@ -164,6 +220,17 @@ Java: search(handle, queryJson, topN, sortSpec)
    查询电池（新增 prefix / wildcard / terms 项）-> Rust 与 Java 结果逐条 diff，
    纳入 `make log-test`。
 
+**边界语料矩阵**（贯穿三层，每层都要覆盖）：
+
+| 语料 | 触发路径 |
+|---|---|
+| 空索引（0 文档） | 所有 reader 返回空，查询返回空 TopDocs |
+| 单文档 / 单 term（df=1） | postings singleton 捷径 |
+| 高 df term（>128 多块 + tail） | PFOR 块边界、tail 路径 |
+| 稀疏 DV（`--sparse` 语料） | IndexedDISI SPARSE/DENSE 分支、MISSING 排序 |
+| 大字典（`--bigdict` 语料） | SortedDV terms dict 多块、FST 深层遍历 |
+| 多段索引 | 段间结果合并、全局 docID 映射 |
+
 ## 7. 工作量粗估
 
 | 部分 | 估计 |
@@ -183,3 +250,4 @@ Java: search(handle, queryJson, topN, sortSpec)
 - mmap IndexInput
 - NRT 原地 refresh（段文件 refcount + writer 删除协议，~800 行）
 - 段间并行搜索
+- 读 Java 写的索引（LiveDocs/.liv、norms 容忍等，前提见 §1）

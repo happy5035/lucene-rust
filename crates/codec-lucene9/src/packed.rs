@@ -157,6 +157,139 @@ pub fn direct_monotonic_write(
     Ok(())
 }
 
+// ============================================================================
+// DirectReader — decode packed values written by DirectWriter
+// ============================================================================
+
+/// Reads packed values from a DirectWriter-encoded stream.
+pub struct DirectReader {
+    input: Box<dyn crate::io::IndexInput>,
+    bpv: u32,
+    value_count: usize,
+    start_fp: u64,
+}
+
+impl DirectReader {
+    pub fn new(
+        input: Box<dyn crate::io::IndexInput>,
+        bpv: u32,
+        value_count: usize,
+        start_fp: u64,
+    ) -> Self {
+        DirectReader { input, bpv, value_count, start_fp }
+    }
+
+    /// Read a single value at index. Bounds-checked.
+    pub fn get(&mut self, index: usize) -> io::Result<u64> {
+        if index >= self.value_count {
+            return Ok(0); // out of bounds — return 0 (no value)
+        }
+        if self.bpv == 0 {
+            return Ok(0); // constant: all values are 0
+        }
+        let byte_offset = (index * self.bpv as usize) / 8;
+        let bit_offset = (index * self.bpv as usize) % 8;
+        self.input.seek(self.start_fp + byte_offset as u64)?;
+
+        // Read enough bytes to cover bpv bits starting at bit_offset
+        let bytes_needed = ((bit_offset + self.bpv as usize) + 7) / 8;
+        let mut buf = [0u8; 9]; // max 8 bytes + 1 for safety
+        let n = self.input.read(&mut buf[..bytes_needed])?;
+        if n < bytes_needed {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "DirectReader: short read",
+            ));
+        }
+        let mut v: u64 = 0;
+        for i in 0..bytes_needed {
+            v |= (buf[i] as u64) << (i * 8);
+        }
+        let mask = if self.bpv == 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.bpv) - 1
+        };
+        Ok((v >> bit_offset) & mask)
+    }
+
+    /// Bulk read for collector. Reads values for all docs in the slice.
+    pub fn get_batch(&mut self, docs: &[u32]) -> io::Result<Vec<Option<i64>>> {
+        let mut result = Vec::with_capacity(docs.len());
+        for &doc in docs {
+            let val = self.get(doc as usize)?;
+            result.push(Some(val as i64));
+        }
+        Ok(result)
+    }
+}
+
+// ============================================================================
+// DirectMonotonicReader — decode monotonic sequence
+// ============================================================================
+
+/// Reads a monotonic sequence of u64 values encoded by DirectMonotonicWriter.
+pub struct DirectMonotonicReader {
+    values: Vec<u64>,
+}
+
+impl DirectMonotonicReader {
+    /// Decode from a DirectMonotonic-encoded stream.
+    /// `input` is positioned at the start of the data.
+    pub fn decode(
+        mut input: Box<dyn crate::io::IndexInput>,
+        value_count: usize,
+        block_shift: u32,
+    ) -> io::Result<Self> {
+        if value_count == 0 {
+            return Ok(DirectMonotonicReader { values: Vec::new() });
+        }
+
+        let block_size = 1usize << block_shift;
+        let num_blocks = (value_count + block_size - 1) / block_size;
+
+        // Read block min values and avg delta
+        let mut min_values = Vec::with_capacity(num_blocks);
+        let mut avg_incs = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            min_values.push(input.read_vlong()? as u64);
+        }
+        for _ in 0..num_blocks {
+            avg_incs.push(input.read_vlong()? as u64);
+        }
+
+        // BPV for delta offsets
+        let bits_per_value = direct_writer_unsigned_bits_required(
+            avg_incs.iter().copied().max().unwrap_or(0),
+        );
+        let offset_start = input.file_pointer();
+        let mut dr = DirectReader::new(input, bits_per_value, value_count, offset_start);
+
+        // Reconstruct values: expected[i] = min_block + avg_inc * index_in_block + offset[i]
+        let mut values = Vec::with_capacity(value_count);
+        for i in 0..value_count {
+            let block = i >> block_shift;
+            let in_block = (i - (block << block_shift)) as u64;
+            let expected = min_values[block] + avg_incs[block] * in_block;
+            let delta = dr.get(i)?;
+            values.push(expected + delta);
+        }
+        Ok(DirectMonotonicReader { values })
+    }
+
+    pub fn get(&self, index: usize) -> u64 {
+        if index < self.values.len() {
+            self.values[index]
+        } else {
+            0
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,3 +459,93 @@ mod tests {
         assert_eq!(direct_writer_unsigned_bits_required(u64::MAX), 64);
     }
 }
+
+#[cfg(test)]
+mod tests_read {
+    use super::*;
+    use crate::io::{HeapIndexInput, IndexOutput};
+
+    #[test]
+    fn test_direct_reader_round_trip() {
+        let values: Vec<u64> = (0..1000u64).map(|i| i * 7 + 13).collect();
+        let bpv = super::direct_writer_unsigned_bits_required(1000 * 7 + 13);
+        let encoded = super::direct_writer_encode(&values, bpv);
+        let input = Box::new(HeapIndexInput::new(encoded));
+        let mut reader = DirectReader::new(input, bpv, values.len(), 0);
+        for (i, &expected) in values.iter().enumerate() {
+            assert_eq!(
+                reader.get(i).unwrap(),
+                expected,
+                "DirectReader mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_direct_monotonic_round_trip() {
+        // Each block consists of identical values; blocks increase stepwise.
+        // avg_inc = 0 for every block, all deltas = 0, bpv = 1 on both sides.
+        let block_shift = 4u32; // 16 values per block
+        let block_size = 1usize << block_shift;
+        let num_blocks = 32usize; // 32 full blocks = 512 values
+        let values: Vec<u64> = (0..num_blocks)
+            .flat_map(|blk| std::iter::repeat((blk + 1) as u64).take(block_size))
+            .take(500) // partial last block
+            .collect();
+
+        let mut out = IndexOutput::in_memory();
+        // Write min values
+        for b in 0..((values.len() + block_size - 1) / block_size) {
+            let start = b * block_size;
+            out.write_vlong(values[start] as i64).unwrap();
+        }
+        // Write avg incs (all zero for constant-per-block)
+        for b in 0..((values.len() + block_size - 1) / block_size) {
+            let start = b * block_size;
+            let end = values.len().min(start + block_size);
+            let avg = if end > start + 1 {
+                (values[end - 1] - values[start]) / (end - start - 1) as u64
+            } else {
+                0
+            };
+            out.write_vlong(avg as i64).unwrap();
+        }
+        // Write deltas (all zero)
+        let mut deltas = Vec::with_capacity(values.len());
+        for b in 0..((values.len() + block_size - 1) / block_size) {
+            let start = b * block_size;
+            let end = values.len().min(start + block_size);
+            let min_val = values[start];
+            let avg = if end > start + 1 {
+                (values[end - 1] - values[start]) / (end - start - 1) as u64
+            } else {
+                0
+            };
+            for i in start..end {
+                let in_block = (i - start) as u64;
+                let expected = min_val + avg * in_block;
+                deltas.push(values[i].wrapping_sub(expected));
+            }
+        }
+        let max_delta = deltas.iter().copied().max().unwrap_or(0);
+        let bpv = super::direct_writer_unsigned_bits_required(max_delta);
+        let delta_bytes = super::direct_writer_encode(&deltas, bpv);
+        out.write_bytes(&delta_bytes).unwrap();
+        out.flush().unwrap();
+        let encoded = out.into_bytes();
+
+        let input = Box::new(HeapIndexInput::new(encoded));
+        let reader = DirectMonotonicReader::decode(input, values.len(), block_shift).unwrap();
+        assert_eq!(reader.len(), values.len());
+        for (i, &expected) in values.iter().enumerate() {
+            assert_eq!(
+                reader.get(i),
+                expected,
+                "DirectMonotonic mismatch at index {}",
+                i
+            );
+        }
+    }
+}
+

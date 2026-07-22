@@ -10,6 +10,7 @@
 pub mod codec_util;
 pub mod directory;
 pub mod doc_values;
+pub mod doc_values_reader;
 pub mod field_infos;
 pub mod fst;
 pub mod io;

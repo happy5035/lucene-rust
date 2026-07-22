@@ -1,7 +1,7 @@
 CARGO ?= cargo
 JAVAC_CP = interop/java/lib/lucene-core-9.12.3.jar:interop/java/lib/lucene-analysis-common-9.12.3.jar
 
-.PHONY: build java-classes interop-test log-test log-bench bench compare
+.PHONY: build java-classes interop-test log-test log-bench bench compare compare-search
 
 build:
 	$(CARGO) build --release
@@ -57,3 +57,27 @@ NDOCS ?=
 POSITIONS ?=
 compare:
 	interop/compare-index.sh $(INPUT) "$(NDOCS)" $(POSITIONS)
+
+# Build a self-contained deployable package (no Rust toolchain needed on target).
+# Default output: ./compare-package/
+#   make package-compare
+#   make package-compare OUT=/opt/compare-tool
+OUT ?= ./compare-package
+package-compare:
+	interop/package-compare.sh --output $(OUT)
+
+# Install the package to a prefix (shorthand for package-compare with a given OUT).
+PREFIX ?= /opt/compare-tool
+compare-install:
+	interop/package-compare.sh --output $(PREFIX)
+
+# Compare search performance on Rust-built vs Java-built indexes.
+# Runs after `make compare` — uses the indexes already built under
+# /tmp/compare-rust and /tmp/compare-java.
+# Override with: make compare-search TASKS=100 WARMUP=20 ITER=50
+TASKS ?= 50
+WARMUP ?= 10
+ITER ?= 30
+compare-search: build java-classes
+	interop/compare-search.sh /tmp/compare-rust /tmp/compare-java message \
+		--tasks $(TASKS) --warmup $(WARMUP) --iter $(ITER)

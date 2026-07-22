@@ -2,7 +2,9 @@ import java.io.BufferedReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
+import org.apache.lucene.analysis.core.WhitespaceTokenizer;
 import org.apache.lucene.document.*;
 import org.apache.lucene.index.*;
 import org.apache.lucene.store.FSDirectory;
@@ -74,7 +76,16 @@ public class JavaIndex {
             System.exit(2);
         }
 
-        IndexWriterConfig iwc = new IndexWriterConfig(new WhitespaceAnalyzer());
+        // Use unlimited maxTokenLength so tokenization matches the Rust side
+        // (split_ascii_whitespace has no artificial token-length cap).
+        Analyzer analyzer = new Analyzer() {
+            @Override
+            protected Analyzer.TokenStreamComponents createComponents(String fieldName) {
+                WhitespaceTokenizer tok = new WhitespaceTokenizer(1_048_575); // max allowed by Lucene
+                return new Analyzer.TokenStreamComponents(tok);
+            }
+        };
+        IndexWriterConfig iwc = new IndexWriterConfig(analyzer);
         iwc.setRAMBufferSizeMB(1024.0);
         iwc.setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH);
         iwc.setUseCompoundFile(false);

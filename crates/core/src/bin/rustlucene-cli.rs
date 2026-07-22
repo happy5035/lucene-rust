@@ -456,7 +456,10 @@ fn index_files(
                     }
                 };
                 lineno += 1;
-                let text = line.trim();
+                // Java String.trim() strips all chars ≤ U+0020;
+                // Rust str::trim() strips Unicode white_space.
+                // Align with Java semantics for index compatibility.
+                let text = line.trim_matches(|c: char| c <= '\x20');
                 if text.is_empty() {
                     continue;
                 }

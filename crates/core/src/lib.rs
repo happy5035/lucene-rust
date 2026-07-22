@@ -1,9 +1,10 @@
-//! RustLucene core: Lucene 9.12.3-compatible index write path.
+//! RustLucene core: Lucene 9.12.3-compatible index write and read paths.
 //!
 //! Append-only writer: buffers documents in RAM, flushes them into segment
 //! files via `codec-lucene9`, and publishes commit points (`segments_N`)
-//! with Lucene's two-phase commit protocol. Read/search/merge are out of
-//! scope (delegated to Java Lucene).
+//! with Lucene's two-phase commit protocol. The `search` module reads back
+//! those indexes (Term/MatchAll queries, ConstantScore semantics; see
+//! docs/superpowers/specs/2026-07-22-rust-search-design.md).
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +13,7 @@ pub mod document;
 pub mod index_writer;
 pub mod json;
 pub mod schema;
+pub mod search;
 pub mod segment_builder;
 pub mod tokenizer;
 

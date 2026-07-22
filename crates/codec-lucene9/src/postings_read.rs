@@ -125,6 +125,7 @@ impl EnumCore {
         };
         if entry.doc_freq < LEVEL1_NUM_DOCS {
             c.level1_last_doc = NO_MORE_DOCS as i64;
+            c.level1_doc_end_fp = c.doc_in.length(); // guard: stray seek lands at EOF
             if entry.doc_freq > 1 {
                 c.doc_in.seek(entry.state.doc_start_fp)?;
             }
@@ -137,6 +138,9 @@ impl EnumCore {
 
     /// nextDoc (:589-596).
     fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS as i64 {
+            return Ok(NO_MORE_DOCS);
+        }
         if self.doc == self.level0_last_doc {
             self.move_to_next_level0_block()?;
         }

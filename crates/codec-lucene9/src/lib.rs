@@ -16,12 +16,14 @@ pub mod fst;
 pub mod io;
 pub mod packed;
 pub mod points;
+pub mod points_reader;
 pub mod postings;
 pub mod postings_ll;
 pub mod postings_reader;
 pub mod segment_info;
 pub mod segment_infos;
 pub mod stored_fields;
+pub mod stored_fields_reader;
 
 pub use directory::FSDirectory;
 pub use field_infos::{DocValuesType, FieldInfo, FieldInfos, IndexOptions};

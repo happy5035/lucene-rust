@@ -159,7 +159,7 @@ fn write_zint_raw(out: &mut Vec<u8>, v: i32) {
 }
 
 /// StoredFieldsInts.writeInts (:31-58) over non-negative ints.
-fn stored_fields_write_ints(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
+pub(crate) fn stored_fields_write_ints(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()> {
     debug_assert!(values.iter().all(|&v| v >= 0));
     let all_equal = values.iter().all(|&v| v == values[0]);
     if all_equal {

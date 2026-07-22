@@ -469,9 +469,11 @@ test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
       }
 
       /// zigzag + VInt (DataInput.readZInt :173-175, BitUtil.zigZagDecode :299).
+      /// 修正注记（2026-07-22 审查）：Java 用无符号移位 `i >>> 1`；先把 VInt
+      /// 位模式按 u32 解码再移，否则 |n| >= 2^30（编码第 31 位置位）解错。
       fn read_zint(&mut self) -> io::Result<i32> {
           let v = self.read_vint()?;
-          Ok((v >> 1) ^ -(v & 1))
+          Ok(((v as u32 >> 1) as i32) ^ -(v & 1))
       }
 
       /// VInt **byte** length + UTF-8 (DataInput.readString :303-308).

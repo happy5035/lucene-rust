@@ -1,9 +1,11 @@
-//! IndexOutput abstraction mirroring Lucene's `store/DataOutput.java` and
-//! `store/ChecksumIndexOutput` (9.12.3).
+//! IndexOutput/IndexInput abstractions mirroring Lucene's `store/DataOutput.java`,
+//! `store/DataInput.java` and the buffered/checksummed wrappers
+//! (`ChecksumIndexOutput`, `BufferedIndexInput`, `ChecksumIndexInput`) (9.12.3).
 //!
-//! All multi-byte primitives written through `IndexOutput` are **little-endian**
-//! (DataOutput.writeInt/writeLong are LE in Lucene); big-endian helpers live in
-//! `codec_util` (CodecUtil.writeBEInt/writeBELong).
+//! All multi-byte primitives through `IndexOutput`/`IndexInput` are
+//! **little-endian** (DataOutput.writeInt/writeLong, DataInput.readInt/readLong
+//! are LE in Lucene); big-endian helpers live in `codec_util`
+//! (CodecUtil.writeBEInt/writeBELong, CodecUtil.readBEInt/readBELong).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -436,6 +438,23 @@ mod tests {
         assert_eq!(i.file_pointer(), i.length());
     }
 
+    /// zigZagDecode must use an **unsigned** shift like Java (`i >>> 1`,
+    /// BitUtil.java:299): an arithmetic shift breaks values whose zigzag
+    /// encoding sets bit 31 (|n| >= 2^30).
+    #[test]
+    fn read_zint_large_magnitudes_round_trip() {
+        let values = [i32::MIN, 1 << 30, -(1 << 30), 0, -1, i32::MAX];
+        let bytes = bytes(|o| {
+            for &n in &values {
+                o.write_zint(n).unwrap();
+            }
+        });
+        let mut i = IndexInput::in_memory(bytes);
+        for &n in &values {
+            assert_eq!(i.read_zint().unwrap(), n);
+        }
+    }
+
     #[test]
     fn read_beyond_end_is_eof() {
         let mut i = IndexInput::in_memory(vec![1]);
@@ -646,7 +665,13 @@ impl IndexInput {
     /// IndexInput.slice (:121-122): an independent reader over
     /// `[offset, offset + length)` of this input.
     pub fn slice(&self, offset: u64, length: u64) -> io::Result<IndexInput> {
-        if offset + length > self.length {
+        let end = offset.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("slice [{offset}, +{length}) overflows u64"),
+            )
+        })?;
+        if end > self.length {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("slice [{offset}, +{length}) past EOF {}", self.length),
@@ -658,7 +683,7 @@ impl IndexInput {
                 base: base + offset,
             },
             InputSource::Memory(bytes) => {
-                InputSource::Memory(bytes[offset as usize..(offset + length) as usize].to_vec())
+                InputSource::Memory(bytes[offset as usize..end as usize].to_vec())
             }
         };
         Ok(IndexInput {
@@ -770,9 +795,11 @@ pub trait DataInput {
     }
 
     /// zigzag + VInt (DataInput.readZInt :173-175, BitUtil.zigZagDecode :299).
+    /// Java shifts **unsigned** (`i >>> 1`); decoding the VInt bit pattern as
+    /// u32 first keeps |n| >= 2^30 (bit 31 set) correct.
     fn read_zint(&mut self) -> io::Result<i32> {
         let v = self.read_vint()?;
-        Ok((v >> 1) ^ -(v & 1))
+        Ok(((v as u32 >> 1) as i32) ^ -(v & 1))
     }
 
     /// VInt **byte** length + UTF-8 (DataInput.readString :303-308).
@@ -849,7 +876,13 @@ impl DataInput for IndexInput {
 
     /// IndexInput.skipBytes (:83-90) = seek(getFilePointer() + numBytes).
     fn skip_bytes(&mut self, n: u64) -> io::Result<()> {
-        self.seek(self.position + n)
+        let target = self.position.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("skip {n} bytes from position {} overflows u64", self.position),
+            )
+        })?;
+        self.seek(target)
     }
 }
 

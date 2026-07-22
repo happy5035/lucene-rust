@@ -1,14 +1,14 @@
 //! Minimal filesystem-backed Directory (subset of `store/FSDirectory.java`).
 //!
-//! Only what the writer needs: create outputs, fsync files, rename
-//! (for the two-phase segments_N commit), fsync the directory itself,
+//! Only what the index layer needs: create outputs, open inputs, fsync files,
+//! rename (for the two-phase segments_N commit), fsync the directory itself,
 //! list / exists / delete.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::io::{ChecksumIndexOutput, IndexOutput};
+use crate::io::{ChecksumIndexInput, ChecksumIndexOutput, IndexInput, IndexOutput};
 
 #[derive(Clone)]
 pub struct FSDirectory {
@@ -39,6 +39,19 @@ impl FSDirectory {
             .create_new(true)
             .open(self.resolve(name))?;
         Ok(ChecksumIndexOutput::new(IndexOutput::from_file(file)))
+    }
+
+    /// Directory.openInput: opens an existing file for reading.
+    pub fn open_input(&self, name: &str) -> io::Result<IndexInput> {
+        let file = File::open(self.resolve(name))?;
+        let length = file.metadata()?.len();
+        Ok(IndexInput::from_file(file, length))
+    }
+
+    /// Directory.openChecksumInput (commit/codec metadata files are read
+    /// this way, with CodecUtil.checkFooter at the end).
+    pub fn open_checksum_input(&self, name: &str) -> io::Result<ChecksumIndexInput> {
+        Ok(ChecksumIndexInput::new(self.open_input(name)?))
     }
 
     /// Directory.sync: fsyncs the given files (FSyncDirectory.wrap / FSDirectory.sync).
@@ -87,6 +100,7 @@ impl FSDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::DataInput;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -116,6 +130,28 @@ mod tests {
         dir.sync_metadata().unwrap();
         dir.delete("b").unwrap();
         assert_eq!(dir.list_all().unwrap().len(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn open_input_reads_what_output_wrote() {
+        let root = temp_dir("open_input");
+        let dir = FSDirectory::open(&root).unwrap();
+        {
+            let mut out = dir.create_output("f").unwrap();
+            out.write_int(0x01020304).unwrap();
+            out.write_vint(300).unwrap();
+            out.flush().unwrap();
+        }
+        let mut input = dir.open_input("f").unwrap();
+        assert_eq!(input.length(), 6);
+        assert_eq!(input.read_int().unwrap(), 0x01020304);
+        assert_eq!(input.read_vint().unwrap(), 300);
+        // 文件读走 slice + 独立定位
+        let mut s0 = input.slice(0, 4).unwrap();
+        let mut s4 = input.slice(4, 1).unwrap();
+        assert_eq!(s4.read_byte().unwrap(), 0xAC);
+        assert_eq!(s0.read_int().unwrap(), 0x01020304);
         fs::remove_dir_all(&root).unwrap();
     }
 }

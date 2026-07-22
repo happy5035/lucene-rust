@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::os::unix::fs::FileExt;
 
 /// Large output buffer; avoids per-byte syscalls (cf. BufferedIndexOutput).
 const BUFFER_CAPACITY: usize = 1 << 16;
@@ -397,6 +398,100 @@ mod tests {
         assert_eq!(out.get_checksum(), 0xCBF43926);
         assert_eq!(out.file_pointer(), 9);
     }
+
+    // ---- read side (DataInput / IndexInput / ChecksumIndexInput) ----
+
+    #[test]
+    fn read_primitives_round_trip() {
+        let bytes = bytes(|o| {
+            o.write_byte(0xAB).unwrap();
+            o.write_short(-2).unwrap();
+            o.write_int(0x01020304).unwrap();
+            o.write_long(-1).unwrap();
+            o.write_vint(300).unwrap();
+            o.write_vlong(1 << 35).unwrap();
+            o.write_zint(-64).unwrap();
+            o.write_string("héllo").unwrap();
+            let mut m = BTreeMap::new();
+            m.insert("k".to_string(), "v".to_string());
+            o.write_map_of_strings(&m).unwrap();
+            let mut s = BTreeSet::new();
+            s.insert("a".to_string());
+            s.insert("b".to_string());
+            o.write_set_of_strings(&s).unwrap();
+        });
+        let mut i = IndexInput::in_memory(bytes);
+        assert_eq!(i.read_byte().unwrap(), 0xAB);
+        assert_eq!(i.read_short().unwrap(), -2);
+        assert_eq!(i.read_int().unwrap(), 0x01020304);
+        assert_eq!(i.read_long().unwrap(), -1);
+        assert_eq!(i.read_vint().unwrap(), 300);
+        assert_eq!(i.read_vlong().unwrap(), 1 << 35);
+        assert_eq!(i.read_zint().unwrap(), -64);
+        assert_eq!(i.read_string().unwrap(), "héllo");
+        let m = i.read_map_of_strings().unwrap();
+        assert_eq!(m.get("k").unwrap(), "v");
+        let s = i.read_set_of_strings().unwrap();
+        assert!(s.contains("a") && s.contains("b"));
+        assert_eq!(i.file_pointer(), i.length());
+    }
+
+    #[test]
+    fn read_beyond_end_is_eof() {
+        let mut i = IndexInput::in_memory(vec![1]);
+        assert_eq!(i.read_byte().unwrap(), 1);
+        let err = i.read_byte().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn skip_bytes_moves_pointer() {
+        let bytes = bytes(|o| o.write_bytes(&[7; 100]).unwrap());
+        let mut i = IndexInput::in_memory(bytes);
+        i.skip_bytes(90).unwrap();
+        assert_eq!(i.file_pointer(), 90);
+        assert_eq!(i.read_byte().unwrap(), 7);
+        assert!(i.skip_bytes(11).is_err(), "skip past end must fail");
+    }
+
+    #[test]
+    fn memory_slice_independent_positions() {
+        let bytes = bytes(|o| o.write_bytes(&(0u8..100).collect::<Vec<_>>()).unwrap());
+        let i = IndexInput::in_memory(bytes);
+        let mut a = i.slice(10, 20).unwrap();
+        let mut b = i.slice(50, 10).unwrap();
+        assert_eq!(a.length(), 20);
+        assert_eq!(a.read_byte().unwrap(), 10);
+        assert_eq!(b.read_byte().unwrap(), 50);
+        assert_eq!(a.read_byte().unwrap(), 11);
+        assert!(i.slice(90, 20).is_err(), "slice past end must fail");
+    }
+
+    #[test]
+    fn checksum_input_footer_round_trip() {
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        out.write_bytes(b"payload").unwrap();
+        crate::codec_util::write_footer(&mut out).unwrap();
+        let bytes = out.into_bytes();
+        let mut input = ChecksumIndexInput::new(IndexInput::in_memory(bytes));
+        let mut payload = [0u8; 7];
+        input.read_bytes(&mut payload).unwrap();
+        assert_eq!(&payload, b"payload");
+        crate::codec_util::check_footer(&mut input).unwrap();
+    }
+
+    #[test]
+    fn corrupted_payload_fails_footer() {
+        let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
+        out.write_bytes(b"payload").unwrap();
+        crate::codec_util::write_footer(&mut out).unwrap();
+        let mut bytes = out.into_bytes();
+        bytes[2] ^= 0xFF;
+        let mut input = ChecksumIndexInput::new(IndexInput::in_memory(bytes));
+        let mut payload = [0u8; 7];
+        input.read_bytes(&mut payload).unwrap();
+        assert!(crate::codec_util::check_footer(&mut input).is_err());
+    }
 }
 
 /// DataOutput-equivalent shared by raw and checksummed outputs, so encoders
@@ -470,5 +565,336 @@ impl DataOutput for ChecksumIndexOutput {
     }
     fn write_zlong(&mut self, v: i64) -> io::Result<()> {
         ChecksumIndexOutput::write_zlong(self, v)
+    }
+}
+
+// ===========================================================================
+// Read side (DataInput / IndexInput / ChecksumIndexInput), mirroring
+// store/DataInput.java and store/BufferedIndexInput.java (9.12.3).
+// ===========================================================================
+
+/// Read buffer capacity (spec §3: buffered FileChannel 读, 8KB; cf.
+/// BufferedIndexInput.BUFFER_SIZE :32).
+const INPUT_BUFFER_CAPACITY: usize = 1 << 13;
+
+enum InputSource {
+    /// Positional reads at `base + pos`; slices share the file handle via
+    /// `try_clone` and shift `base` (std::os::unix::fs::FileExt::read_at).
+    File { file: File, base: u64 },
+    Memory(Vec<u8>),
+}
+
+/// Buffered, position-tracking data input with Lucene `DataInput` primitives
+/// (BufferedIndexInput). All multi-byte primitives are little-endian
+/// (DataInput.readInt/readLong, DataInput.java:94-100,183-185).
+pub struct IndexInput {
+    source: InputSource,
+    length: u64,
+    buffer: [u8; INPUT_BUFFER_CAPACITY],
+    buffer_start: u64, // absolute position of buffer[0]
+    buffer_len: usize, // valid bytes in buffer
+    position: u64,     // absolute position of the next byte to read
+}
+
+impl IndexInput {
+    /// An input over `file[0..length]` (FSDirectory.openInput).
+    pub fn from_file(file: File, length: u64) -> Self {
+        IndexInput {
+            source: InputSource::File { file, base: 0 },
+            length,
+            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer_start: 0,
+            buffer_len: 0,
+            position: 0,
+        }
+    }
+
+    /// An input over an in-memory image (unit tests, in-memory blob parsing).
+    pub fn in_memory(bytes: Vec<u8>) -> Self {
+        IndexInput {
+            length: bytes.len() as u64,
+            source: InputSource::Memory(bytes),
+            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer_start: 0,
+            buffer_len: 0,
+            position: 0,
+        }
+    }
+
+    /// IndexInput.length (IndexInput.java:79).
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// BufferedIndexInput.getFilePointer (:371-374).
+    pub fn file_pointer(&self) -> u64 {
+        self.position
+    }
+
+    /// BufferedIndexInput.seek (:376-385).
+    pub fn seek(&mut self, pos: u64) -> io::Result<()> {
+        if pos > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("seek past EOF: {pos} > {}", self.length),
+            ));
+        }
+        self.position = pos;
+        Ok(())
+    }
+
+    /// IndexInput.slice (:121-122): an independent reader over
+    /// `[offset, offset + length)` of this input.
+    pub fn slice(&self, offset: u64, length: u64) -> io::Result<IndexInput> {
+        if offset + length > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("slice [{offset}, +{length}) past EOF {}", self.length),
+            ));
+        }
+        let source = match &self.source {
+            InputSource::File { file, base } => InputSource::File {
+                file: file.try_clone()?,
+                base: base + offset,
+            },
+            InputSource::Memory(bytes) => {
+                InputSource::Memory(bytes[offset as usize..(offset + length) as usize].to_vec())
+            }
+        };
+        Ok(IndexInput {
+            source,
+            length,
+            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer_start: 0,
+            buffer_len: 0,
+            position: 0,
+        })
+    }
+
+    /// BufferedIndexInput.refill (:340-362).
+    fn refill(&mut self) -> io::Result<()> {
+        if self.position >= self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("read past EOF: {}", self.length),
+            ));
+        }
+        let n = INPUT_BUFFER_CAPACITY.min((self.length - self.position) as usize);
+        match &self.source {
+            InputSource::File { file, base } => {
+                file.read_at(&mut self.buffer[..n], base + self.position)?;
+            }
+            InputSource::Memory(bytes) => {
+                self.buffer[..n]
+                    .copy_from_slice(&bytes[self.position as usize..self.position as usize + n]);
+            }
+        }
+        self.buffer_start = self.position;
+        self.buffer_len = n;
+        Ok(())
+    }
+
+    /// Bytes available in the buffer at `position`; 0 when a seek moved the
+    /// position outside the buffered window (forces a refill on next read,
+    /// cf. BufferedIndexInput.seek invalidating the buffer).
+    fn buffered(&self) -> usize {
+        let end = self.buffer_start + self.buffer_len as u64;
+        if self.position >= self.buffer_start && self.position < end {
+            (end - self.position) as usize
+        } else {
+            0
+        }
+    }
+}
+
+/// DataInput-equivalent shared by raw and checksummed inputs (mirror of
+/// [`DataOutput`]), so decoders read through either without bypassing CRC.
+/// Composite readers have default implementations over `read_bytes`.
+pub trait DataInput {
+    fn read_byte(&mut self) -> io::Result<u8>;
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Little-endian (DataInput.readShort, DataInput.java:82-86).
+    fn read_short(&mut self) -> io::Result<i16> {
+        let mut b = [0u8; 2];
+        self.read_bytes(&mut b)?;
+        Ok(i16::from_le_bytes(b))
+    }
+
+    /// Little-endian (DataInput.readInt, DataInput.java:94-100).
+    fn read_int(&mut self) -> io::Result<i32> {
+        let mut b = [0u8; 4];
+        self.read_bytes(&mut b)?;
+        Ok(i32::from_le_bytes(b))
+    }
+
+    /// Little-endian (DataInput.readLong, DataInput.java:183-185).
+    fn read_long(&mut self) -> io::Result<i64> {
+        let mut b = [0u8; 8];
+        self.read_bytes(&mut b)?;
+        Ok(i64::from_le_bytes(b))
+    }
+
+    /// 7 bits per group, low groups first; at most 5 bytes
+    /// (DataInput.readVInt :136-165).
+    fn read_vint(&mut self) -> io::Result<i32> {
+        let mut v = 0u32;
+        for i in 0..5 {
+            let b = self.read_byte()?;
+            v |= ((b & 0x7f) as u32) << (7 * i);
+            if b & 0x80 == 0 {
+                return Ok(v as i32);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vInt too long (DataInput.readVInt)",
+        ))
+    }
+
+    /// 7 bits per group, low groups first; at most 9 bytes
+    /// (DataInput.readVLong :235-286, negative values rejected like Java).
+    fn read_vlong(&mut self) -> io::Result<i64> {
+        let mut v = 0u64;
+        for i in 0..9 {
+            let b = self.read_byte()?;
+            v |= ((b & 0x7f) as u64) << (7 * i);
+            if b & 0x80 == 0 {
+                return Ok(v as i64);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vLong too long (DataInput.readVLong)",
+        ))
+    }
+
+    /// zigzag + VInt (DataInput.readZInt :173-175, BitUtil.zigZagDecode :299).
+    fn read_zint(&mut self) -> io::Result<i32> {
+        let v = self.read_vint()?;
+        Ok((v >> 1) ^ -(v & 1))
+    }
+
+    /// VInt **byte** length + UTF-8 (DataInput.readString :303-308).
+    fn read_string(&mut self) -> io::Result<String> {
+        let len = self.read_vint()? as usize;
+        let mut bytes = vec![0u8; len];
+        self.read_bytes(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8 string: {e}"))
+        })
+    }
+
+    /// VInt size + (key, value) string pairs (DataInput.readMapOfStrings :334-349).
+    fn read_map_of_strings(&mut self) -> io::Result<BTreeMap<String, String>> {
+        let count = self.read_vint()? as usize;
+        let mut map = BTreeMap::new();
+        for _ in 0..count {
+            let k = self.read_string()?;
+            let v = self.read_string()?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    /// VInt size + strings (DataInput.readSetOfStrings :356-369).
+    fn read_set_of_strings(&mut self) -> io::Result<BTreeSet<String>> {
+        let count = self.read_vint()? as usize;
+        let mut set = BTreeSet::new();
+        for _ in 0..count {
+            set.insert(self.read_string()?);
+        }
+        Ok(set)
+    }
+
+    /// IndexInput.skipBytes (:83-90). The default reads through (so the
+    /// checksum wrapper stays correct); `IndexInput` overrides with a seek.
+    fn skip_bytes(&mut self, mut n: u64) -> io::Result<()> {
+        let mut scratch = [0u8; 4096];
+        while n > 0 {
+            let chunk = (n as usize).min(scratch.len());
+            self.read_bytes(&mut scratch[..chunk])?;
+            n -= chunk as u64;
+        }
+        Ok(())
+    }
+}
+
+impl DataInput for IndexInput {
+    /// BufferedIndexInput.readByte (:52-58).
+    fn read_byte(&mut self) -> io::Result<u8> {
+        if self.buffered() == 0 {
+            self.refill()?;
+        }
+        let b = self.buffer[(self.position - self.buffer_start) as usize];
+        self.position += 1;
+        Ok(b)
+    }
+
+    /// BufferedIndexInput.readBytes (:91-133) — always through the buffer.
+    fn read_bytes(&mut self, mut buf: &mut [u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            if self.buffered() == 0 {
+                self.refill()?;
+            }
+            let n = self.buffered().min(buf.len());
+            let start = (self.position - self.buffer_start) as usize;
+            buf[..n].copy_from_slice(&self.buffer[start..start + n]);
+            self.position += n as u64;
+            let rest = std::mem::take(&mut buf);
+            buf = &mut rest[n..];
+        }
+        Ok(())
+    }
+
+    /// IndexInput.skipBytes (:83-90) = seek(getFilePointer() + numBytes).
+    fn skip_bytes(&mut self, n: u64) -> io::Result<()> {
+        self.seek(self.position + n)
+    }
+}
+
+/// Wraps an `IndexInput` with a running CRC32 over every byte read
+/// (store/ChecksumIndexInput; CRC32 algorithm = java.util.zip.CRC32,
+/// BufferedChecksumIndexInput.java:20,34). Sequential reads only — segments_N,
+/// .si, .fnm, .tmd, .psm are parsed straight through.
+pub struct ChecksumIndexInput {
+    input: IndexInput,
+    digest: crc32fast::Hasher,
+}
+
+impl ChecksumIndexInput {
+    pub fn new(input: IndexInput) -> Self {
+        ChecksumIndexInput {
+            input,
+            digest: crc32fast::Hasher::new(),
+        }
+    }
+
+    /// CRC32 of everything read so far (CodecUtil.writeCRC :643-650 takes this
+    /// value *after* the footer magic + algorithmID have been read).
+    pub fn get_checksum(&self) -> u64 {
+        self.digest.clone().finalize() as u64
+    }
+
+    pub fn file_pointer(&self) -> u64 {
+        self.input.file_pointer()
+    }
+
+    pub fn length(&self) -> u64 {
+        self.input.length()
+    }
+}
+
+impl DataInput for ChecksumIndexInput {
+    fn read_byte(&mut self) -> io::Result<u8> {
+        let b = self.input.read_byte()?;
+        self.digest.update(&[b]);
+        Ok(b)
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        self.input.read_bytes(buf)?;
+        self.digest.update(buf);
+        Ok(())
     }
 }

@@ -1,8 +1,10 @@
-//! Lucene 9.12.3-compatible index writer format layer.
+//! Lucene 9.12.3-compatible index format layer.
 //!
 //! Writes segments that Java Lucene 9.12.3 (`DirectoryReader` / `CheckIndex`)
 //! can read: stored fields (Lucene90 BEST_SPEED), field infos (Lucene94),
 //! segment info (Lucene99/"Lucene90SegmentInfo") and the `segments_N` commit.
+//! Reads the same files back (`DataInput` / `IndexInput` / `ChecksumIndexInput`,
+//! `FSDirectory::open_input`) for the search read path.
 //! All format details follow the 9.12.3 sources, cited per item.
 
 #![forbid(unsafe_code)]
@@ -23,7 +25,7 @@ pub mod stored_fields;
 
 pub use directory::FSDirectory;
 pub use field_infos::{DocValuesType, FieldInfo, FieldInfos, IndexOptions};
-pub use io::{ChecksumIndexOutput, IndexOutput};
+pub use io::{ChecksumIndexInput, ChecksumIndexOutput, DataInput, IndexInput, IndexOutput};
 pub use segment_info::SegmentInfo;
 pub use segment_infos::{SegmentCommitInfo, SegmentInfos};
 pub use stored_fields::{StoredField, StoredFieldsWriter};

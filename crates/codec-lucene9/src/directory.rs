@@ -5,10 +5,10 @@
 //! list / exists / delete.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use crate::io::{ChecksumIndexOutput, IndexOutput};
+use crate::io::{BufferedIndexInput, ChecksumIndexOutput, HeapIndexInput, IndexInput, IndexOutput};
 
 #[derive(Clone)]
 pub struct FSDirectory {
@@ -81,6 +81,24 @@ impl FSDirectory {
 
     pub fn delete(&self, name: &str) -> io::Result<()> {
         fs::remove_file(self.resolve(name))
+    }
+
+    /// Opens an existing file for reading. Small files (< 1 MB) are read
+    /// entirely into memory (HeapIndexInput); large files use buffered reads.
+    pub fn open_input(&self, name: &str) -> io::Result<Box<dyn IndexInput>> {
+        let path = self.resolve(name);
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.len() < 1_048_576 {
+            // Small file: read entirely into memory
+            let mut file = std::fs::File::open(&path)?;
+            let mut buf = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut buf)?;
+            Ok(Box::new(HeapIndexInput::new(buf)))
+        } else {
+            // Large file: buffered reading
+            let file = OpenOptions::new().read(true).open(&path)?;
+            Ok(Box::new(BufferedIndexInput::new(file)?))
+        }
     }
 }
 

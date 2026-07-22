@@ -139,6 +139,10 @@ impl FieldInfos {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    pub fn by_number(&self, number: i32) -> Option<&FieldInfo> {
+        self.fields.iter().find(|f| f.number == number)
+    }
+
     /// Lucene94FieldInfosFormat.write (:367-416).
     pub fn write(
         &self,

@@ -403,6 +403,16 @@ pub struct Fst {
 }
 
 impl Fst {
+    /// Reconstruct an FST from raw parts (used by the reader).
+    pub(crate) fn from_parts(
+        bytes: Vec<u8>,
+        start_node: u64,
+        num_bytes: u64,
+        empty_output: Option<Vec<u8>>,
+    ) -> Self {
+        Fst { bytes, start_node, num_bytes, empty_output }
+    }
+
     /// Raw FST bytes, to be written into .tip at the field's indexStartFP.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes

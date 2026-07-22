@@ -17,6 +17,7 @@ pub mod packed;
 pub mod points;
 pub mod postings;
 pub mod postings_ll;
+pub mod postings_reader;
 pub mod segment_info;
 pub mod segment_infos;
 pub mod stored_fields;

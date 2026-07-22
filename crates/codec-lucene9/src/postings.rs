@@ -84,16 +84,19 @@ fn encode_term(
         let delta = state.singleton_doc_id - last.singleton_doc_id;
         out.write_vlong(((zigzag(delta) << 1) | 0x01) as i64)?;
     } else {
-        out.write_vlong(((state.doc_start_fp - last.doc_start_fp) << 1) as i64)?;
-        if state.singleton_doc_id != -1 {
+        let has_singleton = state.singleton_doc_id != -1;
+        out.write_vlong(
+            (((state.doc_start_fp - last.doc_start_fp) << 1) | (has_singleton as u64)) as i64,
+        )?;
+        if has_singleton {
             out.write_vint(state.singleton_doc_id as i32)?;
         }
     }
     if has_positions {
         out.write_vlong((state.pos_start_fp - last.pos_start_fp) as i64)?;
-        if state.last_pos_block_offset != -1 {
-            out.write_vlong(state.last_pos_block_offset)?;
-        }
+        // Always write lastPosBlockOffset (uses 0 as the sentinel for "none",
+        // avoiding the ambiguous peek in the reader).
+        out.write_vlong(state.last_pos_block_offset.max(0))?;
     }
     *last = *state;
     Ok(())
@@ -977,8 +980,8 @@ mod tests {
         encode_term(&mut out, &s1, &mut last, false).unwrap();
         encode_term(&mut out, &s2, &mut last, false).unwrap();
         let bytes = out.into_bytes();
-        // s1: VLong(10<<1)=20, VInt(7); s2: VLong(zigzag(2)<<1|1)=VLong(9)
-        assert_eq!(bytes, vec![20, 7, 9]);
+        // s1: VLong(10<<1|1)=VLong(21), VInt(7); s2: VLong(zigzag(2)<<1|1)=VLong(9)
+        assert_eq!(bytes, vec![21, 7, 9]);
     }
 
     #[test]

@@ -118,6 +118,45 @@ pub fn write_footer(out: &mut ChecksumIndexOutput) -> io::Result<()> {
     write_be_long(out, crc)
 }
 
+/// Skip past a codec index header written by [`write_index_header`].
+///
+/// Validates the CODEC_MAGIC, reads and discards the codec string, validates
+/// the BE version, discards the 16-byte segment id, and discards the suffix.
+/// Returns `Ok(())` if the header is valid and the cursor is positioned just
+/// past it.
+pub fn skip_index_header(input: &mut dyn IndexInput) -> io::Result<()> {
+    // Read and validate magic (4 bytes BE)
+    let mut magic = [0u8; 4];
+    input.read_bytes(&mut magic, 0, 4)?;
+    let magic = u32::from_be_bytes(magic);
+    if magic != CODEC_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid codec header magic: expected {CODEC_MAGIC:#010x}, got {magic:#010x}"),
+        ));
+    }
+
+    // Read codec name length + bytes
+    let codec_len = input.read_vint()? as usize;
+    let mut _codec = vec![0u8; codec_len];
+    input.read_bytes(&mut _codec, 0, codec_len)?;
+
+    // Read BE version (4 bytes)
+    let mut ver = [0u8; 4];
+    input.read_bytes(&mut ver, 0, 4)?;
+
+    // Skip segment id (16 bytes)
+    let mut _seg_id = [0u8; 16];
+    input.read_bytes(&mut _seg_id, 0, 16)?;
+
+    // Skip suffix (1-byte length + bytes)
+    let suffix_len = input.read_byte()? as usize;
+    let mut _suffix = vec![0u8; suffix_len];
+    input.read_bytes(&mut _suffix, 0, suffix_len)?;
+
+    Ok(())
+}
+
 /// Computes the footer CRC for a whole in-memory file image (test helper).
 #[cfg(test)]
 pub(crate) fn crc32(bytes: &[u8]) -> u64 {

@@ -99,12 +99,23 @@ fn input_read_vlong15(input: &mut dyn IndexInput) -> io::Result<u64> {
 // Term metadata
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TermState {
     doc_start_fp: u64,
     pos_start_fp: u64,
     last_pos_block_offset: i64,
     singleton_doc_id: i64,
+}
+
+impl Default for TermState {
+    fn default() -> Self {
+        TermState {
+            doc_start_fp: 0,
+            pos_start_fp: 0,
+            last_pos_block_offset: 0,
+            singleton_doc_id: -1, // EMPTY_STATE sentinel, matches writer
+        }
+    }
 }
 
 struct TermStats {
@@ -190,19 +201,10 @@ fn decode_one_term_meta(
         last.pos_start_fp = last
             .pos_start_fp
             .wrapping_add(read_slice_vlong(bytes, pos) as u64);
-        if last.singleton_doc_id == -1 {
-            // Peek: if next value looks like a positive file offset,
-            // it's last_pos_block_offset (only written when != -1, i.e. ttf > 128).
-            let saved = *pos;
-            if saved < bytes.len() {
-                let candidate = read_slice_vlong(bytes, pos);
-                if candidate > 0 {
-                    last.last_pos_block_offset = candidate;
-                } else {
-                    *pos = saved;
-                }
-            }
-        }
+        // lastPosBlockOffset is always written (0 sentinel when absent),
+        // so no ambiguous peek is needed.
+        let offset = read_slice_vlong(bytes, pos);
+        last.last_pos_block_offset = if offset == 0 { -1 } else { offset };
     }
 
     last.clone()
@@ -297,10 +299,14 @@ fn read_tim_block_for_term(
             let b = input.read_byte()?;
             vec![b; n]
         } else {
-            let n = code_or_len as usize;
-            let mut raw = vec![0u8; n];
-            input.read_bytes(&mut raw, 0, n)?;
-            raw
+            let n = (code_or_len >> 1) as usize;
+            if n == 0 {
+                Vec::new()
+            } else {
+                let mut raw = vec![0u8; n];
+                input.read_bytes(&mut raw, 0, n)?;
+                raw
+            }
         }
     };
 
@@ -534,11 +540,17 @@ fn read_all_docs(
     doc_start_fp: u64,
     singleton_doc_id: i64,
     doc_freq: u32,
+    total_term_freq: u64,
     has_freqs: bool,
     has_positions: bool,
 ) -> io::Result<(Vec<u32>, Vec<u32>)> {
     if singleton_doc_id != -1 {
-        return Ok((vec![singleton_doc_id as u32], vec![1]));
+        let freq = if has_freqs {
+            total_term_freq as u32
+        } else {
+            1
+        };
+        return Ok((vec![singleton_doc_id as u32], vec![freq]));
     }
 
     input.seek(doc_start_fp)?;
@@ -833,6 +845,18 @@ impl PostingsReader {
         tip: &mut Box<dyn IndexInput>,
         field_infos: &FieldInfos,
     ) -> io::Result<BTreeMap<String, FieldReader>> {
+        // .tmd layout (Lucene90BlockTreeTermsWriter):
+        //   [TMD_CODEC index header]
+        //   [TERMS_CODEC index header (PostingsHeader)]
+        //   [VInt: blockSize]
+        //   [VInt: numFields]
+        //   [field record 0] ... [field record N-1]
+        //   [VLong: indexLength]
+        //   [VLong: termsLength]
+        //   [footer]
+        crate::codec_util::skip_index_header(tmd.as_mut())?;
+        crate::codec_util::skip_index_header(tmd.as_mut())?;
+        let _block_size = tmd.read_vint()?;
         let num_fields = tmd.read_vint()? as usize;
         let mut fields = BTreeMap::new();
 
@@ -1001,6 +1025,7 @@ impl PostingsReader {
             term_state.doc_start_fp,
             term_state.singleton_doc_id,
             stats.doc_freq,
+            stats.total_term_freq,
             fr.has_freqs,
             fr.has_positions,
         )?;
@@ -1042,7 +1067,9 @@ impl PostingsReader {
 // FST block search
 // ---------------------------------------------------------------------------
 
-/// Walk FST along `term`, returning the output of the last final arc.
+/// Walk FST along `term`, returning the output of the deepest final arc
+/// encountered, or the FST's empty_output when no final arc matches (the term
+/// falls under the root block whose prefix is empty).
 fn find_fst_block(fst: &Fst, term: &[u8]) -> Option<Vec<u8>> {
     use crate::fst::read_node;
 
@@ -1076,7 +1103,9 @@ fn find_fst_block(fst: &Fst, term: &[u8]) -> Option<Vec<u8>> {
         node = arc.target;
     }
 
-    last
+    // Fall back to the root block (empty prefix) when no finer-grained block
+    // matches. The root block's pointer is stored as the FST's empty_output.
+    last.or_else(|| fst.empty_output().map(|o| o.to_vec()))
 }
 
 /// Walk FST along `term`, returning the length of the longest prefix that
@@ -1107,4 +1136,346 @@ fn find_block_prefix_len(fst: &Fst, term: &[u8]) -> usize {
     }
 
     last
+}
+
+// ============================================================================
+// Round-trip tests: PostingsWriter → PostingsReader
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::FSDirectory;
+    use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
+    use crate::postings::PostingsWriter;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codec-lucene9-prt-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Helper: collect all doc IDs from a PostingsEnum.
+    fn collect_docs(pe: &mut PostingsEnum) -> Vec<u32> {
+        let mut docs = Vec::new();
+        loop {
+            match pe.next_doc().unwrap() {
+                NO_MORE_DOCS => break,
+                d => docs.push(d as u32),
+            }
+        }
+        docs
+    }
+
+    /// Helper: collect (doc, freq) pairs from a PostingsEnum.
+    fn collect_docs_and_freqs(pe: &mut PostingsEnum) -> Vec<(u32, u32)> {
+        let mut result = Vec::new();
+        loop {
+            match pe.next_doc().unwrap() {
+                NO_MORE_DOCS => break,
+                d => {
+                    let freq = pe.freq();
+                    result.push((d as u32, freq));
+                }
+            }
+        }
+        result
+    }
+
+    /// Helper: collect (doc, freq, positions) from a PostingsEnum.
+    fn collect_docs_freqs_positions(pe: &mut PostingsEnum) -> Vec<(u32, u32, Vec<u32>)> {
+        let mut result = Vec::new();
+        loop {
+            match pe.next_doc().unwrap() {
+                NO_MORE_DOCS => break,
+                d => {
+                    let freq = pe.freq();
+                    let mut positions = Vec::new();
+                    for _ in 0..freq {
+                        positions.push(pe.next_position().unwrap());
+                    }
+                    result.push((d as u32, freq, positions));
+                }
+            }
+        }
+        result
+    }
+
+    /// Build a PostingsReader from in-memory postings data.
+    ///
+    /// Writes postings to a temp directory via `PostingsWriter`, then opens a
+    /// `PostingsReader` pointing at the same files.
+    fn build_reader(
+        tag: &str,
+        index_options: IndexOptions,
+        postings: &BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)>,
+    ) -> (FSDirectory, PostingsReader) {
+        let root = temp_dir(tag);
+        let dir = FSDirectory::open(&root).unwrap();
+        let segment_id = [0x42u8; 16];
+        let segment = "test";
+
+        let mut writer = PostingsWriter::new(&dir, segment, &segment_id).unwrap();
+
+        let field_info = FieldInfo {
+            name: "message".to_string(),
+            number: 0,
+            index_options,
+            ..FieldInfo::stored("message", 0)
+        };
+
+        // Estimate doc_count: max doc id + 1.
+        let max_doc = postings
+            .values()
+            .flat_map(|(docs, _, _)| docs.last().copied())
+            .max()
+            .unwrap_or(0);
+        let doc_count = max_doc + 1;
+
+        writer.start_field(&field_info, doc_count).unwrap();
+
+        // Terms must be written in sorted order (BTreeMap iteration is sorted).
+        for (term, (docs, freqs, positions)) in postings.iter() {
+            let pos_slice: Option<Vec<Vec<u32>>> = positions.clone();
+            let pos_ref: Option<&[Vec<u32>]> = pos_slice.as_ref().map(|v| v.as_slice());
+            writer
+                .write_term(term, docs, freqs, pos_ref)
+                .unwrap();
+        }
+
+        writer.finish_field().unwrap();
+        let _files = writer.finish().unwrap();
+
+        // Build FieldInfos for the reader.
+        let field_infos = FieldInfos::new(vec![field_info]);
+
+        let reader = PostingsReader::open(&dir, segment, "_Lucene912_0", &field_infos).unwrap();
+
+        (dir, reader)
+    }
+
+    // -- Docs only ------------------------------------------------------------
+
+    #[test]
+    fn test_postings_round_trip_docs_only() {
+        let mut postings: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        postings.insert(b"foo".to_vec(), (vec![0, 1, 2, 3, 4], vec![1; 5], None));
+        postings.insert(b"hello".to_vec(), (vec![0, 5, 10], vec![1; 3], None));
+        postings.insert(b"world".to_vec(), (vec![1, 3, 7], vec![1; 3], None));
+
+        let (_dir, mut reader) = build_reader("docs-only", IndexOptions::Docs, &postings);
+
+        for (term, (expected_docs, _, _)) in &postings {
+            let mut pe = reader
+                .read_term("message", term)
+                .unwrap()
+                .unwrap_or_else(|| panic!("term {:?} not found", String::from_utf8_lossy(term)));
+            assert!(
+                matches!(pe, PostingsEnum::Docs { .. }),
+                "expected Docs variant for {:?}",
+                String::from_utf8_lossy(term)
+            );
+            let docs = collect_docs(&mut pe);
+            assert_eq!(
+                docs, *expected_docs,
+                "docs mismatch for {:?}",
+                String::from_utf8_lossy(term)
+            );
+            // For the Docs variant, freq() is always 1 (even after exhaustion).
+        }
+
+        // Test advance
+        let mut pe = reader.read_term("message", b"foo").unwrap().unwrap();
+        assert_eq!(pe.advance(3).unwrap(), 3);
+        assert_eq!(pe.next_doc().unwrap(), 4);
+
+        // Test missing term
+        assert!(reader.read_term("message", b"nonexistent").unwrap().is_none());
+        // Test missing field
+        assert!(reader.read_term("nonexistent", b"hello").unwrap().is_none());
+    }
+
+    // -- Docs and freqs -------------------------------------------------------
+
+    #[test]
+    fn test_postings_round_trip_docs_and_freqs() {
+        let mut postings: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        postings.insert(b"alpha".to_vec(), (vec![0, 2], vec![1, 3], None));
+        postings.insert(
+            b"beta".to_vec(),
+            (vec![0, 1, 5, 10], vec![2, 1, 1, 4], None),
+        );
+        postings.insert(b"gamma".to_vec(), (vec![3, 7, 9], vec![5, 2, 3], None));
+
+        let (_dir, mut reader) =
+            build_reader("docs-freqs", IndexOptions::DocsAndFreqs, &postings);
+
+        for (term, (expected_docs, expected_freqs, _)) in &postings {
+            let mut pe = reader
+                .read_term("message", term)
+                .unwrap()
+                .unwrap_or_else(|| panic!("term {:?} not found", String::from_utf8_lossy(term)));
+            assert!(
+                matches!(pe, PostingsEnum::DocsAndFreqs { .. }),
+                "expected DocsAndFreqs variant for {:?}",
+                String::from_utf8_lossy(term)
+            );
+            let result = collect_docs_and_freqs(&mut pe);
+            let expected: Vec<(u32, u32)> = expected_docs
+                .iter()
+                .zip(expected_freqs.iter())
+                .map(|(&d, &f)| (d, f))
+                .collect();
+            assert_eq!(
+                result, expected,
+                "docs+freqs mismatch for {:?}",
+                String::from_utf8_lossy(term)
+            );
+        }
+
+        // Verify we cannot call next_position on DocsAndFreqs.
+        let mut pe = reader.read_term("message", b"beta").unwrap().unwrap();
+        pe.next_doc().unwrap();
+        assert!(pe.next_position().is_err());
+    }
+
+    // -- Docs, freqs, and positions -------------------------------------------
+
+    #[test]
+    fn test_postings_round_trip_docs_freqs_positions() {
+        let mut postings: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        postings.insert(
+            b"cat".to_vec(),
+            (
+                vec![0, 3],
+                vec![2, 3],
+                Some(vec![vec![0, 5], vec![1, 3, 7]]),
+            ),
+        );
+        postings.insert(
+            b"dog".to_vec(),
+            (
+                vec![1, 4, 8],
+                vec![1, 2, 3],
+                Some(vec![vec![0], vec![2, 4], vec![0, 1, 3]]),
+            ),
+        );
+        postings.insert(
+            b"emu".to_vec(),
+            (vec![2], vec![4], Some(vec![vec![0, 2, 5, 9]])),
+        );
+
+        let (_dir, mut reader) = build_reader(
+            "docs-freqs-pos",
+            IndexOptions::DocsAndFreqsAndPositions,
+            &postings,
+        );
+
+        for (term, (expected_docs, expected_freqs, expected_positions)) in &postings {
+            let mut pe = reader
+                .read_term("message", term)
+                .unwrap()
+                .unwrap_or_else(|| panic!("term {:?} not found", String::from_utf8_lossy(term)));
+            assert!(
+                matches!(pe, PostingsEnum::DocsFreqsPositions { .. }),
+                "expected DocsFreqsPositions variant for {:?}",
+                String::from_utf8_lossy(term)
+            );
+            let result = collect_docs_freqs_positions(&mut pe);
+            let expected: Vec<(u32, u32, Vec<u32>)> = expected_docs
+                .iter()
+                .zip(expected_freqs.iter())
+                .zip(expected_positions.as_ref().unwrap().iter())
+                .map(|((&d, &f), p)| (d, f, p.clone()))
+                .collect();
+            assert_eq!(
+                result, expected,
+                "docs+freqs+positions mismatch for {:?}",
+                String::from_utf8_lossy(term)
+            );
+        }
+
+        // Verify next_position fails on DocsFreqsPositions after exhaustion.
+        let mut pe = reader.read_term("message", b"emu").unwrap().unwrap();
+        pe.next_doc().unwrap(); // doc 2, freq 4
+        for _ in 0..4 {
+            pe.next_position().unwrap();
+        }
+        assert!(pe.next_position().is_err());
+    }
+
+    // -- Singleton / small terms ----------------------------------------------
+
+    #[test]
+    fn test_postings_round_trip_singleton() {
+        let mut postings: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        // Single-doc terms (singletons) test the special-case encoding path.
+        postings.insert(b"a".to_vec(), (vec![5], vec![1], None));
+        postings.insert(b"b".to_vec(), (vec![10], vec![1], None));
+        postings.insert(b"c".to_vec(), (vec![15], vec![1], None));
+
+        let (_dir, mut reader) = build_reader("singleton", IndexOptions::Docs, &postings);
+
+        for (term, (expected_docs, _, _)) in &postings {
+            let mut pe = reader.read_term("message", term).unwrap().unwrap();
+            assert!(matches!(pe, PostingsEnum::Docs { .. }));
+            let docs = collect_docs(&mut pe);
+            assert_eq!(docs, *expected_docs);
+        }
+
+        // Singleton with positions
+        let mut postings2: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        postings2.insert(
+            b"only".to_vec(),
+            (vec![0], vec![3], Some(vec![vec![1, 2, 3]])),
+        );
+        let (_dir2, mut reader2) = build_reader(
+            "singleton-pos",
+            IndexOptions::DocsAndFreqsAndPositions,
+            &postings2,
+        );
+        let mut pe = reader2.read_term("message", b"only").unwrap().unwrap();
+        assert!(matches!(pe, PostingsEnum::DocsFreqsPositions { .. }));
+        let result = collect_docs_freqs_positions(&mut pe);
+        assert_eq!(result, vec![(0, 3, vec![1, 2, 3])]);
+    }
+
+    // -- Large block test (exercises skip data and full 128-doc blocks) --------
+
+    #[test]
+    fn test_postings_round_trip_large_block() {
+        // 300 docs: 2 full FOR blocks (128+128) + 44-doc tail.
+        let docs: Vec<u32> = (0u32..300).collect();
+        let freqs: Vec<u32> = (0u32..300).map(|i| (i % 5) + 1).collect();
+
+        let mut postings: BTreeMap<Vec<u8>, (Vec<u32>, Vec<u32>, Option<Vec<Vec<u32>>>)> =
+            BTreeMap::new();
+        postings.insert(b"bulk".to_vec(), (docs.clone(), freqs.clone(), None));
+
+        let (_dir, mut reader) = build_reader("large", IndexOptions::DocsAndFreqs, &postings);
+
+        let mut pe = reader.read_term("message", b"bulk").unwrap().unwrap();
+        assert!(matches!(pe, PostingsEnum::DocsAndFreqs { .. }));
+        let result = collect_docs_and_freqs(&mut pe);
+        let expected: Vec<(u32, u32)> =
+            docs.iter().zip(freqs.iter()).map(|(&d, &f)| (d, f)).collect();
+        assert_eq!(result, expected);
+
+        // Test advance across block boundaries
+        let mut pe2 = reader.read_term("message", b"bulk").unwrap().unwrap();
+        assert_eq!(pe2.advance(200).unwrap(), 200);
+        assert_eq!(pe2.advance(250).unwrap(), 250);
+        assert_eq!(pe2.next_doc().unwrap(), 251);
+    }
 }

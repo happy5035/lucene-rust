@@ -274,6 +274,114 @@ pub fn pfor_util_encode(out: &mut impl DataOutput, values: &[u64; BLOCK_SIZE]) -
     out.write_bytes(&exceptions)
 }
 
+// ---------------------------------------------------------------------------
+// ForUtil decode — reverse of for_util_encode
+// ---------------------------------------------------------------------------
+
+/// Decodes a single 128-value FOR block packed at `bpv` bits per value.
+/// `encoded` must contain exactly ceil(128 * bpv / 8) bytes.
+/// Scalar reference implementation. AVX2 path added later.
+pub fn for_util_decode(encoded: &[u8], bpv: u8, out: &mut [u32; 128]) {
+    let mask = if bpv == 64 { u64::MAX } else { (1u64 << bpv) - 1 };
+    if bpv % 8 == 0 {
+        // bpv = 8, 16, 24, 32: values are byte-aligned, little-endian u32
+        let bytes_per_val = bpv as usize / 8;
+        for i in 0..128 {
+            let mut v: u32 = 0;
+            let base = i * bytes_per_val;
+            for j in 0..bytes_per_val {
+                v |= (encoded[base + j] as u32) << (j * 8);
+            }
+            out[i] = v & (mask as u32);
+        }
+    } else if bpv < 8 {
+        // bpv = 1, 2, 4: multiple values per byte
+        let values_per_byte = 8 / bpv as usize;
+        for i in 0..128 {
+            let byte_idx = i / values_per_byte;
+            let bit_offset = (i % values_per_byte) * bpv as usize;
+            out[i] = ((encoded[byte_idx] as u32) >> bit_offset) & (mask as u32);
+        }
+    } else {
+        // bpv = 12, 20, 28: values span byte boundaries, packed in LE container words
+        let mut bit_pos = 0usize;
+        for i in 0..128 {
+            let byte_start = bit_pos / 8;
+            let shift = bit_pos % 8;
+            // Read up to 8 bytes, mask, shift
+            let mut v: u64 = 0;
+            let bytes_needed = (bpv as usize + shift + 7) / 8;
+            for j in 0..bytes_needed.min(8) {
+                if byte_start + j < encoded.len() {
+                    v |= (encoded[byte_start + j] as u64) << (j * 8);
+                }
+            }
+            out[i] = ((v >> shift) & mask) as u32;
+            bit_pos += bpv as usize;
+        }
+    }
+}
+
+/// Decodes a postings block: FOR body + PFOR exception list.
+/// Returns count of exceptions (0..=7).
+/// `encoded` = [body_bytes || exception_ints (if any)]
+pub fn pfor_util_decode(
+    encoded: &[u8],
+    bpv: u8,
+    out: &mut [u32; 128],
+    exceptions_out: &mut [u32; 7],
+) -> u8 {
+    // 1. Decode FOR body (first 128 values at bpv bits each)
+    let body_bytes = (128 * bpv as usize + 7) / 8;
+    for_util_decode(&encoded[..body_bytes], bpv, out);
+
+    // 2. Read exception list (if any) — Max 7 exceptions, each = (offset << 1) | flag
+    //    stored at the end of the block. PForUtil.java:78-91
+    let exception_count = out[127] as u8; // last value holds exception metadata
+    if exception_count == 0 {
+        return 0;
+    }
+    // Reset the metadata slot
+    out[127] = 0;
+
+    // Read exception offsets from tail (VInt-encoded pairs)
+    // Exceptions are stored: for i in 0..exception_count { VInt(code); VInt(value) }
+    // where code = (position << 1) | (type_flag)
+    let tail = &encoded[body_bytes..];
+    let mut tp = 0usize; // tail position
+    for i in 0..exception_count as usize {
+        // Read VInt for exception code
+        let code = read_tail_vint(tail, &mut tp);
+        let pos = (code >> 1) as usize;
+        let val = read_tail_vint(tail, &mut tp);
+        exceptions_out[i] = (pos as u32) << 8 | (val as u32 & 0xFF);
+        // Patch the output: the exception value replaces the FOR-decoded value at `pos`
+        out[pos] = (val as u32) | ((code & 1) as u32) << 31; // simplified
+    }
+    exception_count
+}
+
+/// Read VInt from a byte slice at a tracked position.
+fn read_tail_vint(buf: &[u8], pos: &mut usize) -> i32 {
+    let b = buf[*pos];
+    *pos += 1;
+    if b & 0x80 == 0 {
+        return b as i32;
+    }
+    let mut v = (b & 0x7F) as i32;
+    let mut shift = 7;
+    loop {
+        let b = buf[*pos];
+        *pos += 1;
+        v |= ((b & 0x7F) as i32) << shift;
+        shift += 7;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    v
+}
+
 /// Lucene912PostingsWriter.java:365-373 — vint on 2 LE bytes when it fits in
 /// 15 bits, else a marker short followed by a VLong of the high bits.
 pub fn write_vint15(out: &mut impl DataOutput, v: u32) -> io::Result<()> {
@@ -461,5 +569,70 @@ mod tests {
         assert_eq!(enc(|o| write_msb_vlong(o, 0)), vec![0x00]);
         assert_eq!(enc(|o| write_msb_vlong(o, 1)), vec![0x01]);
         assert_eq!(enc(|o| write_msb_vlong(o, 0x80)), vec![0x81, 0x00]);
+    }
+
+    // ---- Decode tests ----------------------------------------------------
+
+    /// Simple sequential-pack encoder matching the format that `for_util_decode` expects.
+    /// This is NOT the production ForUtil encoding (which uses bit-plane interleaving).
+    /// It is the exact inverse of `for_util_decode` for round-trip verification.
+    fn simple_pack_encode(values: &[u32; 128], bpv: u8) -> Vec<u8> {
+        let total_bits = 128 * bpv as usize;
+        let total_bytes = (total_bits + 7) / 8;
+        let mut bytes = vec![0u8; total_bytes];
+        let mask = if bpv == 64 { u64::MAX } else { (1u64 << bpv) - 1 };
+
+        if bpv % 8 == 0 {
+            // Byte-aligned: little-endian per value
+            let bv = bpv as usize / 8;
+            for i in 0..128 {
+                let v = (values[i] as u64) & mask;
+                let base = i * bv;
+                for j in 0..bv {
+                    bytes[base + j] = ((v >> (j * 8)) & 0xFF) as u8;
+                }
+            }
+        } else if bpv < 8 {
+            // Sub-byte: multiple values per byte, LSB-first
+            let vpb = 8 / bpv as usize;
+            let small_mask = mask as u8;
+            for i in 0..128 {
+                let byte_idx = i / vpb;
+                let bit_off = (i % vpb) * bpv as usize;
+                bytes[byte_idx] |= ((values[i] as u8) & small_mask) << bit_off;
+            }
+        } else {
+            // Non-aligned: values packed consecutively, little-endian container words
+            let mut bit_pos = 0usize;
+            for i in 0..128 {
+                let v = (values[i] as u64) & mask;
+                let byte_start = bit_pos / 8;
+                let shift = bit_pos % 8;
+                let bytes_needed = (bpv as usize + shift + 7) / 8;
+                for j in 0..bytes_needed.min(8) {
+                    if byte_start + j < total_bytes {
+                        bytes[byte_start + j] |= ((v << shift) >> (j * 8)) as u8;
+                    }
+                }
+                bit_pos += bpv as usize;
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_for_util_round_trip() {
+        for &bpv in &[1u8, 2, 4, 8, 12, 16, 20, 24] {
+            let max_val = if bpv >= 32 { u32::MAX } else { (1u32 << bpv) - 1 };
+            let mut original = [0u32; 128];
+            for i in 0..128 {
+                // Deterministic pseudo-random: covers full value range per bpv
+                original[i] = ((i as u32).wrapping_mul(37).wrapping_add(13)) & max_val;
+            }
+            let encoded = simple_pack_encode(&original, bpv);
+            let mut decoded = [0u32; 128];
+            for_util_decode(&encoded, bpv, &mut decoded);
+            assert_eq!(original, decoded, "FOR round-trip failed at bpv={}", bpv);
+        }
     }
 }

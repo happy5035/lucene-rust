@@ -688,7 +688,12 @@ impl RoaringBitmap {
             }
             Container::Run(runs, _) => {
                 let p = runs.partition_point(|&(_, e)| e < low);
-                cur.a = cur.a.max(p as u32);
+                if p as u32 > cur.a {
+                    // target lands in a later run: the partially consumed
+                    // run's in-run offset must not leak into the new run
+                    cur.a = p as u32;
+                    cur.b = 0;
+                }
                 if (cur.a as usize) < runs.len() {
                     let (s, _) = runs[cur.a as usize];
                     cur.b = cur.b.max(low.saturating_sub(s) as u32);
@@ -850,7 +855,9 @@ impl RoaringBitmap {
                 }
                 TYPE_RUN => {
                     let num_runs = input.read_vint().ok()?;
-                    if num_runs < 1 {
+                    // at most 2^15 disjoint runs over a 2^16-value domain;
+                    // the bound also caps the with_capacity allocation
+                    if !(1..=32768).contains(&num_runs) {
                         return None;
                     }
                     let mut runs = Vec::with_capacity(num_runs as usize);
@@ -1174,5 +1181,135 @@ mod tests {
         assert_eq!(len, n - 4);
         let back = RoaringBitmap::deserialize(&bytes[..len], 5000).unwrap();
         assert_eq!(to_vec(&back), docs);
+    }
+
+    #[test]
+    fn run_container_advance_drops_stale_offset() {
+        // one bucket, two runs (0,100) and (200,300) -> Run container
+        let docs: Vec<u32> = (0..=100u32).chain(200..=300u32).collect();
+        let b = RoaringBitmap::from_sorted_docs(&docs);
+        assert!(matches!(&b.containers[0].1, Container::Run(runs, _) if runs.len() == 2));
+
+        // partially consume the first run (docs 0..=49, cursor at a=0, b=50),
+        // then advance past its end: the stale in-run offset must not leak
+        // into the next run (the bug returned 250, silently skipping 210-249)
+        let mut cur = b.cursor();
+        for i in 0..50 {
+            assert_eq!(b.cursor_next(&mut cur), Some(i));
+        }
+        assert_eq!(b.cursor_advance(&mut cur, 210), Some(210));
+        assert_eq!(b.cursor_next(&mut cur), Some(211));
+
+        // advance landing INSIDE the partially consumed run: the offset is
+        // clamped forward to the target, not reset
+        let mut cur = b.cursor();
+        for i in 0..50 {
+            assert_eq!(b.cursor_next(&mut cur), Some(i));
+        }
+        assert_eq!(b.cursor_advance(&mut cur, 60), Some(60));
+        assert_eq!(b.cursor_next(&mut cur), Some(61));
+
+        // target behind the in-run offset: forward-only, no rewind
+        let mut cur = b.cursor();
+        for i in 0..50 {
+            assert_eq!(b.cursor_next(&mut cur), Some(i));
+        }
+        assert_eq!(b.cursor_advance(&mut cur, 30), Some(50));
+    }
+
+    #[test]
+    fn cursor_next_advance_interleaved_matches_reference() {
+        // mixed containers across buckets: array(0), run(1), bitset(2),
+        // run(3), array(4), multi-run(5) — runs of 4000/5000 consecutive,
+        // scattered dense, and short separated stretches (4 runs/100 values)
+        let mut docs = shaped_docs(&mut Rng(17), &[(0, 100), (2, 6000), (4, 30)]);
+        docs.extend(65_536..70_536u32); // bucket 1: consecutive -> Run
+        docs.extend(200_000..205_000u32); // bucket 3: consecutive -> Run
+        let base = 5u32 << 16;
+        for off in [0u32, 1000, 5000, 30000] {
+            docs.extend(base + off..base + off + 100); // bucket 5: 4-run Run
+        }
+        docs.sort_unstable();
+        docs.dedup();
+        let b = RoaringBitmap::from_sorted_docs(&docs);
+
+        // single cursor, random interleaving of next and (forward-only)
+        // advance, checked against a linear-scan reference model
+        let mut cur = b.cursor();
+        let mut idx = 0usize; // reference: next unconsumed position in docs
+        let mut last: Option<u32> = None;
+        let mut rng = Rng(23);
+        for step in 0..800 {
+            let do_next = rng.below(2) == 0;
+            let target = match last {
+                None => rng.below(1000),
+                Some(l) => l + 1 + rng.below(500),
+            };
+            let got = if do_next {
+                b.cursor_next(&mut cur)
+            } else {
+                b.cursor_advance(&mut cur, target)
+            };
+            if !do_next {
+                idx = idx.max(docs.partition_point(|&d| d < target));
+            }
+            let want = docs.get(idx).copied();
+            if want.is_some() {
+                idx += 1;
+            }
+            assert_eq!(got, want, "step {step}");
+            if got.is_some() {
+                last = got;
+            }
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_structural_violations() {
+        /// Recomputes the trailing crc32 so ONLY a structural check can
+        /// reject the bytes (a plain bit-flip is always caught by the crc).
+        fn with_fresh_crc(mut bytes: Vec<u8>) -> Vec<u8> {
+            let n = bytes.len();
+            let crc = crc32fast::hash(&bytes[..n - 4]);
+            bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+            bytes
+        }
+
+        // array with non-ascending elements (sole guard: the ascending
+        // check) — layout: magic[0..4] ver[4] df[5] card[6] ncont[7]
+        // key[8..10] type[10] card[11] elems[12..]
+        let b = RoaringBitmap::from_sorted_docs(&[10, 20, 30]);
+        let bytes = b.serialize(3);
+        assert_eq!(bytes[10], TYPE_ARRAY);
+        let mut bad = bytes.clone();
+        bad[14] = 5; // second element 20 -> 5: sequence 10,5,30
+        let bad = with_fresh_crc(bad);
+        assert!(RoaringBitmap::deserialize(&bad, 3).is_none());
+
+        // overlapping runs with the cardinality sum preserved (sole guard:
+        // the overlap check) — header as above but 2-byte vints (202) and a
+        // num_runs byte: runs start at [16], run 1 at [20..24]
+        let docs: Vec<u32> = (0..=100u32).chain(200..=300u32).collect();
+        let b = RoaringBitmap::from_sorted_docs(&docs);
+        let bytes = b.serialize(202);
+        assert_eq!(bytes[12], TYPE_RUN);
+        assert_eq!(bytes[15], 2); // num_runs
+        let mut bad = bytes.clone();
+        // second run (200,300) -> (50,150): overlaps the first, sum == 202
+        bad[20..22].copy_from_slice(&50u16.to_le_bytes());
+        bad[22..24].copy_from_slice(&150u16.to_le_bytes());
+        let bad = with_fresh_crc(bad);
+        assert!(RoaringBitmap::deserialize(&bad, 202).is_none());
+
+        // bitset with a flipped word (sole guard: popcount == card)
+        let scattered = shaped_docs(&mut Rng(7), &[(9, 6000)]);
+        let b = RoaringBitmap::from_sorted_docs(&scattered);
+        let n = scattered.len();
+        let bytes = b.serialize(n as u32);
+        assert_eq!(bytes[12], TYPE_BITSET);
+        let mut bad = bytes.clone();
+        bad[16] ^= 0xFF; // inside the first word of the bitset image
+        let bad = with_fresh_crc(bad);
+        assert!(RoaringBitmap::deserialize(&bad, n as u32).is_none());
     }
 }

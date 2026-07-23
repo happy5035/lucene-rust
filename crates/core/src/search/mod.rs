@@ -409,4 +409,121 @@ mod tests {
         assert_eq!(s.count(&Query::wildcard("nope", "*")).unwrap(), 0);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    fn schema_pos() -> Schema {
+        let mut s = Schema::new();
+        s.add(FieldSpec::keyword("level"));
+        s.add(FieldSpec::keyword("tid"));
+        s.add(FieldSpec::text_with_positions("message"));
+        s
+    }
+
+    fn pos_doc(level: &str, tid: &str, message: &str) -> Document {
+        let mut d = Document::new();
+        d.add("level", FieldValue::Keyword(level.to_string()));
+        d.add("tid", FieldValue::Keyword(tid.to_string()));
+        d.add("message", FieldValue::Text(message.to_string()));
+        d
+    }
+
+    fn write_phrase_corpus(root: &std::path::Path) {
+        let mut w = IndexWriter::create(root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let docs = [
+            "quick brown fox",       // 0: "quick brown" hit
+            "quick fox brown",       // 1: not adjacent
+            "quick quick brown",     // 2: only the 2nd quick aligns
+            "foo foo bar",           // 3: "foo foo" hit
+            "foo bar foo",           // 4: "foo foo" miss
+            "a b c",                 // 5: 3-term phrase hit
+            "a b",                   // 6
+            "c a b",                 // 7: "a b" hit
+        ];
+        for (i, m) in docs.iter().enumerate() {
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    #[test]
+    fn phrase_query_positions() {
+        let root = temp_dir("phrase");
+        write_phrase_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // adjacent / not-adjacent
+        let q = Query::phrase("message", &["quick", "brown"]);
+        assert_eq!(s.count(&q).unwrap(), 2);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![0, 2]);
+        let q = Query::phrase("message", &["quick", "fox"]);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![1]);
+        // same doc, multiple candidate occurrences, only one aligns
+        let q = Query::phrase("message", &["quick", "quick", "brown"]);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![2]);
+        // repeated term needs two adjacent occurrences
+        let q = Query::phrase("message", &["foo", "foo"]);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![3]);
+        // 3-term phrase
+        let q = Query::phrase("message", &["a", "b", "c"]);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![5]);
+        // cross-doc terms never merge
+        let q = Query::phrase("message", &["a", "b"]);
+        let (_, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(docs, vec![5, 6, 7]);
+        // reversed order misses
+        assert_eq!(s.count(&Query::phrase("message", &["brown", "quick"])).unwrap(), 0);
+        // single term degenerates to a Term query
+        let q = Query::phrase("message", &["quick"]);
+        assert_eq!(s.count(&q).unwrap(), 3);
+        // missing term -> no hits (not an error)
+        assert_eq!(s.count(&Query::phrase("message", &["quick", "nosuch"])).unwrap(), 0);
+        // unknown field -> no hits (not an error)
+        assert_eq!(s.count(&Query::phrase("message", &[])).unwrap(), 0);
+        assert_eq!(s.count(&Query::phrase("nope", &["a", "b"])).unwrap(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn phrase_query_requires_positions() {
+        // the M1 schema() has message as DOCS_AND_FREQS (no positions):
+        // phrase must fail fast, mirroring Java's execution-time error
+        let root = temp_dir("phrasefail");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        w.add_document(doc("INFO", "tid-0", "quick brown")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let err = s.count(&Query::phrase("message", &["quick", "brown"])).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // keyword field (DOCS) also fails
+        let err = s.count(&Query::phrase("level", &["INFO", "WARN"])).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn phrase_query_multi_segment() {
+        let root = temp_dir("phraseseg");
+        let mut w = IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        w.add_document(pos_doc("INFO", "tid-0", "quick brown")).unwrap();
+        w.commit().unwrap();
+        w.add_document(pos_doc("INFO", "tid-1", "brown quick")).unwrap();
+        w.add_document(pos_doc("INFO", "tid-2", "quick brown fox")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 2);
+        let q = Query::phrase("message", &["quick", "brown"]);
+        let (total, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(docs, vec![0, 2]);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

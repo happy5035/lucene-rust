@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
-use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PostingsReader};
+use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
@@ -72,6 +72,11 @@ impl SegmentReader {
         } else {
             self.postings.docs_and_freqs_no_freq(entry)
         }
+    }
+
+    /// EverythingEnum over a positions field (PhraseDocIter construction).
+    pub(crate) fn positions_enum(&self, entry: &TermEntry) -> io::Result<PositionsEnum> {
+        self.postings.positions(entry)
     }
 
     /// Look up a field info by name (for Boolean query construction).

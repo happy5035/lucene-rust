@@ -3,7 +3,7 @@
 
 use std::io;
 
-use super::doc_iter::{ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, SegmentDocIter};
+use super::doc_iter::{ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, SegmentDocIter};
 use super::multi_term;
 use super::segment_reader::SegmentReader;
 
@@ -16,6 +16,7 @@ pub enum Query {
     Terms { field: String, terms: Vec<Vec<u8>> },
     Prefix { field: String, prefix: Vec<u8> },
     Wildcard { field: String, pattern: Vec<u8> },
+    Phrase { field: String, terms: Vec<Vec<u8>> },
 }
 
 impl Query {
@@ -51,6 +52,14 @@ impl Query {
         Query::Wildcard {
             field: field.to_string(),
             pattern: pattern.as_bytes().to_vec(),
+        }
+    }
+
+    /// Exact phrase query (slop=0, spec M2 §6): consecutive offsets.
+    pub fn phrase(field: &str, terms: &[&str]) -> Query {
+        Query::Phrase {
+            field: field.to_string(),
+            terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect(),
         }
     }
 
@@ -158,6 +167,19 @@ impl Query {
                     return Ok(None);
                 };
                 multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)
+            }
+            Query::Phrase { field, terms } => {
+                if terms.is_empty() {
+                    return Ok(None);
+                }
+                if terms.len() == 1 {
+                    return Query::Term {
+                        field: field.clone(),
+                        term: terms[0].clone(),
+                    }
+                    .segment_iterator(seg, needs_freq);
+                }
+                Ok(PhraseDocIter::new(seg, field, terms)?.map(SegmentDocIter::Phrase))
             }
         }
     }

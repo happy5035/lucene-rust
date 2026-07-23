@@ -193,6 +193,31 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()>
     out.push_str(&format!("matchall count={count}\n"));
     let (_, docs) = searcher.top_docs(&Query::MatchAll, 20)?;
     out.push_str(&format!("matchall first20={}\n", doc_csv(&docs)));
+
+    // Boolean battery (search spec phase 3): "and" = BooleanQuery MUST+MUST,
+    // "or" = SHOULD+SHOULD. The message pair has a non-empty intersection in
+    // the log corpus (co-occurring tokens); level is single-valued per doc so
+    // INFO ∩ WARN is empty by construction. Mirrored in VerifySearchIndex.java.
+    let boolean_battery: [(&str, &str, [&str; 2]); 5] = [
+        ("and", "message", ["connection0", "query23"]),
+        ("and", "level", ["INFO", "WARN"]),
+        ("or", "message", ["connection0", "query23"]),
+        ("or", "message", ["connection0", "nosuchterm42"]),
+        ("and", "message", ["connection0", "nosuchterm42"]),
+    ];
+    for (op, field, terms) in boolean_battery {
+        let q = match op {
+            "and" => Query::and(field, &terms),
+            _ => Query::or(field, &terms),
+        };
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "{op} {field}={} count={count} first20={}\n",
+            terms.join(","),
+            doc_csv(&docs)
+        ));
+    }
     print!("{out}");
     Ok(())
 }

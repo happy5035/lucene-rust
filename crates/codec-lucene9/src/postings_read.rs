@@ -273,12 +273,33 @@ fn prefix_sum(buffer: &mut [u64], base: i64) {
     }
 }
 
-/// M1: linear advance (next_doc loop). Skip-data-driven advance arrives
-/// with Boolean conjunction (search spec phase 3).
-fn advance_linear(core: &mut EnumCore, target: i32) -> io::Result<i32> {
-    if core.doc >= target as i64 {
+/// Optimized advance: fast-path buffer scan when target is within the
+/// current decoded block, otherwise falls back to next_doc loop (which
+/// correctly handles block and level-1 transitions). Block-level skipping
+/// via level-0 skip entries is deferred to a later phase.
+fn advance(core: &mut EnumCore, target: i32) -> io::Result<i32> {
+    let t = target as u64;
+    if core.doc >= t as i64 {
         return Ok(core.doc as i32);
     }
+    if core.doc == NO_MORE_DOCS as i64 {
+        return Ok(NO_MORE_DOCS);
+    }
+    // Fast path: target is within the current decoded block
+    if t <= core.level0_last_doc as u64 && core.level0_last_doc > 0 {
+        let mut upto = core.doc_buffer_upto;
+        let buf_len = core.doc_buffer.len();
+        while upto < buf_len && core.doc_buffer[upto] < t {
+            upto += 1;
+        }
+        if upto < buf_len {
+            let d = core.doc_buffer[upto] as i64;
+            core.doc = d;
+            core.doc_buffer_upto = upto + 1;
+            return Ok(d as i32);
+        }
+    }
+    // Fallback: linear advance via next_doc
     loop {
         let d = core.next_doc()?;
         if d >= target {
@@ -302,7 +323,7 @@ impl DocsEnum {
     }
 
     pub fn advance(&mut self, target: i32) -> io::Result<i32> {
-        advance_linear(&mut self.core, target)
+        advance(&mut self.core, target)
     }
 }
 
@@ -321,7 +342,7 @@ impl DocsFreqsEnum {
     }
 
     pub fn advance(&mut self, target: i32) -> io::Result<i32> {
-        advance_linear(&mut self.core, target)
+        advance(&mut self.core, target)
     }
 
     /// PostingsEnum.freq(): current doc's term frequency.

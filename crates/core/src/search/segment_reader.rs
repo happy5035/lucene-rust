@@ -5,7 +5,7 @@
 use std::io;
 
 use codec_lucene9::directory::FSDirectory;
-use codec_lucene9::field_infos::{FieldInfos, IndexOptions};
+use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PostingsReader};
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict};
@@ -64,5 +64,10 @@ impl SegmentReader {
 
     pub(crate) fn docs_freqs_enum(&self, entry: &TermEntry) -> io::Result<DocsFreqsEnum> {
         self.postings.docs_and_freqs(entry)
+    }
+
+    /// Look up a field info by name (for Boolean query construction).
+    pub(crate) fn field_info(&self, name: &str) -> Option<&FieldInfo> {
+        self.field_infos.by_name(name)
     }
 }

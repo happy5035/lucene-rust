@@ -73,6 +73,33 @@ public class VerifySearchIndex {
                 for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
                 out.append("matchall first20=").append(b).append('\n');
             }
+
+            // Boolean battery (search spec phase 3): "and" = MUST+MUST,
+            // "or" = SHOULD+SHOULD. Same items/format as the boolean_battery
+            // in rustlucene-cli searchdump.
+            String[][][] battery = {
+                {{"and"}, {"message"}, {"connection0", "query23"}},
+                {{"and"}, {"level"}, {"INFO", "WARN"}},
+                {{"or"}, {"message"}, {"connection0", "query23"}},
+                {{"or"}, {"message"}, {"connection0", "nosuchterm42"}},
+                {{"and"}, {"message"}, {"connection0", "nosuchterm42"}},
+            };
+            for (String[][] item : battery) {
+                String op = item[0][0], field = item[1][0];
+                BooleanClause.Occur occur = op.equals("and")
+                    ? BooleanClause.Occur.MUST : BooleanClause.Occur.SHOULD;
+                BooleanQuery.Builder bq = new BooleanQuery.Builder();
+                for (String t : item[2])
+                    bq.add(new TermQuery(new Term(field, t)), occur);
+                Query q = new ConstantScoreQuery(bq.build());
+                TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                StringBuilder b = new StringBuilder();
+                for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                out.append(op).append(' ').append(field).append('=')
+                   .append(String.join(",", item[2]))
+                   .append(" count=").append(s.count(q))
+                   .append(" first20=").append(b).append('\n');
+            }
         }
         System.out.print(out);
     }

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # M1 search diff: rustlucene-cli searchdump (Rust read path) vs
 # VerifySearchIndex (Java Lucene 9.12.3) over the same two indexes.
+# The battery (term/matchall + Boolean and/or items) is hardcoded in both
+# dumpers; this script diffs their full output line by line.
 # Called by interop/verify-log.sh after both indexes are built.
 # Usage: interop/verify-search.sh <rustIndexDir> <javaIndexDir> <numDocs> <seed>
 set -euo pipefail

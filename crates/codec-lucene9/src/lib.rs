@@ -7,7 +7,10 @@
 //! `FSDirectory::open_input`) for the search read path.
 //! All format details follow the 9.12.3 sources, cited per item.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so the single AVX2 kernel module can opt back
+// in with a module-level `allow` — see postings_ll/simd.rs for the safety
+// argument and the exact boundary of the unsafe code.
+#![deny(unsafe_code)]
 
 pub mod codec_util;
 pub mod directory;

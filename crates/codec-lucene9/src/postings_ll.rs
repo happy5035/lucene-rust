@@ -8,6 +8,12 @@ use std::io;
 
 use crate::io::{DataInput, DataOutput};
 
+/// AVX2 fast path for the ForUtil-family block decode (spec §4a) — see the
+/// module docs for the equivalence and safety arguments. x86_64-only; every
+/// other target takes the scalar reference path below.
+#[cfg(target_arch = "x86_64")]
+mod simd;
+
 #[cfg(test)]
 use crate::io::IndexOutput;
 
@@ -368,6 +374,14 @@ fn for_util_decode_primitive(
     primitive: u32,
 ) -> io::Result<()> {
     debug_assert!(bpv >= 1 && bpv <= 32);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // AVX2 fast path (spec §4a): bit-for-bit equivalent; returns false
+        // without touching the input when the CPU lacks AVX2.
+        if simd::try_decode(input, values, bpv, primitive)? {
+            return Ok(());
+        }
+    }
     let num_longs = BLOCK_SIZE * primitive as usize / 64;
     let num_longs_per_shift = (bpv * 2) as usize;
     let mut tmp = [0u64; BLOCK_SIZE / 2];

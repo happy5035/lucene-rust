@@ -396,6 +396,9 @@ fn searchbench(
     let mut group_p90: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
     let mut group_p99: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
     let mut group_counts: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+    // Per-group logical file-read volume during measured iterations
+    // (RL_IO_STATS-gated counters in the IndexInput layer).
+    let mut group_io: std::collections::BTreeMap<String, (u64, u64)> = std::collections::BTreeMap::new();
 
     // Global warmup: run each query once to prime page cache
     for (_, item) in &work {
@@ -412,6 +415,7 @@ fn searchbench(
 
         // Measurement iterations
         let mut latencies_ns = Vec::with_capacity(iter as usize);
+        let io0 = codec_lucene9::io::io_stats::snapshot();
         for _ in 0..iter {
             let t0 = Instant::now();
             let count = run_once(&mut searcher, item)?;
@@ -421,6 +425,10 @@ fn searchbench(
                 query_counts.push((detail_of(label, item), count));
             }
         }
+        let io1 = codec_lucene9::io::io_stats::snapshot();
+        let e = group_io.entry(label.clone()).or_default();
+        e.0 += io1.0 - io0.0;
+        e.1 += io1.1 - io0.1;
 
         latencies_ns.sort_unstable();
         let n = latencies_ns.len();
@@ -465,6 +473,15 @@ fn searchbench(
     eprintln!("\n# Per-query hit counts (for correctness verification vs Java)");
     for (label, count) in &query_counts {
         eprintln!("{label}\t{count}");
+    }
+
+    // Logical file-read volume per group during measured iterations (IndexInput
+    // refills; includes page-cache hits, like /proc rchar).
+    if codec_lucene9::io::io_stats::enabled() {
+        eprintln!("\n# IO stats (RL_IO_STATS): logical bytes read from files, measured iterations only");
+        for (group, (bytes, calls)) in &group_io {
+            eprintln!("io\t{group}\tread_bytes={bytes}\tread_calls={calls}");
+        }
     }
 
     Ok(())

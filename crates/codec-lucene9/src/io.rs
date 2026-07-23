@@ -596,6 +596,33 @@ impl DataOutput for ChecksumIndexOutput {
 /// BufferedIndexInput.BUFFER_SIZE :32).
 const INPUT_BUFFER_CAPACITY: usize = 1 << 13;
 
+/// Optional process-wide IO counters (observability feature for benchmarks):
+/// when the `RL_IO_STATS` env var is set to anything but "0", every `refill`
+/// from a file source adds its byte count here — the logical read volume the
+/// process pulls through `IndexInput` (page-cache hits included, like rchar).
+/// Disabled cost is one relaxed atomic load per refill.
+pub mod io_stats {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: std::sync::Once = std::sync::Once::new();
+    pub static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static READ_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        INIT.call_once(|| {
+            let on = std::env::var_os("RL_IO_STATS").map(|v| v != "0").unwrap_or(false);
+            ENABLED.store(on, Ordering::Relaxed);
+        });
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// (bytes, calls) read so far.
+    pub fn snapshot() -> (u64, u64) {
+        (READ_BYTES.load(Ordering::Relaxed), READ_CALLS.load(Ordering::Relaxed))
+    }
+}
+
 enum InputSource {
     /// Positional reads at `base + pos`; slices share the file handle via
     /// `try_clone` and shift `base` (std::os::unix::fs::FileExt::read_at).
@@ -707,6 +734,11 @@ impl IndexInput {
         let n = INPUT_BUFFER_CAPACITY.min((self.length - self.position) as usize);
         match &self.source {
             InputSource::File { file, base } => {
+                if io_stats::enabled() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    io_stats::READ_BYTES.fetch_add(n as u64, Relaxed);
+                    io_stats::READ_CALLS.fetch_add(1, Relaxed);
+                }
                 file.read_at(&mut self.buffer[..n], base + self.position)?;
             }
             InputSource::Memory(bytes) => {

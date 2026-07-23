@@ -46,6 +46,14 @@ with Roaring bitmaps*）。
   cardinality + payload offset/len；flush 天然字典序）+ payload 区。
   - cardinality 存 term 表 → **count 查询连 payload 都不用加载**。
   - term 表有序 → 读侧二分定位；前缀连续区间为将来 multi-term 集成留口。
+- **为什么 bitmap 不是 FST/terms-dict 元数据，term 如何找到 bitmap**（2026-07-24 细化）：
+  `.tim/.tip` 是被 `.si` 引用的 codec 文件，BlockTree FST output 是 Java 端固定 schema
+  （MSB VLong 链编码 docStartFP/posStartFP/payStartFP/skipOffset，Java 侧
+  `FieldReader.readVLongOutput` 按固定格式解码）；往 output 里塞 bitmap offset 会让
+  Java 字典解析错乱——bitmap 无法挂靠 Lucene 字典，只能完全新增、自带索引。df≥4096
+  门槛把 bitmap term 数卡在 ≤ field posting 总数/4096（20 万 doc 段每 field 数十~
+  数百条，整表 KB 级），open 全量载入内存二分查找，开销可忽略，无需 FST。查询路径上
+  block-tree seek（拿 df 与 fallback postings fp）本来就要做，sidecar 只多一次内存二分。
 
 ## 4a. sidecar 文件兼容性契约（2026-07-24 细化，Lucene 9.12.3 源码核实）
 

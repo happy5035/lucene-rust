@@ -233,7 +233,9 @@ fn doc_csv(docs: &[i32]) -> String {
 
 /// Search benchmark following luceneutil methodology: open index, run term
 /// queries against sampled terms (bucketed by docFreq), measure QPS and
-/// latency percentiles. M1 only supports Term / MatchAll queries.
+/// latency percentiles. AND/OR term pairs recorded by Java SearchBench
+/// --dump-queries are replayed verbatim (no sampling) so both sides run the
+/// exact same Boolean query set.
 ///
 /// Uses Java SearchBench --dump-queries output as query source.
 /// Output is tab-separated: query_type freq qps p50_us p90_us p99_us count
@@ -276,6 +278,25 @@ fn searchbench(
         std::process::exit(2);
     }
 
+    // AND/OR term pairs dumped by Java SearchBench: (op, bucket, term1, term2)
+    let bool_tasks: Vec<(String, String, String, String)> = content
+        .lines()
+        .filter(|l| l.starts_with("AND\t") || l.starts_with("OR\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 4 {
+                Some((
+                    parts[0].to_lowercase(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Classify into freq buckets (luceneutil convention)
     let low_limit = 10u32;
     let med_limit = (max_doc as u32 / 100).max(11);
@@ -298,16 +319,47 @@ fn searchbench(
     shuffle_sample(&mut med_terms);
     shuffle_sample(&mut high_terms);
 
-    // Build work list: (label, term_str)
-    let mut work: Vec<(String, String)> = Vec::new();
-    for t in &low_terms { work.push((format!("term\tlow"), t.1.clone())); }
-    for t in &med_terms { work.push((format!("term\tmed"), t.1.clone())); }
-    for t in &high_terms { work.push((format!("term\thigh"), t.1.clone())); }
+    // Build work list: (label, item)
+    enum WorkItem {
+        Term(String),
+        And(String, String),
+        Or(String, String),
+    }
+    let mut work: Vec<(String, WorkItem)> = Vec::new();
+    for t in &low_terms { work.push(("term\tlow".to_string(), WorkItem::Term(t.1.clone()))); }
+    for t in &med_terms { work.push(("term\tmed".to_string(), WorkItem::Term(t.1.clone()))); }
+    for t in &high_terms { work.push(("term\thigh".to_string(), WorkItem::Term(t.1.clone()))); }
+    // AND/OR items are used verbatim, in file order (no sampling), so they
+    // line up one-to-one with the Java SearchBench --load-queries run.
+    for (op, bucket, t1, t2) in &bool_tasks {
+        let item = if op == "and" {
+            WorkItem::And(t1.clone(), t2.clone())
+        } else {
+            WorkItem::Or(t1.clone(), t2.clone())
+        };
+        work.push((format!("{op}\t{bucket}"), item));
+    }
 
     if work.is_empty() {
         eprintln!("searchbench: no terms after sampling");
         std::process::exit(2);
     }
+
+    let build_query = |item: &WorkItem| -> Query {
+        match item {
+            WorkItem::Term(t) => Query::term(field, t),
+            WorkItem::And(a, b) => Query::and(field, &[a.as_str(), b.as_str()]),
+            WorkItem::Or(a, b) => Query::or(field, &[a.as_str(), b.as_str()]),
+        }
+    };
+    // Correctness line matching the Java SearchBench stderr format verbatim.
+    let detail_of = |label: &str, item: &WorkItem| -> String {
+        match item {
+            WorkItem::Term(t) => format!("term={t} bucket={label}"),
+            WorkItem::And(a, b) => format!("and t1={a} t2={b} bucket={label}"),
+            WorkItem::Or(a, b) => format!("or t1={a} t2={b} bucket={label}"),
+        }
+    };
 
     // Per-group aggregation
     let mut group_qps: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
@@ -317,15 +369,15 @@ fn searchbench(
     let mut group_counts: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
 
     // Global warmup: run each query once to prime page cache
-    for (_, term) in &work {
-        let q = Query::term(field, term);
+    for (_, item) in &work {
+        let q = build_query(item);
         let _ = searcher.count(&q);
     }
 
-    let mut term_counts: Vec<(String, u64)> = Vec::with_capacity(work.len());
+    let mut query_counts: Vec<(String, u64)> = Vec::with_capacity(work.len());
 
-    for (label, term) in &work {
-        let q = Query::term(field, term);
+    for (label, item) in &work {
+        let q = build_query(item);
 
         // Warmup iterations
         for _ in 0..warmup {
@@ -340,7 +392,7 @@ fn searchbench(
             latencies_ns.push(t0.elapsed().as_nanos() as u64);
             // Store count from last iteration for correctness check
             if latencies_ns.len() == iter as usize {
-                term_counts.push((format!("term={term} bucket={label}"), count));
+                query_counts.push((detail_of(label, item), count));
             }
         }
 
@@ -360,7 +412,7 @@ fn searchbench(
         group_p50.entry(label.clone()).or_default().push(p50);
         group_p90.entry(label.clone()).or_default().push(p90);
         group_p99.entry(label.clone()).or_default().push(p99);
-        group_counts.entry(label.clone()).or_default().push(term_counts.last().unwrap().1);
+        group_counts.entry(label.clone()).or_default().push(query_counts.last().unwrap().1);
     }
 
     // Print results header
@@ -383,9 +435,9 @@ fn searchbench(
         );
     }
 
-    // Print per-term counts for correctness diff (compare with Java SearchBench)
-    eprintln!("\n# Per-term hit counts (for correctness verification vs Java)");
-    for (label, count) in &term_counts {
+    // Print per-query counts for correctness diff (compare with Java SearchBench)
+    eprintln!("\n# Per-query hit counts (for correctness verification vs Java)");
+    for (label, count) in &query_counts {
         eprintln!("{label}\t{count}");
     }
 

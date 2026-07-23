@@ -25,6 +25,15 @@ import org.apache.lucene.util.BytesRef;
  *   and   — 2–3 terms, BooleanQuery MUST
  *   or    — 2–3 terms, BooleanQuery SHOULD (minShouldMatch=1)
  *
+ * Query file format (--dump-queries output, --load-queries input):
+ *   TERM\t<bucket>\t<term>\t<docFreq>
+ *   AND\t<bucket>\t<term1>\t<term2>   (tasks pairs per bucket)
+ *   OR\t<bucket>\t<term1>\t<term2>    (tasks pairs per bucket)
+ * --load-queries replays AND/OR lines verbatim (MUST+MUST / SHOULD+SHOULD
+ * msm=1, both wrapped in ConstantScoreQuery) when present, and only falls
+ * back to self-sampling when the file has none — so Java and the Rust
+ * searchbench run the exact same Boolean query set.
+ *
  * Terms are sampled from the index dictionary and bucketed by docFreq:
  *   low   — docFreq ≤ 10
  *   med   — 10 < docFreq ≤ 1% maxDoc
@@ -228,6 +237,22 @@ public class SearchBench {
                                     bucketLabel(bucket), ts.term.utf8ToString(), ts.docFreq);
                         }
                     }
+                    // AND/OR term pairs, mirroring the --load-queries generation
+                    // logic (2 terms per query, `tasks` queries per bucket).
+                    for (FreqBucket bucket : FreqBucket.values()) {
+                        List<TermStats> sample = buckets.get(bucket);
+                        if (sample.size() < 2) continue;
+                        for (int i = 0; i < tasks; i++) {
+                            String t1 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String t2 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            pw.printf(Locale.ROOT, "AND\t%s\t%s\t%s%n", bucketLabel(bucket), t1, t2);
+                        }
+                        for (int i = 0; i < tasks; i++) {
+                            String t1 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String t2 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            pw.printf(Locale.ROOT, "OR\t%s\t%s\t%s%n", bucketLabel(bucket), t1, t2);
+                        }
+                    }
                 }
                 System.out.println("DUMPED terms to " + dumpQueriesFile);
                 return;
@@ -237,16 +262,22 @@ public class SearchBench {
                 // --- load queries from a previous --dump-queries run ---
                 Map<FreqBucket, List<String>> loadedTerms = new EnumMap<>(FreqBucket.class);
                 for (FreqBucket b : FreqBucket.values()) loadedTerms.put(b, new ArrayList<>());
+                // AND/OR lines: {op, bucketLabel, term1, term2}, kept in file order
+                List<String[]> loadedBool = new ArrayList<>();
                 for (String line : Files.readAllLines(Paths.get(loadQueriesFile))) {
-                    if (line.startsWith("TERM\t")) {
-                        String[] parts = line.split("\t");
+                    String[] parts = line.split("\t");
+                    if (parts[0].equals("TERM") && parts.length >= 3) {
                         FreqBucket bucket = FreqBucket.valueOf(parts[1].toUpperCase());
                         loadedTerms.get(bucket).add(parts[2]);
+                    } else if ((parts[0].equals("AND") || parts[0].equals("OR")) && parts.length >= 4) {
+                        loadedBool.add(new String[]{
+                                parts[0].toLowerCase(Locale.ROOT), parts[1], parts[2], parts[3]});
                     }
                 }
                 // Build queries using the loaded terms
                 List<Query> queries = new ArrayList<>();
                 List<String> labels = new ArrayList<>();
+                List<String> details = new ArrayList<>();
                 for (FreqBucket bucket : FreqBucket.values()) {
                     List<String> terms = loadedTerms.get(bucket);
                     if (terms.isEmpty()) continue;
@@ -254,26 +285,48 @@ public class SearchBench {
                         String t = terms.get(rng.nextInt(terms.size()));
                         queries.add(new ConstantScoreQuery(new TermQuery(new Term(field, t))));
                         labels.add("term\t" + bucketLabel(bucket));
+                        details.add("term=" + t + " bucket=term\t" + bucketLabel(bucket));
                     }
+                    if (!loadedBool.isEmpty()) continue;  // AND/OR replayed from file below
                     // AND queries: pick 2 terms from this bucket
                     for (int i = 0; i < tasks && terms.size() >= 2; i++) {
+                        String t1 = terms.get(rng.nextInt(terms.size()));
+                        String t2 = terms.get(rng.nextInt(terms.size()));
                         BooleanQuery.Builder b = new BooleanQuery.Builder();
-                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, terms.get(rng.nextInt(terms.size()))))), BooleanClause.Occur.MUST);
-                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, terms.get(rng.nextInt(terms.size()))))), BooleanClause.Occur.MUST);
+                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t1))), BooleanClause.Occur.MUST);
+                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t2))), BooleanClause.Occur.MUST);
                         queries.add(new ConstantScoreQuery(b.build()));
                         labels.add("and\t" + bucketLabel(bucket));
+                        details.add("and t1=" + t1 + " t2=" + t2 + " bucket=and\t" + bucketLabel(bucket));
                     }
                     // OR queries
                     for (int i = 0; i < tasks && terms.size() >= 2; i++) {
+                        String t1 = terms.get(rng.nextInt(terms.size()));
+                        String t2 = terms.get(rng.nextInt(terms.size()));
                         BooleanQuery.Builder b = new BooleanQuery.Builder();
-                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, terms.get(rng.nextInt(terms.size()))))), BooleanClause.Occur.SHOULD);
-                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, terms.get(rng.nextInt(terms.size()))))), BooleanClause.Occur.SHOULD);
+                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t1))), BooleanClause.Occur.SHOULD);
+                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t2))), BooleanClause.Occur.SHOULD);
                         b.setMinimumNumberShouldMatch(1);
                         queries.add(new ConstantScoreQuery(b.build()));
                         labels.add("or\t" + bucketLabel(bucket));
+                        details.add("or t1=" + t1 + " t2=" + t2 + " bucket=or\t" + bucketLabel(bucket));
                     }
                 }
-                runAndPrint(searcher, queries, labels, warmup, iterations);
+                // AND/OR lines from the file take precedence over self-sampling:
+                // build the queries exactly as recorded, in file order.
+                for (String[] p : loadedBool) {
+                    String op = p[0], bl = p[1], t1 = p[2], t2 = p[3];
+                    BooleanQuery.Builder b = new BooleanQuery.Builder();
+                    BooleanClause.Occur occur = op.equals("and")
+                            ? BooleanClause.Occur.MUST : BooleanClause.Occur.SHOULD;
+                    b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t1))), occur);
+                    b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t2))), occur);
+                    if (op.equals("or")) b.setMinimumNumberShouldMatch(1);
+                    queries.add(new ConstantScoreQuery(b.build()));
+                    labels.add(op + "\t" + bl);
+                    details.add(op + " t1=" + t1 + " t2=" + t2 + " bucket=" + op + "\t" + bl);
+                }
+                runAndPrint(searcher, queries, labels, details, warmup, iterations);
                 return;
             }
 
@@ -286,6 +339,11 @@ public class SearchBench {
 
     static void runAndPrint(IndexSearcher searcher, List<Query> queries, List<String> labels,
                             int warmup, int iterations) throws Exception {
+        runAndPrint(searcher, queries, labels, null, warmup, iterations);
+    }
+
+    static void runAndPrint(IndexSearcher searcher, List<Query> queries, List<String> labels,
+                            List<String> details, int warmup, int iterations) throws Exception {
         // Global warmup: run all queries once to prime JIT and page cache
         for (Query q : queries) {
             runOnce(searcher, q);
@@ -304,6 +362,13 @@ public class SearchBench {
             aggP50.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p50us);
             aggP90.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p90us);
             aggP99.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p99us);
+            if (details != null) {
+                // Per-query hit count for correctness diffing against the Rust
+                // searchbench (which prints the same lines to stderr).
+                TotalHitCountCollector c = new TotalHitCountCollector();
+                searcher.search(queries.get(i), c);
+                System.err.printf(Locale.ROOT, "%s\t%d%n", details.get(i), c.getTotalHits());
+            }
         }
 
         // Print aggregated results

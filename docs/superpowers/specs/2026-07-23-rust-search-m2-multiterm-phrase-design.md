@@ -20,7 +20,7 @@ Terms 余项），本文档是该 spec 的 M2 切片细化。
 
 **明确不做**：自动机与 FST 求交（总 spec §8 留项）；fuzzy；slop>0；payload/offset 读；
 评分/norms/impact；NRT；query cache；bitmap postings（独立 M3，见
-`2026-07-23-rust-search-m3-roaring-sidecar-design.md`）。
+`2026-07-23-rust-search-m3-roaring-bitmap-design.md`）。
 
 ## 2. 前置事实（已核实的代码现状）
 

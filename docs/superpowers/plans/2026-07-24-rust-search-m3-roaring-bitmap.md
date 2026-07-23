@@ -1,24 +1,24 @@
-# M3 高 df term 的 Roaring bitmap sidecar Implementation Plan
+# M3 高 df term 的 Roaring bitmap（.doc 内联）Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在 M2（multi-term + phrase）之上新增 M3：segment flush 时对 df ≥ 4096 的 term 构建三容器 RoaringBitmap（array <4096 / bitset ≥4096 / runOptimize 后 run），写 per-segment sidecar 文件 `rbm<seg>.bin`（永不列入 segments_N/.si）；搜索时 Term/And/Or 按 spec §5 三档规则走 roaring 容器运算（档 1 全 bitmap、档 2 混合查询时物化、档 3 纯低 df 走既有 PFOR 不动）。自研容器子集（不引 roaring crate），标量先行、AVX2 等价追加；`make log-test` 加 `--bitmap` 第五变体全绿 + bitmap on/off searchdump diff 为空 + Java CheckIndex "No problems" 收尾。对应已批准 spec `docs/superpowers/specs/2026-07-23-rust-search-m3-roaring-sidecar-design.md` 的全部范围（含 §4a sidecar 兼容性契约——每条命名/GC/校验规则均为绑定）。
+**Goal:** 在 M2（multi-term + phrase）之上新增 M3：segment flush 时对 df ≥ 4096 的 term 构建三容器 RoaringBitmap（array <4096 / bitset ≥4096 / runOptimize 后 run），**内联写入 `.doc` 流**——每个 term 的 postings 之前、capture `docStartFP` 之前写 `[bitmap 头+payload+crc32][len: 4B LE]`，读侧由现有 FST output 的 `docStartFP` 定位（`docStartFP-4-len` 处），不改 FST output schema、不新增任何文件。读侧 Term/And/Or 按 spec §5 三档规则走 roaring 容器运算（档 1 全 bitmap、档 2 混合查询时物化、档 3 纯低 df 走既有 PFOR 不动）。自研容器子集（不引 roaring crate），标量先行、AVX2 等价追加；`make log-test` 加 `--bitmap` 第五变体全绿 + bitmap on/off searchdump diff 为空 + Java CheckIndex "No problems" + **Java forceMerge 后再对拍**收尾。对应已批准 spec `docs/superpowers/specs/2026-07-23-rust-search-m3-roaring-bitmap-design.md` 的全部范围（2026-07-24 内联修订版；旧 sidecar 契约整体作废，不再引用）。
 
-**Architecture:** 延续方案 C（算法语义照抄 9.12.3、对象结构 Rust 化）。roaring 容器库与 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）都在 codec 层（`crates/codec-lucene9/src/roaring.rs` + `roaring/simd.rs` + `bitmap_sidecar.rs`），core 层只拥有执行（三档规则、`RoaringDocIter`、查询时物化、And/Or 粘合），core 无任何 unsafe。sidecar 布局（自定格式，无需跨实现兼容）：CodecUtil 惯例 header（magic/version/segment id）+ segment name + maxDoc + field 分区表 + 每 field 有序 term 表 {term bytes, df, cardinality, payload offset/len} + payload 区 + footer crc32；open 只读 header + term 表（KB 级），payload 首触及才加载，count 查询只读 term 表。读侧自动探测 sidecar 存在性；Java merge 产出的 segment 无 sidecar → per-segment 自然落档 postings（Rust 无 merge，不做 merge 侧 bitmap 构建）。验证三层不变：容器/文件 round-trip 单测（codec）→ 三档语义测试（core `search/mod.rs`）→ Java diff 终验 + 三路 bench 报告（`--no-cache`）。
+**Architecture:** 延续方案 C（算法语义照抄 9.12.3、对象结构 Rust 化）。roaring 容器库（`crates/codec-lucene9/src/roaring.rs` + `roaring/simd.rs`）与存储方案无关；codec 同时拥有内联块 FORMAT：写侧 `PostingsWriter::write_term` 在 `doc_start_fp` capture 之前把 bitmap 块写进同一个 `ChecksumIndexOutput`（`.doc` footer CRC 因此自然覆盖 bitmap 字节，`CodecUtil.java:402-413`），读侧 `PostingsReader::inline_bitmap` 经 `docStartFP-4` 取 len、回退 len 字节取块，四重校验（len 有界 → magic → df==termState.df → crc32）任一失败**静默落档 postings**。core 只拥有执行（三档规则、`RoaringDocIter`、查询时物化、And/Or 粘合），core 无任何 unsafe。配置链：CLI/电池 → `IndexWriterConfig{bitmap, bitmap_threshold}` → `SegmentBuilder::with_bitmap` → `PostingsWriter::set_bitmap_threshold`。读侧自动探测（bitmap 块在不在由四重校验回答，不依赖任何元数据）；Java merge 经 PostingsEnum 重编码 → 产物天然无 bitmap、per-segment 自然落档（Rust 无 merge，无 GC 问题）。验证三层不变：容器/内联块 round-trip 单测（codec）→ 三档语义测试（core `search/mod.rs`）→ Java diff 终验 + forceMerge 实证 + 三路 bench 报告（`--no-cache`）。
 
-**Tech Stack:** Rust（codec crate edition 2024、core crate edition 2021；codec `#![deny(unsafe_code)]` + 仅 `postings_ll/simd.rs`、`roaring/simd.rs` 两个模块级 `#[allow(unsafe_code)]`，core `#![forbid(unsafe_code)]`，统一 `io::Result`）；不新增依赖（容器子集自研，spec §7）；Java 9.12.3（`interop/java/lib/lucene-core-9.12.3.jar`）做 diff 基准与 CheckIndex 终验；格式语义以 `reference/lucene-9.12.3/` 源码为准。
+**Tech Stack:** Rust（codec crate edition 2024、core crate edition 2021；codec `#![deny(unsafe_code)]` + 仅 `postings_ll/simd.rs`、`roaring/simd.rs` 两个模块级 `#[allow(unsafe_code)]`，core `#![forbid(unsafe_code)]`，统一 `io::Result`）；不新增依赖（crc32fast 已是 codec 依赖，bitmap crc32 与 footer CRC 同算法）；Java 9.12.3（`interop/java/lib/lucene-core-9.12.3.jar`）做 diff 基准、CheckIndex 与 forceMerge 实证；格式语义以 `reference/lucene-9.12.3/` 源码为准。
 
 ## Global Constraints
 
-（摘自 spec §3/§4a/§5/§6/§7 与既有项目惯例，逐字或就近转述；所有 Task 共同遵守）
+（摘自 spec §2/§3/§4/§4a/§5/§6/§7 与既有项目惯例，逐字或就近转述；所有 Task 共同遵守）
 
-- **df 阈值 4096**：`DEFAULT_BITMAP_THRESHOLD = 4096`（对齐 level-1 skip 粒度 32×128，spec §3），`--bitmap-threshold N` 可调。
-- **`--bitmap` 默认 off**（spec §3 实验期开关）；读侧自动探测 sidecar 存在性，CLI `--no-bitmap` 只用于同一索引上的 bench A/B。
+- **postings 主格式不动、不新增任何文件**（spec §2）：bitmap 不带 freq/positions，postings 永远保留，bitmap 只是附加字节，内联在 `.doc` 流内每个 term 的 postings 之前。Java 读写零感知，写侧 interop 与 diff 电池不受影响。
+- **内联布局不变量**（spec §4/§4a，绑定）：bitmap 块 `[magic(4B LE) + version(1B) + df(vInt) + cardinality(vInt) + payload + crc32(4B LE)]` + 4B LE len（= 头+payload+crc32 总字节）写于 `docStartFP` capture **之前**；`docStartFP` 仍指向 postings 起点，**FST output schema 不动**；读侧四重校验（len 有界按 maxDoc 推算 + 块不越入 header 区 → magic → `df == termState.df` → crc32），任一失败**静默落档 postings**，查询永不报错；Java merge 产物自然无 bitmap；CFS/addIndexes 字节拷贝 bitmap 存活；Rust 无 merge，无 GC。
+- **df 阈值 4096**：`DEFAULT_BITMAP_THRESHOLD = 4096`（对齐 level-1 skip 粒度 32×128，spec §3），`--bitmap-threshold N` 可调。**`--bitmap` 默认 off**（实验期开关）；读侧自动探测，CLI `--no-bitmap` 只用于同一索引上的 bench A/B。
 - **不新增 crate 依赖**（spec §7：自研容器子集 ~500–700 行含测试；现有依赖 crc32fast/lz4/rand/serde_json 不动）。
-- **sidecar 命名 `rbm<seg>.bin`**（segment `_7` → `rbm_7.bin`，spec §4a.3）；**永不列入 `.si` files 集合**（§4a.2）；**Rust 侧 GC** 按 §4a.4：IndexWriter open 时与 flush 后 listAll，删除 `rbm` 前缀且 segment 名不在 live segments 的文件。
 - **unsafe 边界**：codec crate 保持 `#![deny(unsafe_code)]`，模块级 `#[allow(unsafe_code)]` 只出现在既有 `crates/codec-lucene9/src/postings_ll/simd.rs` 与新增 `crates/codec-lucene9/src/roaring/simd.rs`（分发/安全论证模式照搬前者）；core crate 保持 `#![forbid(unsafe_code)]`——core 任何新代码不得引入 unsafe。
 - **commit message 前缀**：`feat:` / `test:` / `bench:` / `docs:`（沿用 git log 现有风格）。
-- **验收门槛**：`make log-test` 全部变体绿（既有四变体 seed 42 默认 / 43 `--positions` / 44 `--sparse` / 45 `--bigdict`，加新第五变体 seed 46 `--bitmap`）+ bitmap on/off searchdump diff 为空 + Java CheckIndex 对带 sidecar 的索引 "No problems"（且 CheckIndex 运行后 sidecar 文件仍在、字节不变，§4a.3/5）。
+- **验收门槛**：`make log-test` 全部变体绿（既有四变体 seed 42 默认 / 43 `--positions` / 44 `--sparse` / 45 `--bigdict`，加新第五变体 seed 46 `--bitmap`）+ bitmap on/off searchdump diff 为空 + Java CheckIndex 对带内联 bitmap 的索引 "No problems" + **Java forceMerge 该索引后 Java↔Rust 再对拍**（merge 产物无 bitmap 自然落档、结果不变，spec §8）。
 - **Rust edition 分工**：`crates/codec-lucene9` edition 2024，`crates/core` edition 2021（各自 Cargo.toml 已声明，新增代码遵守，不得改动）。
 - **测试命令**：codec 层 `cargo test -p codec-lucene9 <test名>`，core 层 `cargo test -p rustlucene-core <test名>`；`make log-test` 较慢，只在 T6 电池任务与最终收尾使用。
 - **Lucene 语义照抄**：执行语义逐行对照 9.12.3 源码，关键决策在代码注释中给 `File.java:line` 引用（Java 源码在 `reference/lucene-9.12.3/lucene/core/src/java/org/apache/lucene/`，下文引用省略该前缀；§4a 的引用逐条沿用 spec）。
@@ -38,22 +38,22 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ## 关键设计事实（本计划全部代码的字节级依据，已逐项对照 spec §4a 引用与本仓库源码核实）
 
-1. **构建钩子点**（spec §4）：flush 时 term 的 docs 全量切片本就在内存——`crates/core/src/segment_builder.rs:161-169` 的 term 循环把 `&pb.docs` 交给 `PostingsWriter::write_term`（`crates/codec-lucene9/src/postings.rs:338-346`，`debug_assert` 升序）。M3 在同一循环体内、`df >= threshold` 时顺手 `RoaringBitmap::from_sorted_docs(&pb.docs)`，O(df) CPU、零额外 IO。字段按 field number 顺序、term 按字典序到达（`dict.sorted_ids()`），sidecar term 表天然有序。
-2. **命名/托管命名空间契约**（§4a.2/3，绑定）：`rbm<seg>.bin` 不匹配 `IndexFileNames.java:199` 的 `CODEC_FILE_PATTERN = _[a-z0-9]+(_.*)?\..*`（首字符不是 `_`），也不以 `segments`/`pending_segments` 开头 → `IndexFileDeleter.java:146-151` 完全不 track（先例：write.lock 正是靠在命名空间之外而存活）。`.si` files 集合被持久化并被 Java 用于 CFS 打包与引用计数（`IndexWriter.java:5876-5900`）→ sidecar 永不列入。反例警戒：`_7.rbm` 会被下一次 Java IndexWriter open 删除（`IndexFileDeleter.java:226-236`），`_7_rust.bitmap` 还会 gen 膨胀（`IndexFileDeleter.java:314-321`）。
-3. **必须独立文件 + CheckIndex 零感知**（§4a.1/5）：codec 文件 footer CRC 覆盖全文件且 `validateFooter` 显式拒绝尾随字节（`CodecUtil.java:572-580`），header magic 拒绝前置字节（`CodecUtil.java:46,182`）——向任何现有文件追加/嵌入 = Java 读即 CorruptIndexException。CheckIndex 只枚举 `segments*` 文件、per-segment 只查 `.si` 引用集（`CheckIndex.java:599,618-623,986-1025`），自身从不删除文件 → 带 sidecar 的索引仍 "No problems were detected"（`CheckIndex.java:916-917`）。
-4. **绑定与失效兜底**（§4a.6）：sidecar header 记 {magic, version, segment name, maxDoc}，footer crc32；term 表记 df/cardinality。读侧 open 校验 segment 名 + maxDoc；term 级要求 cardinality == postings df（读侧本就知道 df）。任一不匹配 → 静默丢弃该 bitmap、落档 postings（§5 档 2/3），查询永不受坏 sidecar 影响。
-5. **CodecUtil 惯例**：本项目 codec 文件 header/footer 走 `crates/codec-lucene9/src/codec_util.rs` 的 `write_index_header`（BE magic + codec 名 + BE version + 16B id + suffix）与 `write_footer`（BE FOOTER_MAGIC + algorithmID 0 + CRC32，覆盖全文件）；文件 body 一律 LE（`io.rs` 的 write_short/write_long）。sidecar 同惯例（codec 名 `RustRbmSidecar`，version 0，suffix `""`）；读侧用 `check_index_header` + `check_footer_structure`（`crates/codec-lucene9/src/postings_read.rs:62-72` 同模式）。payload offset 相对 payload 区起点 → term 表可先写、无循环依赖。
-6. **三档钩子点**（spec §5）：`crates/core/src/search/query.rs` Term 分支（`query.rs:126-137`）、And 分支（:138-161）、Or 分支（:162-187）——档判定在每个分支 seek 完 term 之后、构造现有 iterator 之前；档 3（无任何子句有 bitmap）完全走既有 `ConjunctionDocIter`/`DisjunctionDocIter`（df 升序排序、lead 选择保持不动，M1 合取已调优）。规则 per-segment 独立生效（M1 既定 per-segment 执行）。
-7. **needs_freq 纪律**：bitmap 不带 freq（spec §2）——roaring 分支只在 `!needs_freq` 时进入。`Searcher::freq_sum` 的 Term 短路走 `total_term_freq`（`crates/core/src/search/searcher.rs:113-121`）本就不需要迭代；And/Or 的 `freq()` 本来就是 placeholder（`crates/core/src/search/doc_iter.rs:218-223,301-310`），唯一需要 freq 的 collector（FreqSumCollector）拒收 And/Or（`searcher.rs:106-112`）。
-8. **count 路径**：Term 的 `Searcher::count` 已是 O(1)（`searcher.rs:61-69` 直接加 doc_freq），roaring 不改变它；收益在迭代路径（top_docs/search 驱动、searchbench iterm）与 And/Or 的 CountCollector 迭代。term 表的 cardinality 让 sidecar 的 count 连 payload 都不用加载（spec §4）。
-9. **查询时物化同源**（spec §5 档 2）：M2 的 `multi_term::materialize`（`crates/core/src/search/multi_term.rs:275-303`）用 no-freq enum 升序全扫置位；M3 的 `materialize_roaring` 用**同一扫描纪律**（no-freq enum、升序收集）产出 `RoaringBitmap`。档 2 中被物化的子句 df < 4096 → 成本 ≤4095 doc ≈ 32 个 PFOR 块，有界微秒级。
-10. **容器语义**（spec §4，照 Roaring 论文 Chambi et al.）：doc 按高 16 位分桶；桶内 cardinality < 4096 → array 容器（u16 有序数组），≥ 4096 → bitset 容器（1024 u64 = 8KB）；构建后与每次 and/or 后 runOptimize（连续区间转 run 容器；按序列化体积判定：run 2+4R bytes vs array 2C bytes vs bitset 8192 bytes，小者胜）。交/并容器对分发（spec §5）：array∩array galloping、bitset∩bitset 字运算 + popcount、run∩run 双指针；Or 对偶。结果仍是 roaring，直接迭代，不物化成数组；空容器立即丢弃。
-11. **AVX2 纪律**（spec §6）：先标量参考实现（容器交/并/popcount），AVX2 快路径作等价追加。x86 AVX2 **无 VPOPCNT**（那是 AVX-512）→ popcount 用 nibble-LUT + PSADBW（Muła 惯用法）。运行时分发 + `RL_SIMD=0` kill switch + OnceLock 缓存照抄 `crates/codec-lucene9/src/postings_ll/simd.rs:52-62`；对拍单测钉死"标量 vs SIMD 逐位相等"；bench 数据门槛见 T6。
-12. **log 语料 df 量级**（估计，决定电池/bench 覆盖面）：`gen_message` 200 字节 ≈ 25–33 token/doc，词表 60×40+5 = 2405 → 200k 文档时 message term df ≈ 2–3k < 4096，`make log-test` 的 `--bitmap` 变体的 sidecar 只覆盖 level 字段（df ≈ 40k ≥ 4096；term level=X 的 top20 与 and level=INFO,WARN 走 roaring）。档 2 混合场景由 T5 单测覆盖（小阈值人造语料）。bench 用 1M 文档（message term df ≈ 13.7k ≥ 4096）做 message 高 df AND/OR/iterm 三路对比。
-13. **电池接线**：`interop/verify-log.sh` 目前把第三参（变体旗标）同时透传给 logwrite、JavaLogBench 与 verify-search.sh。`--bitmap` 是 Rust 私有旗标：JavaLogBench 对未知旗标静默忽略（`interop/java/JavaLogBench.java:73-76`，仅 if-equals 判断、无 else 报错），但 verify-search.sh 会把它传给 searchdump → 必须在 verify-log.sh 内把传给 verify-search.sh 的旗标过滤为仅 `--positions`。VerifyLogIndex 不枚举目录文件（已核实源码无 listAll/文件集比对）→ rbm 文件对 Java 读侧零感知。
+1. **构建钩子点**（spec §4）：flush 时 term 的 docs 全量切片本就在内存——`crates/codec-lucene9/src/postings.rs:338` `PostingsWriter::write_term` 收 `docs: &[u32]`（`postings.rs:346` `debug_assert` 升序）；`postings.rs:354` `let doc_start_fp = self.doc_out.file_pointer();` 在 `.pos` 写出（:349-351）之后、`.doc` postings 写出（:357）之前。**bitmap 钩子就在 capture 之前**：`df >= threshold` 时 `write_inline_bitmap(docs)` 往同一个 `doc_out` 写 `[头+payload+crc32][len]`，O(df) CPU、零额外 IO。core 侧对应 `crates/core/src/segment_builder.rs:161-169` 的 term 循环调用点。
+2. **缝隙字节对 Java 隐形**（§4a.1）：postings reader 是纯 seek 式——读 term 永远 `docIn.seek(termState.docStartFP)` 起手（`Lucene912PostingsReader.java:436,809`），skip 导航也 seek 到算好的 fp（`level1DocEndFP`/`skip0EndFP`/`blockEndFP`，:526,559,997），读完 df 个 doc 即停；**从不顺序扫描，从不假设"term N+1 起点 == term N 结尾"**。bitmap 位于 docStartFP 之前的缝隙，永不被 Java 触及；Rust 自己的 `EnumCore` 同样纯 seek（`postings_read.rs:227` `c.doc_in.seek(entry.state.doc_start_fp)` + skip fp 自算），也不受缝隙影响。
+3. **CRC 与 CheckIndex**（§4a.2/3）：footer CRC 覆盖全流（`CodecUtil.java:402-413`）——bitmap 在流内、footer 之前经同一 `ChecksumIndexOutput` 写入，checkIntegrity 照常通过；`.psm` 的 `docLen` 在 `postings.rs:440` 于 footer 前 capture，自然包含 bitmap 字节。CheckIndex 的 term 枚举与 postings 抽查全走 seek 路径、目录零新增文件 → "No problems were detected"（`CheckIndex.java:916-917`；电池实证）。
+4. **FST output schema 不动 + len 尾缀定位**（spec §4 用户拍板）：BlockTree FST output 是 Java 端固定 schema（docStartFP/posStartFP/…），改它即破坏 Java 兼容；但无需改——`docStartFP` 本身就是定位器：读 `docStartFP-4` 处 4B LE len，回退 len 字节即 bitmap 区。写侧 `encode_term`（`postings.rs:87`）的 docStartFP delta 编码自然吸收增大的 fp（delta 变大仍是合法 VLong）。sidecar 方案的"有序 term 表 + 二分"整个不需要。
+5. **四重校验与静默落档**（spec §4/§5）：无 bitmap 时 `docStartFP-4` 处是上一 term postings 的任意字节。校验链：`0 < len ≤ max_bitmap_len(maxDoc)`（按 maxDoc 推算上限）且块不越入 `.doc` header 区 → magic 匹配 → `df == termState.df`（cardinality 同值构建）→ crc32 匹配。误判概率实际为零，任一失败静默落档 postings。**读侧不设 df 门槛**：threshold 是写时配置（`--bitmap-threshold` 可调），读侧无从得知，探测交给四重校验回答（§5 的"df≥4096"描述的是写侧覆盖面）。惰性：非 bitmap term 的探测只花 4B（+15B 头）小读，payload 只有校验通过后才读——open 不读任何 bitmap（§5 惰性加载）。
+6. **merge 安全**（§4a.4）：Java merge 经 PostingsEnum 逐 doc 重编码 postings → 新 segment 无 bitmap、自然落档（§5），无孤儿字节；CFS 打包 / addIndexes 是字节级拷贝 → bitmap 原样存活。Rust 自身无 merge，无 GC 问题。**注意**：Java 默认 merge 可能产出 CFS（compound file），Rust 读侧无 CFS 支持——电池的 ForceMerge 工具显式 `setUseCompoundFile(false)`（见事实 13）。
+7. **三档钩子点**（spec §5）：`crates/core/src/search/query.rs` Term 分支（`query.rs:126-137`）、And 分支（:138-161）、Or 分支（:162-187）——档判定在每个分支 seek 完 term 之后、构造现有 iterator 之前；档 3（无任何子句有 bitmap）完全走既有 `ConjunctionDocIter`/`DisjunctionDocIter`（df 升序排序、lead 选择保持不动，M1 合取已调优）。规则 per-segment 独立生效（M1 既定 per-segment 执行）。
+8. **needs_freq 纪律**：bitmap 不带 freq（spec §2/§5 "freq/freq_sum 永远走 postings"）——roaring 分支只在 `!needs_freq` 时进入。`Searcher::freq_sum` 的 Term 短路走 `total_term_freq`（`crates/core/src/search/searcher.rs:113-121`）本就不需要迭代；And/Or 的 `freq()` 本来就是 placeholder（`crates/core/src/search/doc_iter.rs:218-223,301-310`），唯一需要 freq 的 collector（FreqSumCollector）拒收 And/Or（`searcher.rs:106-112`）。
+9. **count 路径**：Term 的 `Searcher::count` 已是 O(1)（`searcher.rs:61-69` 直接加 `TermEntry.doc_freq`），roaring 不改变它——bitmap 头的 df/cardinality 字段服务于四重校验而非 count 读取（spec §4 "count 查询只读头" 在本读路径下无额外消费者，如实记录）。收益在迭代路径（top_docs/search 驱动、searchbench iterm）与 And/Or 的 CountCollector 迭代。
+10. **查询时物化同源**（spec §5 档 2）：M2 的 `multi_term::materialize`（`crates/core/src/search/multi_term.rs:275-303`）用 no-freq enum 升序全扫置位；M3 的 `materialize_roaring` 用**同一扫描纪律**（no-freq enum、升序收集）产出 `RoaringBitmap`。档 2 中被物化的子句 df < threshold → 成本 ≤4095 doc ≈ 32 个 PFOR 块，有界微秒级。
+11. **容器语义**（spec §4，照 Roaring 论文 Chambi et al.）：doc 按高 16 位分桶；桶内 cardinality < 4096 → array 容器（u16 有序数组），≥ 4096 → bitset 容器（1024 u64 = 8KB）；构建后与每次 and/or 后 runOptimize（连续区间转 run 容器；按序列化体积判定：run 2+4R bytes vs array 2C bytes vs bitset 8192 bytes，小者胜）。交/并容器对分发（spec §5）：array∩array galloping、bitset∩bitset 字运算 + popcount、run∩run 双指针；Or 对偶。结果仍是 roaring，直接迭代，不物化成数组；空容器立即丢弃。
+12. **AVX2 纪律**（spec §6）：先标量参考实现（容器交/并/popcount），AVX2 快路径作等价追加。x86 AVX2 **无 VPOPCNT**（那是 AVX-512）→ popcount 用 nibble-LUT + PSADBW（Muła 惯用法）。运行时分发 + `RL_SIMD=0` kill switch + OnceLock 缓存照抄 `crates/codec-lucene9/src/postings_ll/simd.rs:52-62`；对拍单测钉死"标量 vs SIMD 逐位相等"；bench 数据门槛见 T6。
+13. **log 语料 df 量级**（估计，决定电池/bench 覆盖面）：`gen_message` 200 字节 ≈ 25–33 token/doc，词表 60×40+5 = 2405 → 200k 文档时 message term df ≈ 2–3k < 4096，`make log-test` 的 `--bitmap` 变体的 bitmap 只覆盖 level 字段（df ≈ 40k ≥ 4096；term level=X 的 top20 与 and level=INFO,WARN 走 roaring）。档 2 混合场景由 T5 单测覆盖（小阈值人造语料）。bench 用 1M 文档（message term df ≈ 13.7k ≥ 4096）做 message 高 df AND/OR/iterm 三路对比。
+14. **电池接线**：`interop/verify-log.sh` 目前把第三参（变体旗标）同时透传给 logwrite、JavaLogBench 与 verify-search.sh。`--bitmap` 是 Rust 私有旗标：JavaLogBench 对未知旗标静默忽略（`interop/java/JavaLogBench.java:73-76`，仅 if-equals 判断、无 else 报错），但 verify-search.sh 会把它传给 searchdump → 在 verify-log.sh 内把传给 verify-search.sh 的旗标过滤为仅 `--positions`。`interop/java/` 现有工具**没有** forceMerge 入口（已逐一核实 16 个 .java 文件）→ 新增最小 `ForceMerge.java`（`Makefile:9-11` 的 `javac interop/java/*.java` 通配自动编译），并显式 `setUseCompoundFile(false)`（事实 6）。
 
 ---
-
 ## Task 1: roaring 容器库标量实现（`crates/codec-lucene9/src/roaring.rs` 新建）
 
 三容器 + build/and/or/cardinality/迭代访问 + payload 序列化，全标量（spec §6 先标量）。AVX2 在 T2 追加。
@@ -65,7 +65,7 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 **Interfaces:**
 - Consumes: `crate::io::{DataInput, DataOutput}`（`io.rs:519/779`）、`crate::codec_util::corrupt`（`codec_util.rs:69`）、测试用 `crate::io::{IndexInput, IndexOutput}`。
-- Produces（T2 的 dispatch、T3 的 sidecar 写/读、T4/T5 的 core 执行层依赖这些名字，不得改名）:
+- Produces（T2 的 dispatch、T3 的 .doc 内联写/读、T4/T5 的 core 执行层依赖这些名字，不得改名）:
   ```rust
   // roaring.rs
   pub const DEFAULT_BITMAP_THRESHOLD: u32 = 4096;   // spec §3
@@ -241,7 +241,7 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   use crate::codec_util::corrupt;
   use crate::io::{DataInput, DataOutput};
 
-  /// spec §3: terms with df >= this threshold get a sidecar bitmap at flush
+  /// spec §3: terms with df >= this threshold get an inline bitmap at flush
   /// (4096 = 32×128, the level-1 skip granularity,
   /// Lucene912PostingsFormat.java:347-352); `--bitmap-threshold N` overrides.
   pub const DEFAULT_BITMAP_THRESHOLD: u32 = 4096;
@@ -731,7 +731,7 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
           RoaringBitmap { containers: out }
       }
 
-      /// Payload layout (consumed by bitmap_sidecar.rs): VInt num_containers,
+      /// Payload layout (consumed by the .doc inline block, spec §4): VInt num_containers,
       /// then per container VInt key + Byte type tag (0=array, 1=bitset,
       /// 2=run) + VInt cardinality + body (array: card x Short; bitset:
       /// 1024 x Long; run: VInt num_runs + runs x (Short start, Short len)).
@@ -774,7 +774,7 @@ test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
       /// ascending, array values ascending and < 4096, bitset popcount ==
       /// cardinality, runs disjoint/non-adjacent with card == sum) — any
       /// violation is a corrupt payload and the caller falls back to
-      /// postings (§4a.6).
+      /// postings (spec §4/§5: 任一校验失败静默落档).
       pub(crate) fn deserialize(input: &mut impl DataInput) -> io::Result<RoaringBitmap> {
           let n = input.read_vint()?;
           if !(0..=65536).contains(&n) {
@@ -1589,50 +1589,34 @@ spec §6：AVX2 作等价追加——运行时分发 + 标量 vs SIMD 逐位对�
 
 ---
 
-## Task 3: 写侧 sidecar 产出（`bitmap_sidecar.rs` + flush 钩子 + 命名/GC/校验 §4a）
 
-codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 flush 的 term 循环里喂 docs 切片。round-trip 测试在 codec 层闭环。
+---
+
+## Task 3: 写侧 .doc 内联 bitmap 产出（`postings.rs` 钩子 + 配置透传）
+
+codec 拥有内联块 FORMAT：常量 + 写出；core 只做配置透传。round-trip 字节级测试在 codec 层闭环。
 
 **Files:**
-- Create: `crates/codec-lucene9/src/bitmap_sidecar.rs`
-- Modify: `crates/codec-lucene9/src/lib.rs`（`pub mod bitmap_sidecar;`）
-- Modify: `crates/core/src/index_writer.rs`（`IndexWriterConfig` 两个字段 + create/flush 的 GC 调用 + `#[cfg(test)]` 模块）
-- Modify: `crates/core/src/segment_builder.rs`（`with_bitmap` + finalize 钩子 + sidecar fsync）
-- Test: `crates/codec-lucene9/src/bitmap_sidecar.rs` 与 `crates/core/src/index_writer.rs` 的 `#[cfg(test)]` 模块
+- Modify: `crates/codec-lucene9/src/postings.rs`（BITMAP 常量 + `bitmap_crc32` + `set_bitmap_threshold` + `write_inline_bitmap` + `write_term` 钩子）
+- Modify: `crates/core/src/index_writer.rs`（`IndexWriterConfig` 两个字段 + `#[cfg(test)]` 模块）
+- Modify: `crates/core/src/segment_builder.rs`（`with_bitmap` + finalize 透传 setter）
+- Test: `crates/codec-lucene9/src/postings.rs` 与 `crates/core/src/index_writer.rs` 的 `#[cfg(test)]` 模块
 
 **Interfaces:**
-- Consumes: T1 的 `RoaringBitmap::{from_sorted_docs, cardinality, serialize, deserialize}`；`crate::codec_util::{write_index_header, write_footer, check_index_header, check_footer_structure, corrupt}`；`FSDirectory::{create_output, open_input, open_checksum_input, file_exists, list_all, delete, sync}`。
-- Produces（T4 的 SegmentReader、T6 的 CLI/电池依赖这些名字，不得改名）:
+- Consumes: T1 的 `RoaringBitmap::{from_sorted_docs, cardinality, serialize}`；`IndexOutput::in_memory` / `ChecksumIndexOutput`；既有 `crc32fast` 依赖。
+- Produces（T4 的读侧校验、T6 的 CLI/电池依赖这些名字，不得改名）:
   ```rust
-  // bitmap_sidecar.rs
-  pub fn file_name(segment: &str) -> String; // rbm<seg>.bin（§4a.3）
+  // postings.rs
+  pub(crate) const BITMAP_MAGIC: u32 = 0x614D4252; // "RBMa" as LE bytes
+  pub(crate) const BITMAP_VERSION: u8 = 1;
+  /// zlib CRC32（crc32fast，与 CodecUtil footer CRC 同算法）
+  pub(crate) fn bitmap_crc32(bytes: &[u8]) -> u32;
 
-  pub struct SidecarBuilder { .. }
-  impl SidecarBuilder {
-      pub fn new(segment: &str, max_doc: i32) -> Self;
-      pub fn add_term(&mut self, field: &str, term: &[u8], docs: &[u32]);
-      pub fn is_empty(&self) -> bool;
-      /// 写出 rbm<seg>.bin，返回文件名（不写入任何 .si files 集合，§4a.2）
-      pub fn write(self, dir: &FSDirectory, segment_id: &[u8; 16]) -> io::Result<String>;
+  impl PostingsWriter {
+      /// M3（spec §3/§4）：df >= threshold 的 term 在 docStartFP capture
+      /// 之前内联写 bitmap 块。0 = 关闭（默认）。
+      pub fn set_bitmap_threshold(&mut self, threshold: u32);
   }
-
-  #[derive(Clone, Debug, PartialEq, Eq)]
-  pub struct SidecarTerm {
-      pub doc_freq: u32,
-      pub cardinality: u64,
-      // payload_off/payload_len 为 pub(crate)，仅 load_bitmap 使用
-  }
-
-  pub struct SidecarReader { .. }
-  impl SidecarReader {
-      /// 文件不存在或绑定/校验失败 → Ok(None)（§4a.6 静默落档）
-      pub fn open(dir: &FSDirectory, segment: &str, segment_id: &[u8; 16], max_doc: i32) -> io::Result<Option<SidecarReader>>;
-      pub fn term_entry(&self, field: &str, term: &[u8]) -> Option<SidecarTerm>;
-      pub fn load_bitmap(&self, entry: &SidecarTerm) -> io::Result<RoaringBitmap>;
-  }
-
-  /// §4a.4：删除 rbm 前缀且 segment 不在 live 集合的文件，返回删除数
-  pub fn gc_sidecars(dir: &FSDirectory, live_segments: &[String]) -> io::Result<usize>;
 
   // core index_writer.rs
   pub struct IndexWriterConfig { .., pub bitmap: bool, pub bitmap_threshold: u32 } // default false / 4096
@@ -1642,106 +1626,88 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   }
   ```
 
+  内联块布局（spec §4，写于 `docStartFP` capture 之前）：`magic(4B LE) + version(1B) + df(vInt) + cardinality(vInt) + payload(roaring.rs serialize) + crc32(4B LE)`，随后 `len: 4B LE`（= 头+payload+crc32 总字节）。读侧 `docStartFP-4` 取 len、回退 len 字节即块起点。
+
 ### Steps
 
-- [ ] **Step 3.1: 写 codec 失败测试** — 新建 `crates/codec-lucene9/src/bitmap_sidecar.rs`，先只放模块文档与测试（`SidecarBuilder`/`SidecarReader`/`gc_sidecars` 尚不存在，编译失败即失败测试成立）：
+- [ ] **Step 3.1: 写 codec 失败测试** — `crates/codec-lucene9/src/postings.rs` 的 `mod tests` 追加（`set_bitmap_threshold` / `BITMAP_MAGIC` 尚不存在，编译失败即失败测试成立）。现有 `mod tests` 只有 `use super::*;`——在其 use 区补测试所需 import，然后追加测试：
 
   ```rust
-  //! Roaring-bitmap sidecar file (`rbm<seg>.bin`) — M3 spec §4 layout and
-  //! the §4a compatibility contract:
-  //!
-  //! - independent directory-level file, never referenced by segments_N/.si
-  //!   (§4a.1/2: codec footers reject trailing bytes, CodecUtil.java:572-580;
-  //!   the .si files set drives CFS packing and refcounts,
-  //!   IndexWriter.java:5876-5900);
-  //! - named outside Lucene's managed namespace (§4a.3:
-  //!   IndexFileNames.CODEC_FILE_PATTERN requires a leading '_',
-  //!   IndexFileNames.java:199; IndexFileDeleter.java:146-151 only tracks
-  //!   matching names and segments*/pending_segments* — write.lock survives
-  //!   the same way);
-  //! - header binds {magic, version, segment name, maxDoc}, term rows bind
-  //!   df/cardinality; any mismatch degrades to "no bitmap" (§4a.6) — a bad
-  //!   sidecar must never affect queries;
-  //! - Rust-side GC deletes orphaned sidecars (§4a.4): Java merge/delete
-  //!   leaves them behind and Java never cleans them up.
-  //!
-  //! Layout (spec §4; CodecUtil conventions per codec_util.rs):
-  //!   index header (codec "RustRbmSidecar", version 0, segment id, "")
-  //!   VInt-len string segment_name
-  //!   VInt max_doc
-  //!   VInt num_fields, then per field:
-  //!     VInt-len string field_name
-  //!     VInt num_terms, then per term (bytes strictly ascending):
-  //!       VInt term_len + term bytes
-  //!       VInt doc_freq
-  //!       VLong cardinality
-  //!       VLong payload_off  (relative to the payload region start)
-  //!       VInt payload_len
-  //!   payload region (concatenated roaring payloads, roaring.rs serialize)
-  //!   footer (CRC32 over the whole file)
-
-  #[cfg(test)]
-  mod tests {
-      use super::*;
-      use crate::codec_util::check_footer;
-      use crate::io::DataInput;
+      use crate::directory::FSDirectory;
+      use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
+      use crate::io::IndexInput;
+      use crate::postings_read::{NO_MORE_DOCS, PostingsReader};
+      use crate::roaring::{Container, RoaringBitmap};
+      use crate::terms_read::TermsDict;
       use std::fs;
 
-      fn temp_dir(tag: &str) -> std::path::PathBuf {
+      fn temp_dir_rbm(tag: &str) -> std::path::PathBuf {
           let dir = std::env::temp_dir()
-              .join(format!("codec-lucene9-rbm-{}-{}", tag, std::process::id()));
+              .join(format!("codec-lucene9-rbmwrite-{}-{}", tag, std::process::id()));
           let _ = fs::remove_dir_all(&dir);
           dir
       }
 
-      const SEG_ID: [u8; 16] = [7u8; 16];
-
-      /// level/INFO: 0..5000 contiguous (Run); level/WARN: i*13 scattered
-      /// (Bitset); message/apple: 4 docs across two keys (Array).
-      fn write_test_sidecar(dir: &FSDirectory) {
-          let mut b = SidecarBuilder::new("_0", 70_000);
-          b.add_term("level", b"INFO", &(0..5000u32).collect::<Vec<_>>());
-          b.add_term("level", b"WARN", &(0..5000u32).map(|i| i * 13).collect::<Vec<_>>());
-          b.add_term("message", b"apple", &[1, 2, 3, 69_999]);
-          b.write(dir, &SEG_ID).unwrap();
+      fn indexed(name: &str, number: i32, opts: IndexOptions) -> FieldInfo {
+          FieldInfo {
+              name: name.to_string(),
+              number,
+              omit_norms: true,
+              index_options: opts,
+              ..FieldInfo::stored(name, number)
+          }
       }
 
+      /// spec §4 inline layout, byte by byte: [magic + version + df +
+      /// cardinality + payload + crc32][len u32 LE] written immediately
+      /// before docStartFP; postings decode is unaffected by the gap bytes.
       #[test]
-      fn naming_stays_outside_lucene_namespace() {
-          assert_eq!(file_name("_7"), "rbm_7.bin");
-          // §4a.3: must NOT match CODEC_FILE_PATTERN (IndexFileNames.java:199,
-          // `_[a-z0-9]+(_.*)?\..*` — requires a leading '_') and must not
-          // start with segments/pending_segments; non-matching files are
-          // never touched by IndexFileDeleter (:146-151).
-          let n = file_name("_7");
-          assert!(!n.starts_with('_'), "leading '_' would match CODEC_FILE_PATTERN");
-          assert!(!n.starts_with("segments"));
-          assert!(!n.starts_with("pending_segments"));
-          assert!(n.starts_with("rbm") && n.ends_with(".bin"));
-      }
-
-      #[test]
-      fn round_trip_write_open_lookup_load() {
-          let root = temp_dir("roundtrip");
+      fn inline_bitmap_byte_layout_and_postings_intact() {
+          let root = temp_dir_rbm("layout");
           let dir = FSDirectory::open(&root).unwrap();
-          write_test_sidecar(&dir);
-          assert!(dir.file_exists("rbm_0.bin"));
+          let id = [3u8; 16];
+          let fis = FieldInfos::new(vec![indexed("kw", 0, IndexOptions::Docs)]);
+          let mut w = PostingsWriter::new(&dir, "_0", &id).unwrap();
+          w.set_bitmap_threshold(128);
+          w.start_field(fis.by_name("kw").unwrap(), 6000).unwrap();
+          let big: Vec<u32> = (0..200).collect();
+          w.write_term(b"big", &big, &vec![1; 200], None).unwrap();
+          w.write_term(b"tail", &[10, 20, 30], &[1, 1, 1], None).unwrap();
+          w.finish_field().unwrap();
+          w.finish().unwrap();
+          fis.write(&dir, "_0", &id, "").unwrap();
 
-          let r = SidecarReader::open(&dir, "_0", &SEG_ID, 70_000).unwrap().unwrap();
-          let info = r.term_entry("level", b"INFO").unwrap();
-          assert_eq!(info.doc_freq, 5000);
-          assert_eq!(info.cardinality, 5000);
-          // count queries read only the term table (spec §4) — distinct rows
-          let warn = r.term_entry("level", b"WARN").unwrap();
-          assert_eq!(warn.cardinality, 5000);
-          assert_ne!(info, warn);
-          // lazy payload load reproduces the doc set
-          let bm = r.load_bitmap(&info).unwrap();
-          assert_eq!(bm.cardinality(), 5000);
-          let apple = r.term_entry("message", b"apple").unwrap();
-          assert_eq!(apple.doc_freq, 4);
-          let bm = r.load_bitmap(&apple).unwrap();
-          assert_eq!(bm.cardinality(), 4);
+          // locate "big" via the terms dict (FST output schema untouched:
+          // doc_start_fp still points at the postings start)
+          let mut dict = TermsDict::open(&dir, "_0", &id, &fis).unwrap();
+          let e = dict
+              .seek_exact(fis.by_name("kw").unwrap(), b"big")
+              .unwrap()
+              .unwrap();
+          let fp = e.state.doc_start_fp;
+
+          // len suffix at docStartFP-4, block at docStartFP-4-len
+          let mut input = dir.open_input(&file_name("_0", "doc")).unwrap();
+          input.seek(fp - 4).unwrap();
+          let len = input.read_int().unwrap() as u32 as u64;
+          let block_start = fp - 4 - len;
+          let mut block = vec![0u8; len as usize];
+          input.seek(block_start).unwrap();
+          input.read_bytes(&mut block).unwrap();
+
+          assert_eq!(&block[0..4], &BITMAP_MAGIC.to_le_bytes());
+          assert_eq!(block[4], BITMAP_VERSION);
+          let mut cur = IndexInput::in_memory(block.clone());
+          cur.seek(5).unwrap();
+          assert_eq!(cur.read_vint().unwrap(), 200, "df field");
+          assert_eq!(cur.read_vint().unwrap(), 200, "cardinality field");
+          let bm = RoaringBitmap::deserialize(&mut cur).unwrap();
+          assert_eq!(cur.file_pointer() + 4, len, "payload must end 4B before len");
+          let stored = u32::from_le_bytes(block[len as usize - 4..].try_into().unwrap());
+          assert_eq!(bitmap_crc32(&block[..len as usize - 4]), stored);
+
+          // bitmap content == input docs; 200 contiguous -> one Run container
+          assert_eq!(bm.cardinality(), 200);
           let mut docs = Vec::new();
           for ci in 0..bm.num_containers() {
               let key = bm.container_key(ci) as u32;
@@ -1750,401 +1716,166 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                   docs.push((key << 16) | c.value_at(i) as u32);
               }
           }
-          assert_eq!(docs, vec![1, 2, 3, 69_999]);
-          // absent field / term
-          assert!(r.term_entry("nope", b"x").is_none());
-          assert!(r.term_entry("level", b"DEBUG").is_none());
-          fs::remove_dir_all(&root).unwrap();
-      }
+          assert_eq!(docs, big);
+          assert!(matches!(bm.container_at(0), Container::Run(_)));
 
-      #[test]
-      fn open_validates_binding_and_degrades_silently() {
-          let root = temp_dir("binding");
-          let dir = FSDirectory::open(&root).unwrap();
-          write_test_sidecar(&dir);
-          // §4a.6: segment name / maxDoc / segment id mismatch -> None
-          assert!(SidecarReader::open(&dir, "_1", &SEG_ID, 70_000).unwrap().is_none());
-          assert!(SidecarReader::open(&dir, "_0", &SEG_ID, 60_000).unwrap().is_none());
-          assert!(SidecarReader::open(&dir, "_0", &[9u8; 16], 70_000).unwrap().is_none());
-          // missing file -> None
-          assert!(SidecarReader::open(&dir, "_9", &SEG_ID, 70_000).unwrap().is_none());
-          // corrupted payload: open still succeeds (footer structure intact),
-          // load fails cardinality/popcount validation -> caller falls back
-          let path = root.join("rbm_0.bin");
-          let mut bytes = fs::read(&path).unwrap();
-          let i = bytes.len() * 3 / 5; // inside WARN's 8KB bitset payload
-          bytes[i] ^= 0xFF;
-          fs::write(&path, &bytes).unwrap();
-          let r = SidecarReader::open(&dir, "_0", &SEG_ID, 70_000).unwrap().unwrap();
-          let e = r.term_entry("level", b"WARN").unwrap();
-          assert!(r.load_bitmap(&e).is_err(), "corrupt bitset payload must be detected");
-          fs::remove_dir_all(&root).unwrap();
-      }
-
-      #[test]
-      fn footer_crc_covers_whole_file() {
-          let root = temp_dir("crc");
-          let dir = FSDirectory::open(&root).unwrap();
-          write_test_sidecar(&dir);
-          // whole-file CRC validates on the untouched file (CodecUtil
-          // writeFooter semantics, codec_util.rs write_footer)
-          let mut input = dir.open_checksum_input("rbm_0.bin").unwrap();
-          let len = input.length();
-          let mut buf = vec![0u8; (len - 16) as usize];
-          input.read_bytes(&mut buf).unwrap();
-          check_footer(&mut input).unwrap();
-          // flip a payload byte -> CRC mismatch detected
-          let path = root.join("rbm_0.bin");
-          let mut bytes = fs::read(&path).unwrap();
-          let i = bytes.len() * 3 / 5;
-          bytes[i] ^= 0xFF;
-          fs::write(&path, &bytes).unwrap();
-          let mut input = dir.open_checksum_input("rbm_0.bin").unwrap();
-          input.read_bytes(&mut buf).unwrap();
-          assert!(check_footer(&mut input).is_err());
-          fs::remove_dir_all(&root).unwrap();
-      }
-
-      #[test]
-      fn gc_removes_only_orphaned_sidecars() {
-          let root = temp_dir("gc");
-          let dir = FSDirectory::open(&root).unwrap();
-          for name in ["rbm_0.bin", "rbm_1.bin", "rbmx.bin", "_0.si", "segments_1", "rbm_2.bak"] {
-              fs::write(root.join(name), b"x").unwrap();
+          // the inline block is invisible to the postings enum (pure seek)
+          let postings = PostingsReader::open(&dir, "_0", &id).unwrap();
+          let mut en = postings.docs(&e).unwrap();
+          for d in 0..200 {
+              assert_eq!(en.next_doc().unwrap(), d);
           }
-          // §4a.4: rbm_1.bin's segment "_1" is not live -> deleted;
-          // rbmx.bin (seg part lacks '_') and rbm_2.bak (not .bin) are not
-          // sidecar names; .si/segments_N untouched
-          let deleted = gc_sidecars(&dir, &["_0".to_string()]).unwrap();
-          assert_eq!(deleted, 1);
-          assert!(dir.file_exists("rbm_0.bin"));
-          assert!(!dir.file_exists("rbm_1.bin"));
-          assert!(dir.file_exists("rbmx.bin"));
-          assert!(dir.file_exists("rbm_2.bak"));
-          assert!(dir.file_exists("_0.si"));
-          assert!(dir.file_exists("segments_1"));
+          assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+          // "tail" (df=3 < 128) got no bitmap; its postings still decode
+          let e2 = dict
+              .seek_exact(fis.by_name("kw").unwrap(), b"tail")
+              .unwrap()
+              .unwrap();
+          let mut en2 = postings.docs(&e2).unwrap();
+          assert_eq!(en2.next_doc().unwrap(), 10);
+          assert_eq!(en2.next_doc().unwrap(), 20);
+          assert_eq!(en2.next_doc().unwrap(), 30);
+          assert_eq!(en2.next_doc().unwrap(), NO_MORE_DOCS);
           fs::remove_dir_all(&root).unwrap();
       }
-  }
   ```
-
-  同时 `crates/codec-lucene9/src/lib.rs` 在 `pub mod codec_util;` 之前插入一行 `pub mod bitmap_sidecar;`（否则模块未声明，测试无法编译）。
 
 - [ ] **Step 3.2: 跑测试确认失败**
 
   ```
-  $ cargo test -p codec-lucene9 bitmap_sidecar 2>&1 | tail -5
-  error[E0433]: failed to resolve: use of unresolved module or unlinked crate `bitmap_sidecar`
-  ...（SidecarBuilder / SidecarReader / gc_sidecars 未定义）
+  $ cargo test -p codec-lucene9 inline_bitmap 2>&1 | tail -5
+  error[E0599]: no method named `set_bitmap_threshold` found for struct `PostingsWriter`
+  ...（BITMAP_MAGIC / bitmap_crc32 同样未定义）
   ```
 
-- [ ] **Step 3.3: 实现 bitmap_sidecar.rs** — `crates/codec-lucene9/src/bitmap_sidecar.rs` 在模块文档之后、`#[cfg(test)]` 之前插入：
+- [ ] **Step 3.3: 实现写侧** — `crates/codec-lucene9/src/postings.rs` 三处修改：
+
+  (a) `SEGMENT_SUFFIX` 常量声明之后加：
 
   ```rust
-  use std::io;
+  // Lucene912PostingsFormat.java:347-352
+  pub(crate) const SEGMENT_SUFFIX: &str = "Lucene912_0";
 
-  use crate::codec_util::{
-      check_footer_structure, check_index_header, corrupt, write_footer, write_index_header,
-  };
-  use crate::directory::FSDirectory;
-  use crate::io::{DataInput, IndexInput, IndexOutput};
-  use crate::roaring::RoaringBitmap;
+  /// M3 (spec §4): inline bitmap block magic, 4 bytes written little-endian
+  /// ("RBMa" in the byte stream). The quad-validation in
+  /// postings_read::inline_bitmap rejects any gap block whose first 4 bytes
+  /// do not match.
+  pub(crate) const BITMAP_MAGIC: u32 = 0x614D4252;
+  /// M3 (spec §4): inline bitmap block format version (1 byte).
+  pub(crate) const BITMAP_VERSION: u8 = 1;
 
-  /// Codec name in the sidecar's index header (project CodecUtil convention).
-  pub(crate) const SIDECAR_CODEC: &str = "RustRbmSidecar";
-  pub(crate) const SIDECAR_VERSION: u32 = 0;
-
-  /// §4a.3: rbm<seg>.bin — outside Lucene's managed namespace
-  /// (IndexFileNames.CODEC_FILE_PATTERN requires a leading '_';
-  /// IndexFileDeleter.java:146-151 never tracks non-matching names).
-  pub fn file_name(segment: &str) -> String {
-      format!("rbm{segment}.bin")
+  /// zlib CRC32 over the inline bitmap block (crc32fast — same algorithm as
+  /// the CodecUtil footer CRC, codec_util.rs write_footer).
+  pub(crate) fn bitmap_crc32(bytes: &[u8]) -> u32 {
+      crc32fast::hash(bytes)
   }
+  ```
 
-  // ── write side ─────────────────────────────────────────────────────────
+  （`SEGMENT_SUFFIX` 已在原处，仅为定位锚点；常量与函数紧随其后插入。）
 
-  /// Accumulates (field, term, bitmap) rows at segment flush; terms arrive
-  /// in dictionary order per field (the block-tree flush order), so the
-  /// term table is sorted for free (spec §4).
-  pub struct SidecarBuilder {
+  (b) `PostingsWriter` 结构体加字段 + setter + `write_inline_bitmap`：
+
+  ```rust
+  pub struct PostingsWriter {
+      dir: FSDirectory,
       segment: String,
-      max_doc: i32,
-      fields: Vec<FieldBitmaps>,
-  }
-
-  struct FieldBitmaps {
-      name: String,
-      /// (term bytes, doc_freq, bitmap); term bytes strictly ascending
-      terms: Vec<(Vec<u8>, u32, RoaringBitmap)>,
-  }
-
-  impl SidecarBuilder {
-      pub fn new(segment: &str, max_doc: i32) -> Self {
-          SidecarBuilder {
-              segment: segment.to_string(),
-              max_doc,
-              fields: Vec::new(),
-          }
-      }
-
-      /// spec §4: the docs slice is already in RAM at term flush — building
-      /// the bitmap here is O(df) CPU, zero extra IO. Fields must arrive as
-      /// one contiguous run each; terms ascending within a field.
-      pub fn add_term(&mut self, field: &str, term: &[u8], docs: &[u32]) {
-          if self.fields.last().map(|f| f.name.as_str()) != Some(field) {
-              self.fields.push(FieldBitmaps {
-                  name: field.to_string(),
-                  terms: Vec::new(),
-              });
-          }
-          let f = self.fields.last_mut().unwrap();
-          debug_assert!(
-              f.terms.last().map(|(t, _, _)| t.as_slice()) < Some(term),
-              "terms must ascend within a field"
-          );
-          f.terms
-              .push((term.to_vec(), docs.len() as u32, RoaringBitmap::from_sorted_docs(docs)));
-      }
-
-      pub fn is_empty(&self) -> bool {
-          self.fields.is_empty()
-      }
-
-      /// Writes rbm<seg>.bin and returns the file name. The caller never
-      /// lists it in the .si files set (§4a.2). Payload offsets are relative
-      /// to the payload region start, so the term tables (which carry the
-      /// offsets) can be written before the blobs without a size fixpoint.
-      pub fn write(self, dir: &FSDirectory, segment_id: &[u8; 16]) -> io::Result<String> {
-          let name = file_name(&self.segment);
-          let mut out = dir.create_output(&name)?;
-          write_index_header(&mut out, SIDECAR_CODEC, SIDECAR_VERSION, segment_id, "")?;
-          out.write_string(&self.segment)?;
-          out.write_vint(self.max_doc)?;
-          out.write_vint(self.fields.len() as i32)?;
-          // serialize payloads first (offsets relative to the payload region)
-          let mut payload = IndexOutput::in_memory();
-          let mut offsets: Vec<Vec<(u64, u32)>> = Vec::with_capacity(self.fields.len());
-          for f in &self.fields {
-              let mut field_offsets = Vec::with_capacity(f.terms.len());
-              for (_, _, bm) in &f.terms {
-                  let off = payload.file_pointer();
-                  bm.serialize(&mut payload)?;
-                  field_offsets.push((off, (payload.file_pointer() - off) as u32));
-              }
-              offsets.push(field_offsets);
-          }
-          for (f, field_offsets) in self.fields.iter().zip(&offsets) {
-              out.write_string(&f.name)?;
-              out.write_vint(f.terms.len() as i32)?;
-              for ((term, df, bm), &(off, len)) in f.terms.iter().zip(field_offsets) {
-                  out.write_vint(term.len() as i32)?;
-                  out.write_bytes(term)?;
-                  out.write_vint(*df as i32)?;
-                  out.write_vlong(bm.cardinality() as i64)?;
-                  out.write_vlong(off as i64)?;
-                  out.write_vint(len as i32)?;
-              }
-          }
-          out.write_bytes(&payload.into_bytes())?;
-          write_footer(&mut out)?;
-          out.flush()?;
-          Ok(name)
-      }
-  }
-
-  // ── read side ──────────────────────────────────────────────────────────
-
-  /// Term-table row (spec §4: cardinality lives in the table, so count
-  /// queries never touch the payload).
-  #[derive(Clone, Debug, PartialEq, Eq)]
-  pub struct SidecarTerm {
-      pub doc_freq: u32,
-      pub cardinality: u64,
-      pub(crate) payload_off: u64,
-      pub(crate) payload_len: u32,
-  }
-
-  struct SidecarField {
-      name: String,
-      /// rows sorted by term bytes (binary-searched)
-      terms: Vec<(Vec<u8>, SidecarTerm)>,
-  }
-
-  /// Read view of one segment's `rbm<seg>.bin`: open reads only the header
-  /// + term tables (KB-scale); payloads load lazily per term (spec §5
-  /// 惰性加载: bitmap payload 首次触及才加载).
-  pub struct SidecarReader {
-      input: IndexInput,
-      payload_base: u64,
-      fields: Vec<SidecarField>,
-  }
-
-  impl SidecarReader {
-      /// §4a.6: any binding/validation failure (absent file, bad header,
-      /// wrong segment name or maxDoc, bad footer structure) degrades to
-      /// `Ok(None)` — a bad sidecar must never affect queries.
-      pub fn open(
-          dir: &FSDirectory,
-          segment: &str,
-          segment_id: &[u8; 16],
-          max_doc: i32,
-      ) -> io::Result<Option<SidecarReader>> {
-          let name = file_name(segment);
-          if !dir.file_exists(&name) {
-              return Ok(None);
-          }
-          let input = dir.open_input(&name)?;
-          Ok(Self::parse(input, segment, segment_id, max_doc).ok())
-      }
-
-      fn parse(
-          mut input: IndexInput,
-          segment: &str,
-          segment_id: &[u8; 16],
-          max_doc: i32,
-      ) -> io::Result<SidecarReader> {
-          check_index_header(
-              &mut input,
-              SIDECAR_CODEC,
-              SIDECAR_VERSION,
-              SIDECAR_VERSION,
-              segment_id,
-              "",
-          )?;
-          if input.read_string()? != segment {
-              return Err(corrupt("sidecar segment name mismatch"));
-          }
-          if input.read_vint()? != max_doc {
-              return Err(corrupt("sidecar maxDoc mismatch"));
-          }
-          let num_fields = input.read_vint()?;
-          if !(0..=65536).contains(&num_fields) {
-              return Err(corrupt("sidecar field count out of range"));
-          }
-          let mut fields = Vec::with_capacity(num_fields as usize);
-          for _ in 0..num_fields {
-              let name = input.read_string()?;
-              let num_terms = input.read_vint()?;
-              if !(0..=(1 << 26)).contains(&num_terms) {
-                  return Err(corrupt("sidecar term count out of range"));
-              }
-              let mut terms = Vec::with_capacity((num_terms as usize).min(1 << 16));
-              let mut prev: Option<Vec<u8>> = None;
-              for _ in 0..num_terms {
-                  let tlen = input.read_vint()?;
-                  if !(0..=(1 << 20)).contains(&tlen) {
-                      return Err(corrupt("sidecar term length out of range"));
-                  }
-                  let mut t = vec![0u8; tlen as usize];
-                  input.read_bytes(&mut t)?;
-                  if prev.as_deref() >= Some(t.as_slice()) {
-                      return Err(corrupt("sidecar terms must strictly ascend"));
-                  }
-                  prev = Some(t.clone());
-                  let doc_freq = input.read_vint()?;
-                  if doc_freq <= 0 {
-                      return Err(corrupt("sidecar df must be positive"));
-                  }
-                  let cardinality = input.read_vlong()?;
-                  if cardinality <= 0 {
-                      return Err(corrupt("sidecar cardinality must be positive"));
-                  }
-                  let payload_off = input.read_vlong()?;
-                  if payload_off < 0 {
-                      return Err(corrupt("sidecar payload offset negative"));
-                  }
-                  let payload_len = input.read_vint()?;
-                  if payload_len <= 0 {
-                      return Err(corrupt("sidecar payload length must be positive"));
-                  }
-                  terms.push((
-                      t,
-                      SidecarTerm {
-                          doc_freq: doc_freq as u32,
-                          cardinality: cardinality as u64,
-                          payload_off: payload_off as u64,
-                          payload_len: payload_len as u32,
-                      },
-                  ));
-              }
-              fields.push(SidecarField { name, terms });
-          }
-          let payload_base = input.file_pointer();
-          // Footer structure (magic/algorithmID) is validated now; the
-          // whole-file CRC is exercised by the codec tests and payloads are
-          // validated per load via cardinality/popcount (§4a.6).
-          check_footer_structure(&input, input.length())?;
-          Ok(SidecarReader {
-              input,
-              payload_base,
-              fields,
-          })
-      }
-
-      /// Term-table lookup (binary search on the sorted rows). No payload IO.
-      pub fn term_entry(&self, field: &str, term: &[u8]) -> Option<SidecarTerm> {
-          let f = self.fields.iter().find(|f| f.name == field)?;
-          f.terms
-              .binary_search_by(|(t, _)| t.as_slice().cmp(term))
-              .ok()
-              .map(|i| f.terms[i].1.clone())
-      }
-
-      /// Lazy payload load + deserialize; cardinality is cross-checked
-      /// against the term table (§4a.6 term-level validation).
-      pub fn load_bitmap(&self, entry: &SidecarTerm) -> io::Result<RoaringBitmap> {
-          let mut slice = self
-              .input
-              .slice(self.payload_base + entry.payload_off, entry.payload_len as u64)?;
-          let bm = RoaringBitmap::deserialize(&mut slice)?;
-          if bm.cardinality() != entry.cardinality {
-              return Err(corrupt("sidecar payload cardinality mismatch"));
-          }
-          Ok(bm)
-      }
-  }
-
-  // ── GC (§4a.4) ─────────────────────────────────────────────────────────
-
-  /// Rust-side GC: Java merge/delete leaves orphaned sidecars behind (Java
-  /// never touches them, IndexFileDeleter.java:146-151). Deletes every
-  /// `rbm<seg>.bin` whose segment is not in `live_segments`; returns the
-  /// number of deleted files. Called at IndexWriter open and after flush.
-  pub fn gc_sidecars(dir: &FSDirectory, live_segments: &[String]) -> io::Result<usize> {
-      let mut deleted = 0;
-      for name in dir.list_all()? {
-          let Some(seg) = name.strip_prefix("rbm").and_then(|n| n.strip_suffix(".bin")) else {
-              continue;
-          };
-          // sidecar names are rbm<seg>.bin and segment names always start
-          // with '_' (SegmentBuilder: format!("_{}", base36)) — anything
-          // else with an rbm prefix is not ours
-          if !seg.starts_with('_') {
-              continue;
-          }
-          if !live_segments.iter().any(|s| s == seg) {
-              dir.delete(&name)?;
-              deleted += 1;
-          }
-      }
-      Ok(deleted)
+      segment_id: [u8; 16],
+      doc_out: ChecksumIndexOutput,
+      pos_out: Option<ChecksumIndexOutput>,
+      tim_out: ChecksumIndexOutput,
+      tip_out: ChecksumIndexOutput,
+      tmd_out: ChecksumIndexOutput,
+      psm_out: ChecksumIndexOutput,
+      field: Option<FieldState>,
+      /// Serialized per-field .tmd records (Lucene90BlockTreeTermsWriter.fields).
+      field_records: Vec<Vec<u8>>,
+      max_num_impacts_level0: i32,
+      max_impact_bytes_level0: i32,
+      max_num_impacts_level1: i32,
+      max_impact_bytes_level1: i32,
+      /// M3 (spec §3/§4): terms with df >= this get an inline bitmap block
+      /// before their postings; 0 = off (default, --bitmap 默认 off).
+      bitmap_threshold: u32,
+      files: Vec<String>,
   }
   ```
 
-- [ ] **Step 3.4: 跑测试确认通过（codec 5 个 sidecar 测试 + 全量回归）**
+  `PostingsWriter::new` 的 `Ok(Self { ... })` 初始化列表加 `bitmap_threshold: 0,`；`impl PostingsWriter` 内（`start_field` 之前）加：
+
+  ```rust
+      /// M3 (spec §3/§4): terms with df >= `threshold` get an inline bitmap
+      /// block written immediately before their docStartFP is captured.
+      /// 0 disables the feature (default).
+      pub fn set_bitmap_threshold(&mut self, threshold: u32) {
+          self.bitmap_threshold = threshold;
+      }
+  ```
+
+  `write_doc_postings` 之前加：
+
+  ```rust
+      /// spec §4 inline layout, written immediately before docStartFP is
+      /// captured: [magic(4B LE) + version(1B) + df(VInt) + cardinality(VInt)
+      /// + roaring payload + crc32(4B LE)][len: 4B LE], len = 头+payload+crc32
+      /// 总字节. The block goes through the same ChecksumIndexOutput as the
+      /// postings, so the .doc footer CRC covers it for free
+      /// (CodecUtil.java:402-413) and the reader finds it at
+      /// docStartFP-4-len (§4a: the inter-term gap is invisible to Java's
+      /// pure-seek reader, Lucene912PostingsReader.java:436,809).
+      fn write_inline_bitmap(&mut self, docs: &[u32]) -> io::Result<()> {
+          let bm = RoaringBitmap::from_sorted_docs(docs);
+          let mut block = IndexOutput::in_memory();
+          block.write_int(BITMAP_MAGIC as i32)?; // write_int is LE (io.rs)
+          block.write_byte(BITMAP_VERSION)?;
+          block.write_vint(docs.len() as i32)?;
+          block.write_vint(bm.cardinality() as i32)?;
+          bm.serialize(&mut block)?;
+          let mut bytes = block.into_bytes();
+          let crc = bitmap_crc32(&bytes);
+          bytes.extend_from_slice(&crc.to_le_bytes());
+          let len = bytes.len() as u32;
+          self.doc_out.write_bytes(&bytes)?;
+          self.doc_out.write_int(len as i32)?; // LE
+          Ok(())
+      }
+  ```
+
+  use 区加 `use crate::roaring::RoaringBitmap;`。
+
+  (c) `write_term` 的 `.pos` 写出与 docStartFP capture 之间加钩子（`postings.rs:349-354` 现状）：
+
+  ```rust
+          // --- .pos: full pfor chunks + tail (before .doc so skip fps are known)
+          let (pos_start_fp, last_pos_block_offset, pos_block_index) =
+              self.write_positions(docs, freqs, positions)?;
+
+          // --- M3 inline bitmap (spec §4): df >= threshold 的 term 在
+          // docStartFP capture 之前内联写 bitmap 块；docStartFP 仍指向
+          // postings 起点，FST output schema 不变
+          if self.bitmap_threshold != 0 && doc_freq >= self.bitmap_threshold {
+              self.write_inline_bitmap(docs)?;
+          }
+
+          // --- .doc
+          let doc_start_fp = self.doc_out.file_pointer();
+  ```
+
+- [ ] **Step 3.4: 跑测试确认通过（新测试 + 全量回归）**
 
   ```
-  $ cargo test -p codec-lucene9 bitmap_sidecar 2>&1 | tail -3
-  test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  $ cargo test -p codec-lucene9 inline_bitmap 2>&1 | tail -3
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   $ cargo test -p codec-lucene9 2>&1 | tail -3
-  test result: ok. 155 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+  test result: ok. 151 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
   ```
+
+  （151 = 基线 142 + T1 的 7 + T2 的 1 + 本任务 1；既有测试全绿 = 默认 threshold=0 时字节零变化。）
 
 - [ ] **Step 3.5: 提交（codec 部分）**
 
   ```
-  git add crates/codec-lucene9/src/bitmap_sidecar.rs crates/codec-lucene9/src/lib.rs
-  git commit -m "feat: roaring bitmap sidecar file format (write/read/validate/GC, M3 §4a)"
+  git add crates/codec-lucene9/src/postings.rs
+  git commit -m "feat: inline roaring bitmap blocks in .doc at flush (M3 §4)"
   ```
 
 - [ ] **Step 3.6: 写 core 失败测试** — `crates/core/src/index_writer.rs` 末尾新建 `#[cfg(test)]` 模块（`IndexWriterConfig.bitmap` 等字段尚不存在，编译失败即失败测试成立）：
@@ -2155,7 +1886,6 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       use super::*;
       use crate::document::{Document, FieldValue};
       use crate::schema::{FieldSpec, Schema};
-      use codec_lucene9::bitmap_sidecar::SidecarReader;
       use std::fs;
       use std::path::PathBuf;
 
@@ -2180,79 +1910,68 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           d
       }
 
-      /// M3 §4/§4a: with bitmap on, flush emits rbm_0.bin covering terms
-      /// with df >= threshold; the .si files set must never reference it.
-      #[test]
-      fn bitmap_sidecar_written_outside_si_files_set() {
-          let root = temp_dir("rbmwrite");
+      fn write_corpus(root: &Path, bitmap: bool) {
           let mut cfg = IndexWriterConfig::default();
-          cfg.bitmap = true;
+          cfg.bitmap = bitmap;
           cfg.bitmap_threshold = 4;
-          let mut w = IndexWriter::create(&root, schema(), cfg).unwrap();
+          let mut w = IndexWriter::create(root, schema(), cfg).unwrap();
           for i in 0..10 {
               w.add_document(doc("INFO", &format!("common w{i}"))).unwrap();
           }
           w.commit().unwrap();
           drop(w);
-
-          let dir = FSDirectory::open(&root).unwrap();
-          let names = dir.list_all().unwrap();
-          assert_eq!(
-              names.iter().filter(|n| n.starts_with("rbm")).count(),
-              1,
-              "one segment -> one sidecar"
-          );
-          assert!(names.iter().any(|n| n == "rbm_0.bin"));
-
-          // §4a.2: the .si files set must never reference the sidecar
-          let (infos, _) = SegmentInfos::read_latest(&dir).unwrap();
-          assert_eq!(infos.segments.len(), 1);
-          let sci = &infos.segments[0];
-          assert!(
-              !sci.info.files.iter().any(|f| f.starts_with("rbm")),
-              "sidecar must stay out of the .si files set (§4a.2)"
-          );
-
-          // term table: high-df terms present, low-df absent
-          let r = SidecarReader::open(&dir, &sci.info.name, &sci.info.id, sci.info.doc_count)
-              .unwrap()
-              .unwrap();
-          let common = r.term_entry("message", b"common").unwrap();
-          assert_eq!(common.doc_freq, 10);
-          assert_eq!(common.cardinality, 10);
-          assert!(r.term_entry("level", b"INFO").is_some());
-          assert!(r.term_entry("message", b"w3").is_none(), "df=1 < threshold 4");
-          fs::remove_dir_all(&root).unwrap();
       }
 
-      /// §4a.4: writer-open GC removes orphaned sidecars (a fresh CREATE
-      /// has no live segments), and leaves non-sidecar rbm* files alone.
-      #[test]
-      fn gc_on_create_removes_orphan_sidecars() {
-          let root = temp_dir("rbmgc");
-          fs::create_dir_all(&root).unwrap();
-          fs::write(root.join("rbm_7.bin"), b"orphan").unwrap();
-          fs::write(root.join("rbmx.bin"), b"not a sidecar name").unwrap();
-          let w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
-          drop(w);
-          assert!(!root.join("rbm_7.bin").exists(), "§4a.4: orphan GC at writer open");
-          assert!(root.join("rbmx.bin").exists());
-          fs::remove_dir_all(&root).unwrap();
+      /// _0_Lucene912_0.doc 的字节数（postings.rs file_name 布局）。
+      fn doc_bytes(root: &Path) -> u64 {
+          fs::metadata(root.join("_0_Lucene912_0.doc")).unwrap().len()
       }
 
-      /// spec §3: --bitmap default off -> no sidecar files at all.
+      /// spec §2/§4: bitmap on 不新增任何文件，bitmap 字节内联进 .doc；
+      /// 写侧集成后索引照常可读可搜（roaring 读侧接线在 T4，本步走既有
+      /// postings 路径——inline 字节对纯 seek reader 隐形，spec §4a.1）。
       #[test]
-      fn bitmap_off_writes_no_sidecar() {
-          let root = temp_dir("rbmoff");
+      fn inline_bitmap_write_adds_bytes_but_no_files() {
+          let root = temp_dir("rbmwrite");
+          write_corpus(&root, true);
+          let off_root = temp_dir("rbmwriteoff");
+          write_corpus(&off_root, false);
+
+          // spec §2 不新增任何文件：同一语料 on/off 文件名集合完全一致
+          let on_dir = FSDirectory::open(&root).unwrap();
+          let off_dir = FSDirectory::open(&off_root).unwrap();
+          assert_eq!(on_dir.list_all().unwrap(), off_dir.list_all().unwrap());
+
+          // bitmap 字节内联在 .doc：on 的 .doc 严格大于 off 的，且差值有界
+          // （本语料 2 个命中 term：level/INFO df=5 与 message/common df=10，
+          //   各一个 [头+payload+crc32+len] 小块）
+          let (on_len, off_len) = (doc_bytes(&root), doc_bytes(&off_root));
+          assert!(on_len > off_len, "inline bytes must inflate .doc");
+          assert!(on_len - off_len < 4096, "two tiny bitmap blocks + len suffixes");
+
+          // 写侧集成后索引照常可读（既有 postings 路径）
+          let mut s = crate::search::Searcher::open(&on_dir).unwrap();
+          let q = crate::search::Query::term("message", "common");
+          assert_eq!(s.count(&q).unwrap(), 10);
+          fs::remove_dir_all(&root).unwrap();
+          fs::remove_dir_all(&off_root).unwrap();
+      }
+
+      /// spec §3: --bitmap 默认 off —— 默认 config 与显式 off 的 .doc 字节数一致。
+      #[test]
+      fn bitmap_default_off_writes_no_inline_bytes() {
+          let root = temp_dir("rbmdefault");
           let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
           for i in 0..10 {
               w.add_document(doc("INFO", &format!("common w{i}"))).unwrap();
           }
           w.commit().unwrap();
           drop(w);
-          let dir = FSDirectory::open(&root).unwrap();
-          assert!(!dir.list_all().unwrap().iter().any(|n| n.starts_with("rbm")));
+          let off_root = temp_dir("rbmdefaultoff");
+          write_corpus(&off_root, false);
+          assert_eq!(doc_bytes(&root), doc_bytes(&off_root));
           fs::remove_dir_all(&root).unwrap();
+          fs::remove_dir_all(&off_root).unwrap();
       }
   }
   ```
@@ -2264,9 +1983,9 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   error[E0609]: no field `bitmap` on type `IndexWriterConfig`
   ```
 
-- [ ] **Step 3.8: 实现 core 写侧钩子** — 三处修改：
+- [ ] **Step 3.8: 实现 core 配置透传** — 两处修改：
 
-  (a) `crates/core/src/index_writer.rs`：`IndexWriterConfig` 加两个字段（默认值保证 `--bitmap` 默认 off、既有 `::default()` 调用方不受影响）；`create` 与 `flush` 加 GC：
+  (a) `crates/core/src/index_writer.rs`：`IndexWriterConfig` 加两个字段（默认值保证 `--bitmap` 默认 off、既有 `::default()` 调用方不受影响）：
 
   ```rust
   pub struct IndexWriterConfig {
@@ -2277,10 +1996,11 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       /// project spec; Lucene's fair-comparison counterpart is
       /// IndexWriterConfig.setRAMBufferSizeMB.
       pub max_ram_bytes: usize,
-      /// M3 (spec §3): build roaring-bitmap sidecar files (rbm<seg>.bin) at
-      /// segment flush. Experimental, default off.
+      /// M3 (spec §3): write inline roaring-bitmap blocks into .doc at
+      /// segment flush (df >= bitmap_threshold terms). Experimental,
+      /// default off.
       pub bitmap: bool,
-      /// M3 (spec §3): minimum doc_freq for a term to get a sidecar bitmap.
+      /// M3 (spec §3): minimum doc_freq for a term to get an inline bitmap.
       /// Default 4096 (codec_lucene9::roaring::DEFAULT_BITMAP_THRESHOLD,
       /// the 32×128 level-1 skip granularity); --bitmap-threshold tunes it.
       pub bitmap_threshold: u32,
@@ -2298,23 +2018,6 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   }
   ```
 
-  `create()` 在 `segments_` 存在性检查之后、`Ok(Self { ... })` 之前插入：
-
-  ```rust
-          // §4a.4: GC orphaned sidecars at writer open (a fresh CREATE has
-          // no live segments, so every leftover rbm<seg>.bin goes away)
-          codec_lucene9::bitmap_sidecar::gc_sidecars(&dir, &[])?;
-  ```
-
-  `flush()` 在 builder finalize 块之后、`Ok(())` 之前插入：
-
-  ```rust
-          // §4a.4: GC orphaned sidecars after flush (Rust has no merge —
-          // orphans only ever come from Java-side merges/deletes)
-          let live: Vec<String> = self.infos.segments.iter().map(|s| s.info.name.clone()).collect();
-          codec_lucene9::bitmap_sidecar::gc_sidecars(&self.dir, &live)?;
-  ```
-
   `add_document` 的 builder 创建改为：
 
   ```rust
@@ -2327,7 +2030,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           }
   ```
 
-  (b) `crates/core/src/segment_builder.rs`：`SegmentBuilder` 加两个字段 + `with_bitmap`；`finalize` 的 postings 块加 sidecar 构建与 fsync：
+  (b) `crates/core/src/segment_builder.rs`：`SegmentBuilder` 加两个字段 + `with_bitmap`；`finalize` 在 `PostingsWriter::new` 之后透传 setter：
 
   ```rust
   pub struct SegmentBuilder {
@@ -2353,7 +2056,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           }
       }
 
-      /// M3 (spec §3): opt into roaring-bitmap sidecar output at finalize
+      /// M3 (spec §3): opt into inline roaring-bitmap output at finalize
       /// (default off; IndexWriterConfig::bitmap / --bitmap-threshold).
       pub fn with_bitmap(mut self, enabled: bool, threshold: u32) -> Self {
           self.bitmap_enabled = enabled;
@@ -2362,7 +2065,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       }
   ```
 
-  `finalize` 开头的解构要带上新字段（否则会漏）：
+  `finalize` 开头的解构带上新字段：
 
   ```rust
           let Self {
@@ -2376,16 +2079,17 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           } = self;
   ```
 
-  `if has_indexed` 块改为（在 `PostingsWriter::new` 之后建 builder、`write_term` 之后喂 docs、`pw.finish()` 之后写文件 + fsync）：
+  `if has_indexed` 块整体替换为（只在 `PostingsWriter::new` 之后多三行 setter 透传，term 循环逐行不变，完整列出便于核对）：
 
   ```rust
           if has_indexed {
               let mut pw = PostingsWriter::new(&dir, &seg_name, &seg_id)?;
-              // M3 (spec §4): the sidecar builds alongside the term loop —
-              // the docs slices are already in RAM, so this is O(df) CPU
+              // M3 (spec §3/§4): the inline bitmap builds inside write_term
+              // — the docs slices are already in RAM, so this is O(df) CPU
               // and zero extra IO
-              let mut sidecar =
-                  bitmap_enabled.then(|| codec_lucene9::bitmap_sidecar::SidecarBuilder::new(&seg_name, max_doc));
+              if bitmap_enabled {
+                  pw.set_bitmap_threshold(bitmap_threshold);
+              }
               for (number, spec) in dw.fields().iter().enumerate() {
                   if !spec.is_indexed() || !field_has_terms(&dw, number) {
                       continue;
@@ -2402,61 +2106,53 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                           None
                       };
                       pw.write_term(dict.bytes_of(id), &pb.docs, &pb.freqs, positions)?;
-                      if let Some(sb) = sidecar.as_mut() {
-                          if pb.docs.len() as u32 >= bitmap_threshold {
-                              sb.add_term(&spec.name, dict.bytes_of(id), &pb.docs);
-                          }
-                      }
                   }
                   pw.finish_field()?;
               }
               postings_files = pw.finish()?;
-              // §4a.2/3: the sidecar is a directory-level file outside
-              // Lucene's managed namespace — never listed in .si files.
-              // fsync it here because commit_infos only syncs .si-listed
-              // files; a torn sidecar after a crash degrades to "no
-              // bitmap" at read time (§4a.6), never to a query error.
-              if let Some(sb) = sidecar {
-                  if !sb.is_empty() {
-                      let name = sb.write(&dir, &seg_id)?;
-                      dir.sync(&[name.as_str()])?;
-                  }
-              }
           }
   ```
 
-- [ ] **Step 3.9: 跑测试确认通过（core 3 个新测试 + 全量回归）**
+- [ ] **Step 3.9: 跑测试确认通过（core 2 个新测试 + 全量回归）**
 
   ```
   $ cargo test -p rustlucene-core index_writer 2>&1 | tail -3
-  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   $ cargo test -p rustlucene-core 2>&1 | tail -3
-  test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   ```
 
 - [ ] **Step 3.10: 提交（core 部分）**
 
   ```
   git add crates/core/src/index_writer.rs crates/core/src/segment_builder.rs
-  git commit -m "feat: build roaring sidecars at segment flush behind --bitmap (M3 §4/§4a)"
+  git commit -m "feat: wire --bitmap/--bitmap-threshold through IndexWriterConfig to PostingsWriter"
   ```
 
 ---
 
-## Task 4: 读侧 RoaringDocIter + Term 接入（spec §5 档 1）
+## Task 4: 读侧定位/校验 + RoaringDocIter + Term 接入（spec §5 档 1）
+
+codec 提供 `PostingsReader::inline_bitmap`（定位 + 四重校验 + 反序列化）；core 接线三档规则的档 1。
 
 **Files:**
+- Modify: `crates/codec-lucene9/src/postings_read.rs`（`inline_bitmap` + `max_bitmap_len`）
 - Modify: `crates/core/src/search/doc_iter.rs`（`RoaringDocIter` + `SegmentDocIter::Roaring`）
-- Modify: `crates/core/src/search/segment_reader.rs`（sidecar 字段 + `open_with_bitmap` + `roaring_bitmap`）
+- Modify: `crates/core/src/search/segment_reader.rs`（`bitmap_enabled` 字段 + `open_with_bitmap` + `roaring_bitmap`）
 - Modify: `crates/core/src/search/reader.rs`（`Reader::open_with_bitmap`）
 - Modify: `crates/core/src/search/searcher.rs`（`Searcher::open_with_bitmap`）
 - Modify: `crates/core/src/search/query.rs`（Term 分支档 1）
-- Test: `crates/core/src/search/mod.rs` 的 `#[cfg(test)]` 模块
+- Test: `crates/codec-lucene9/src/postings_read.rs` 与 `crates/core/src/search/mod.rs` 的 `#[cfg(test)]` 模块
 
 **Interfaces:**
-- Consumes: T1 `RoaringBitmap` + `Container::{cardinality, value_at, lower_bound}`；T3 `SidecarReader`/`SidecarTerm`；既有 `SegmentReader::seek_term` / `docs_enum` / `docs_freqs_enum`、`DocIter` 协议（`doc_iter.rs:14-31`）。
+- Consumes: T1 `RoaringBitmap` + `Container::{cardinality, value_at, lower_bound}` + `RoaringBitmap::deserialize`；T3 的 `BITMAP_MAGIC` / `BITMAP_VERSION` / `bitmap_crc32`；`crate::codec_util::index_header_length`（`codec_util.rs:35`）；既有 `PostingsReader::fresh_input`（`postings_read.rs:135`）、`TermEntry.state.doc_start_fp`（`terms_read.rs:26-31`）、`SegmentReader::seek_term` / `docs_enum` / `docs_freqs_enum`、`DocIter` 协议（`doc_iter.rs:14-31`）。
 - Produces（T5/T6 依赖这些名字，不得改名）:
   ```rust
+  // postings_read.rs
+  /// spec §4/§5：定位 + 四重校验 docStartFP 前的内联 bitmap；任一失败
+  /// Ok(None) 静默落档。非 bitmap term 只花 4B（+15B 头）小读。
+  pub fn PostingsReader::inline_bitmap(&self, entry: &TermEntry, max_doc: i32) -> io::Result<Option<RoaringBitmap>>;
+
   // doc_iter.rs
   pub struct RoaringDocIter { .. }
   impl RoaringDocIter {
@@ -2467,24 +2163,258 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   // segment_reader.rs
   pub(crate) fn open_with_bitmap(dir: &FSDirectory, sci: &SegmentCommitInfo, bitmap: bool) -> io::Result<SegmentReader>;
-  /// §5 位图源 + §4a.6 term 级校验（cardinality == postings df），任何
-  /// 不匹配/加载错误 → Ok(None) 静默落档
-  pub(crate) fn roaring_bitmap(&self, field: &str, term: &[u8], doc_freq: u32) -> io::Result<Option<RoaringBitmap>>;
+  pub(crate) fn roaring_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringBitmap>>;
 
   // reader.rs / searcher.rs
   pub fn Reader::open_with_bitmap(dir: &FSDirectory, bitmap: bool) -> io::Result<Reader>;
   pub fn Searcher::open_with_bitmap(dir: &FSDirectory, bitmap: bool) -> io::Result<Searcher>;
   ```
 
-  语义决定：读侧自动探测——segment 有 sidecar 且 term 命中 term 表且校验通过 → roaring；否则原路径。`needs_freq == true` 时 Term 分支不进 roaring（bitmap 无 freq，spec §2；FreqSumCollector 只用于 Term，且 freq_sum 本就走 `total_term_freq` 短路，`searcher.rs:113-121`）。
+  语义决定：读侧自动探测——`docStartFP-4` 的 len 尾缀 + 四重校验回答"有没有 bitmap"（无任何元数据依赖）；`bitmap == false`（`--no-bitmap`）直接短路探测，用于 bench A/B。`needs_freq == true` 时 Term 分支不进 roaring（bitmap 无 freq，spec §2/§5）。
 
 ### Steps
 
-- [ ] **Step 4.1: 写失败测试** — 追加到 `crates/core/src/search/mod.rs` 的 `mod tests`（复用模块内已有 `temp_dir` / `schema` / `doc` 助手；`Searcher::open_with_bitmap`、`SegmentDocIter::Roaring` 尚不存在，编译失败即失败测试成立）：
+- [ ] **Step 4.1: 写 codec 失败测试** — `crates/codec-lucene9/src/postings_read.rs` 的 `mod tests` 追加（`inline_bitmap` 尚不存在，编译失败即失败测试成立）。先加与 `write_segment` 同语料的 bitmap 变体 helper（不改既有 helper，既有测试零触动）：
+
+  ```rust
+      /// Same corpus as write_segment, with the inline-bitmap threshold set
+      /// (None = bitmap off, the Java-written-index analog: the gap before
+      /// docStartFP then holds the previous term's arbitrary postings bytes).
+      /// kw "big" df=200, "tail" df=3; tx "hot" df=5000, "one" df=1,
+      /// "warm" df=200 step 3.
+      fn write_bitmap_segment(dir: &FSDirectory, threshold: Option<u32>) -> FieldInfos {
+          let id = [4u8; 16];
+          let kw = indexed("kw", 0, IndexOptions::Docs);
+          let tx = indexed("tx", 1, IndexOptions::DocsAndFreqs);
+          let mut w = PostingsWriter::new(dir, "_0", &id).unwrap();
+          if let Some(t) = threshold {
+              w.set_bitmap_threshold(t);
+          }
+          w.start_field(&kw, 6000).unwrap();
+          let big: Vec<u32> = (0..200).collect();
+          w.write_term(b"big", &big, &vec![1; 200], None).unwrap();
+          w.write_term(b"tail", &[10, 20, 30], &[1, 1, 1], None).unwrap();
+          w.finish_field().unwrap();
+          w.start_field(&tx, 6000).unwrap();
+          let hot: Vec<u32> = (0..5000).collect();
+          w.write_term(b"hot", &hot, &vec![1; 5000], None).unwrap();
+          w.write_term(b"one", &[42], &[7], None).unwrap();
+          let warm_docs: Vec<u32> = (0..200).map(|i| i * 3).collect();
+          let warm_freqs: Vec<u32> = (0..200).map(|i| (i % 5) + 1).collect();
+          w.write_term(b"warm", &warm_docs, &warm_freqs, None).unwrap();
+          w.finish_field().unwrap();
+          w.finish().unwrap();
+          let fis = FieldInfos::new(vec![kw, tx]);
+          fis.write(dir, "_0", &id, "").unwrap();
+          fis
+      }
+
+      fn hot_entry(dir: &FSDirectory, fis: &FieldInfos) -> TermEntry {
+          seek(dir, fis, "tx", b"hot")
+      }
+
+      /// spec §4/§5: locate + quad-validate; content round-trips; terms
+      /// below the threshold and the bitmap-off case degrade to None.
+      #[test]
+      fn inline_bitmap_round_trip_and_fallbacks() {
+          let root = temp_dir("rbmread");
+          let dir = FSDirectory::open(&root).unwrap();
+          let fis = write_bitmap_segment(&dir, Some(4096));
+          let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+
+          // "hot" (df=5000 >= 4096) -> bitmap; docs preserved
+          let e = hot_entry(&dir, &fis);
+          let bm = postings.inline_bitmap(&e, 6000).unwrap().unwrap();
+          assert_eq!(bm.cardinality(), 5000);
+          let mut docs = Vec::new();
+          for ci in 0..bm.num_containers() {
+              let key = bm.container_key(ci) as u32;
+              let c = bm.container_at(ci);
+              for i in 0..c.cardinality() {
+                  docs.push((key << 16) | c.value_at(i) as u32);
+              }
+          }
+          assert_eq!(docs, (0..5000).collect::<Vec<u32>>());
+
+          // "big"/"warm" (df=200 < 4096) and the singleton -> None
+          let e = seek(&dir, &fis, "kw", b"big");
+          assert!(postings.inline_bitmap(&e, 6000).unwrap().is_none());
+          let e = seek(&dir, &fis, "tx", b"warm");
+          assert!(postings.inline_bitmap(&e, 6000).unwrap().is_none());
+          let e = seek(&dir, &fis, "tx", b"one");
+          assert!(postings.inline_bitmap(&e, 6000).unwrap().is_none());
+
+          // postings enums unaffected by the gap bytes (pure seek)
+          let e = hot_entry(&dir, &fis);
+          let mut en = postings.docs_and_freqs(&e).unwrap();
+          assert_eq!(en.next_doc().unwrap(), 0);
+          assert_eq!(en.next_doc().unwrap(), 1);
+          assert_eq!(en.advance(4999).unwrap(), 4999);
+          assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+
+          // bitmap off: docStartFP-4 holds the previous term's arbitrary
+          // bytes -> quad validation must reject, never error
+          let root2 = temp_dir("rbmreadoff");
+          let dir2 = FSDirectory::open(&root2).unwrap();
+          let fis2 = write_bitmap_segment(&dir2, None);
+          let postings2 = PostingsReader::open(&dir2, "_0", &[4u8; 16]).unwrap();
+          let e = hot_entry(&dir2, &fis2);
+          assert!(postings2.inline_bitmap(&e, 6000).unwrap().is_none());
+          fs::remove_dir_all(&root).unwrap();
+          fs::remove_dir_all(&root2).unwrap();
+      }
+
+      /// 四重校验逐项：magic / version / df / crc32 任一损坏 -> None（静默）。
+      #[test]
+      fn inline_bitmap_validation_failures_degrade_to_none() {
+          let root = temp_dir("rbmcorrupt");
+          let dir = FSDirectory::open(&root).unwrap();
+          let fis = write_bitmap_segment(&dir, Some(4096));
+          let e = hot_entry(&dir, &fis);
+          let fp = e.state.doc_start_fp;
+          let doc_path = root.join(crate::postings::file_name("_0", "doc"));
+          let len = {
+              let bytes = fs::read(&doc_path).unwrap();
+              let at = (fp - 4) as usize;
+              u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as u64
+          };
+          let block_start = fp - 4 - len;
+
+          for (off_in_block, tag) in [
+              (0u64, "magic"),
+              (4, "version"),
+              (5, "df vint first byte"),
+              (len - 1, "crc last byte"),
+          ] {
+              let good = fs::read(&doc_path).unwrap();
+              let mut bad = good.clone();
+              bad[(block_start + off_in_block) as usize] ^= 0xFF;
+              fs::write(&doc_path, &bad).unwrap();
+              let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+              assert!(
+                  postings.inline_bitmap(&e, 6000).unwrap().is_none(),
+                  "corrupted {tag} must degrade to None"
+              );
+              fs::write(&doc_path, &good).unwrap(); // restore for the next case
+          }
+          fs::remove_dir_all(&root).unwrap();
+      }
+  ```
+
+  （df=5000 的 VInt 首字节在块内偏移 5 处；翻转它使 df 变为 5000±128 ≠ termState.df。）
+
+- [ ] **Step 4.2: 跑测试确认失败**
+
+  ```
+  $ cargo test -p codec-lucene9 inline_bitmap 2>&1 | tail -5
+  error[E0599]: no method named `inline_bitmap` found for struct `PostingsReader`
+  ```
+
+- [ ] **Step 4.3: 实现 codec 读侧** — `crates/codec-lucene9/src/postings_read.rs`：use 区的 `crate::postings::{...}` 列表加 `BITMAP_MAGIC, BITMAP_VERSION, bitmap_crc32`，`crate::codec_util::{...}` 列表加 `index_header_length`，新增 `use crate::roaring::RoaringBitmap;`；`impl PostingsReader` 内（`fresh_input` 之后）加：
+
+  ```rust
+      /// spec §4/§5: locate + quad-validate the inline bitmap immediately
+      /// before docStartFP — len 有界（按 maxDoc 推算）且块不越入 .doc
+      /// header 区 → magic → df == termState.df → crc32. Any failure
+      /// degrades to `Ok(None)`: the caller falls back to the postings
+      /// path and a garbage gap block must never cause an error. Lazy by
+      /// construction (§5 惰性加载): a non-bitmap term costs only a 4B
+      /// (+15B header) read; the payload is read only for real bitmaps.
+      pub fn inline_bitmap(
+          &self,
+          entry: &TermEntry,
+          max_doc: i32,
+      ) -> io::Result<Option<RoaringBitmap>> {
+          let fp = entry.state.doc_start_fp;
+          if fp < 4 {
+              return Ok(None);
+          }
+          let mut in_ = self.fresh_input()?;
+          in_.seek(fp - 4)?;
+          let len = in_.read_int()? as u32 as u64;
+          if len < 16 || len > max_bitmap_len(max_doc) || len + 4 > fp {
+              return Ok(None);
+          }
+          let block_start = fp - 4 - len;
+          if block_start < index_header_length(DOC_CODEC, SEGMENT_SUFFIX) as u64 {
+              return Ok(None);
+          }
+          in_.seek(block_start)?;
+          let mut block = vec![0u8; len as usize];
+          in_.read_bytes(&mut block)?;
+          // magic + version (cheap reject before any further work)
+          if u32::from_le_bytes(block[0..4].try_into().unwrap()) != BITMAP_MAGIC {
+              return Ok(None);
+          }
+          if block[4] != BITMAP_VERSION {
+              return Ok(None);
+          }
+          // df == termState.df (cardinality 同值构建, spec §4)
+          let mut cur = IndexInput::in_memory(block.clone());
+          cur.seek(5)?;
+          if cur.read_vint()? != entry.doc_freq as i32 {
+              return Ok(None);
+          }
+          if cur.read_vint()? != entry.doc_freq as i32 {
+              return Ok(None);
+          }
+          // payload, then exactly 4 crc bytes must remain
+          let bm = match RoaringBitmap::deserialize(&mut cur) {
+              Ok(bm) => bm,
+              Err(_) => return Ok(None),
+          };
+          if bm.cardinality() != entry.doc_freq as u64 {
+              return Ok(None);
+          }
+          if cur.file_pointer() + 4 != len {
+              return Ok(None);
+          }
+          // crc32 over header+payload (spec §4 四重校验的最后一项)
+          let stored = u32::from_le_bytes(block[len as usize - 4..].try_into().unwrap());
+          if bitmap_crc32(&block[..len as usize - 4]) != stored {
+              return Ok(None);
+          }
+          Ok(Some(bm))
+      }
+  ```
+
+  文件级（`impl PostingsReader` 之外）加：
+
+  ```rust
+  /// spec §4 四重校验的 len 上限：maxDoc 个 doc 至多 ceil(maxDoc/65536)
+  /// 个容器，每个至多 8KB bitset + 数字节头（key/tag/cardinality ≈ 8B）；
+  /// 24 = 头(≤15B) + numContainers(≤3B) + crc(4B) 的余量。超出即非 bitmap 块。
+  fn max_bitmap_len(max_doc: i32) -> u64 {
+      let containers = (max_doc.max(0) as u64 + 65535) / 65536;
+      24 + containers * 8200
+  }
+  ```
+
+- [ ] **Step 4.4: 跑测试确认通过（codec 2 个新测试 + 全量回归 + T3 前置锁定的 core 测试）**
+
+  ```
+  $ cargo test -p codec-lucene9 inline_bitmap 2>&1 | tail -3
+  test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  $ cargo test -p codec-lucene9 2>&1 | tail -3
+  test result: ok. 153 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+  $ cargo test -p rustlucene-core index_writer 2>&1 | tail -3
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  ```
+
+  （codec 3 个 = T3 的 1 + 本任务 2；153 = 151 + 2；core 的 T3 测试在本步接口落地后转绿。）
+
+- [ ] **Step 4.5: 提交（codec 读侧）**
+
+  ```
+  git add crates/codec-lucene9/src/postings_read.rs
+  git commit -m "feat: locate and quad-validate inline term bitmaps on the read path (M3 §4/§5)"
+  ```
+
+- [ ] **Step 4.6: 写 core 失败测试** — 追加到 `crates/core/src/search/mod.rs` 的 `mod tests`（复用模块内已有 `temp_dir` / `schema` / `doc` 助手；`Searcher::open_with_bitmap`、`SegmentDocIter::Roaring` 尚不存在，编译失败即失败测试成立）：
 
   ```rust
       /// 10 docs, threshold 4: message "common" (df=10) and level INFO/WARN
-      /// (df=5) get sidecar bitmaps; w{i} (df=1) stay postings-only.
+      /// (df=5) get inline bitmaps; w{i} (df=1) stay postings-only.
       fn write_bitmap_corpus(root: &std::path::Path, bitmap: bool) {
           let mut cfg = IndexWriterConfig::default();
           cfg.bitmap = bitmap;
@@ -2516,7 +2446,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
               assert_eq!(on.count(&q).unwrap(), off.count(&q).unwrap(), "count {q:?}");
               assert_eq!(on.top_docs(&q, 20).unwrap(), off.top_docs(&q, 20).unwrap(), "docs {q:?}");
           }
-          // freq_sum unaffected (total_term_freq shortcut)
+          // freq_sum unaffected (total_term_freq shortcut; spec §5 freq 永远走 postings)
           assert_eq!(
               on.freq_sum(&Query::term("message", "common")).unwrap(),
               off.freq_sum(&Query::term("message", "common")).unwrap()
@@ -2577,11 +2507,11 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       }
 
       #[test]
-      fn no_sidecar_segment_stays_on_postings() {
+      fn no_bitmap_segment_stays_on_postings() {
           let root = temp_dir("rbmnone");
           write_bitmap_corpus(&root, false); // bitmap off at write time
           let dir = FSDirectory::open(&root).unwrap();
-          // read side auto-detects: no sidecar -> postings (spec §5 档规则按段独立)
+          // read side auto-detects: no inline bitmap -> postings (spec §5 档规则按段独立)
           let mut reader = Reader::open(&dir).unwrap();
           let (_, seg) = reader.leaves().next().unwrap();
           let it = Query::term("message", "common")
@@ -2595,7 +2525,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   同时在 `mod tests` 的 use 块加一行 `use codec_lucene9::postings_read::NO_MORE_DOCS;`。
 
-- [ ] **Step 4.2: 跑测试确认失败**
+- [ ] **Step 4.7: 跑测试确认失败**
 
   ```
   $ cargo test -p rustlucene-core roaring 2>&1 | tail -5
@@ -2603,14 +2533,14 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   ...（SegmentDocIter::Roaring 同样未定义）
   ```
 
-- [ ] **Step 4.3: 最小实现** — 五处修改：
+- [ ] **Step 4.8: 最小实现（core 接线）** — 五处修改：
 
   (a) `crates/core/src/search/doc_iter.rs`：`use codec_lucene9::roaring::RoaringBitmap;` 加到 use 块；`RoaringDocIter` 插在 `// ── SegmentDocIter` 注释之前：
 
   ```rust
-  // ── Roaring (M3 bitmap sidecar) ───────────────────────────────────────
+  // ── Roaring (M3 inline bitmap) ────────────────────────────────────────
 
-  /// DocIter over a (sidecar-loaded or query-materialized) roaring bitmap
+  /// DocIter over a (inline-loaded or query-materialized) roaring bitmap
   /// (spec M3 §5): next_doc walks (container, index-in-container); advance
   /// is a container lookup + intra-container lower_bound. freq() is 1 —
   /// the bitmap carries no freqs (doc-set semantics, ConstantScore).
@@ -2714,7 +2644,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   }
   ```
 
-  `SegmentDocIter` 枚举加变体与四个 match 分支：
+  `SegmentDocIter` 枚举加变体与三个 match 分支：
 
   ```rust
   pub enum SegmentDocIter {
@@ -2731,7 +2661,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   （`doc_id`/`next_doc`/`advance` 三个 match 各加 `Self::Roaring(r) => r.xxx(...)`；`freq` 的 match 走 `_ => 1` 既有分支，无需改。）
 
-  (b) `crates/core/src/search/segment_reader.rs`：use 块加 `use codec_lucene9::bitmap_sidecar::SidecarReader;` 与 `use codec_lucene9::roaring::RoaringBitmap;`；结构体加字段 + 两个方法：
+  (b) `crates/core/src/search/segment_reader.rs`：use 块加 `use codec_lucene9::roaring::RoaringBitmap;`；结构体加字段 + 两个方法：
 
   ```rust
   pub struct SegmentReader {
@@ -2739,7 +2669,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       field_infos: FieldInfos,
       terms: TermsDict,
       postings: PostingsReader,
-      sidecar: Option<SidecarReader>,
+      bitmap_enabled: bool,
   }
 
   impl SegmentReader {
@@ -2747,8 +2677,9 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           Self::open_with_bitmap(dir, sci, true)
       }
 
-      /// `bitmap == false` disables the roaring sidecar read path (bench
-      /// A/B switch, spec M3 §5); with `true` the sidecar is auto-detected.
+      /// `bitmap == false` disables the inline-bitmap read path (bench A/B
+      /// switch, spec M3 §5); with `true` bitmaps are auto-detected via the
+      /// docStartFP-4 len suffix + quad validation.
       pub(crate) fn open_with_bitmap(
           dir: &FSDirectory,
           sci: &SegmentCommitInfo,
@@ -2759,44 +2690,23 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           let field_infos = FieldInfos::read(dir, segment, segment_id, "")?;
           let terms = TermsDict::open(dir, segment, segment_id, &field_infos)?;
           let postings = PostingsReader::open(dir, segment, segment_id)?;
-          let sidecar = if bitmap {
-              SidecarReader::open(dir, segment, segment_id, sci.info.doc_count)?
-          } else {
-              None
-          };
           Ok(SegmentReader {
               max_doc: sci.info.doc_count,
               field_infos,
               terms,
               postings,
-              sidecar,
+              bitmap_enabled: bitmap,
           })
       }
 
-      /// M3 §5 bitmap source + §4a.6 term-level validation: the sidecar
-      /// row's df/cardinality must equal the postings df the reader
-      /// already knows; any mismatch or payload error degrades to
-      /// `Ok(None)` (silent fallback to the postings path — a bad sidecar
-      /// must never affect queries).
-      pub(crate) fn roaring_bitmap(
-          &self,
-          field: &str,
-          term: &[u8],
-          doc_freq: u32,
-      ) -> io::Result<Option<RoaringBitmap>> {
-          let Some(sidecar) = &self.sidecar else {
-              return Ok(None);
-          };
-          let Some(entry) = sidecar.term_entry(field, term) else {
-              return Ok(None);
-          };
-          if entry.doc_freq != doc_freq || entry.cardinality != doc_freq as u64 {
+      /// M3 §5 bitmap source: the codec probe answers "is there an inline
+      /// bitmap for this term" with quad validation (§4/§5); `bitmap ==
+      /// false` (--no-bitmap) short-circuits for bench A/B.
+      pub(crate) fn roaring_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringBitmap>> {
+          if !self.bitmap_enabled {
               return Ok(None);
           }
-          match sidecar.load_bitmap(&entry) {
-              Ok(bm) if bm.cardinality() == doc_freq as u64 => Ok(Some(bm)),
-              _ => Ok(None),
-          }
+          self.postings.inline_bitmap(entry, self.max_doc)
       }
   ```
 
@@ -2809,7 +2719,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
           Self::open_with_bitmap(dir, true)
       }
 
-      /// `bitmap == false` disables roaring sidecar reads in every segment
+      /// `bitmap == false` disables inline-bitmap reads in every segment
       /// (bench A/B on one and the same index, spec M3 §5).
       pub fn open_with_bitmap(dir: &FSDirectory, bitmap: bool) -> io::Result<Reader> {
           let (infos, _generation) = SegmentInfos::read_latest(dir)?;
@@ -2840,7 +2750,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       }
 
       /// `bitmap == false` disables the roaring read path on an index that
-      /// has sidecars — bench A/B on one and the same index (spec M3 §5).
+      /// has inline bitmaps — bench A/B on one and the same index (spec M3 §5).
       pub fn open_with_bitmap(dir: &FSDirectory, bitmap: bool) -> io::Result<Searcher> {
           Ok(Searcher {
               reader: Reader::open_with_bitmap(dir, bitmap)?,
@@ -2855,11 +2765,11 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                   let Some((has_freqs, entry)) = seg.seek_term(field, term)? else {
                       return Ok(None);
                   };
-                  // M3 §5 tier 1: sidecar bitmap -> roaring iteration (freq
+                  // M3 §5 tier 1: inline bitmap -> roaring iteration (freq
                   // consumers keep the postings enum — the bitmap carries
-                  // no freqs, spec §2)
+                  // no freqs, spec §2/§5)
                   if !needs_freq {
-                      if let Some(bm) = seg.roaring_bitmap(field, term, entry.doc_freq)? {
+                      if let Some(bm) = seg.roaring_bitmap(&entry)? {
                           return Ok(Some(SegmentDocIter::Roaring(RoaringDocIter::new(bm))));
                       }
                   }
@@ -2873,16 +2783,16 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
               }
   ```
 
-- [ ] **Step 4.4: 跑测试确认通过（3 个新测试 + 全量回归）**
+- [ ] **Step 4.9: 跑测试确认通过（3 个新测试 + 全量回归）**
 
   ```
   $ cargo test -p rustlucene-core roaring 2>&1 | tail -3
   test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   $ cargo test -p rustlucene-core 2>&1 | tail -3
-  test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   ```
 
-- [ ] **Step 4.5: 提交**
+- [ ] **Step 4.10: 提交**
 
   ```
   git add crates/core/src/search/doc_iter.rs crates/core/src/search/segment_reader.rs crates/core/src/search/reader.rs crates/core/src/search/searcher.rs crates/core/src/search/query.rs crates/core/src/search/mod.rs
@@ -2907,7 +2817,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   pub(crate) fn materialize_roaring(seg: &SegmentReader, entry: &TermEntry, has_freqs: bool) -> io::Result<RoaringBitmap>;
   ```
 
-  档规则（spec §5，per-segment 独立）：子句逐一 `roaring_bitmap` 探测 → 全无 bitmap → 档 3 既有 PFOR 路径**逐字节不动**；≥1 个有 → 无 bitmap 的子句 `materialize_roaring` 物化，全部走 roaring and/or 折叠，结果仍是 roaring，直接迭代（不物化成数组）。And 遇 absent term → `Ok(None)`（无命中，既有语义）；Or 跳过 absent term（既有语义）。`needs_freq == true` 时整支不进 roaring（bitmap 无 freq）。
+  档规则（spec §5，per-segment 独立）：子句逐一 `roaring_bitmap(&entry)` 探测 → 全无 bitmap → 档 3 既有 PFOR 路径**逐字节不动**；≥1 个有 → 无 bitmap 的子句 `materialize_roaring` 物化，全部走 roaring and/or 折叠，结果仍是 roaring，直接迭代（不物化成数组）。And 遇 absent term → `Ok(None)`（无命中，既有语义）；Or 跳过 absent term（既有语义）。`needs_freq == true` 时整支不进 roaring（bitmap 无 freq）。
 
 ### Steps
 
@@ -2921,8 +2831,8 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       }
 
       /// 20 docs: ha df=12 (0..12), hb df=12 (4..16), lo df=2 {0,1},
-      /// lo2 df=2 {1,2}; threshold 4 puts ha/hb in the sidecar, lo/lo2
-      /// stay postings-only. u{i} keeps every doc's message non-empty.
+      /// lo2 df=2 {1,2}; threshold 4 puts ha/hb inline, lo/lo2 stay
+      /// postings-only. u{i} keeps every doc's message non-empty.
       fn write_tier_corpus(root: &std::path::Path) {
           let mut cfg = IndexWriterConfig::default();
           cfg.bitmap = true;
@@ -3079,8 +2989,9 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                   }
                   // M3 §5: the per-clause bitmap probe decides the tier.
                   // Probing is skipped for freq consumers (the bitmap
-                  // carries no freqs, spec §2); with no sidecar,
-                  // roaring_bitmap returns None immediately.
+                  // carries no freqs, spec §2/§5); with no inline bitmap,
+                  // roaring_bitmap returns None after the cheap len/header
+                  // checks.
                   let mut clauses: Vec<(u32, codec_lucene9::terms_read::TermEntry, Option<RoaringBitmap>)> =
                       Vec::new();
                   let mut has_freqs = false;
@@ -3093,7 +3004,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                       let bm = if needs_freq {
                           None
                       } else {
-                          seg.roaring_bitmap(field, t, entry.doc_freq)?
+                          seg.roaring_bitmap(&entry)?
                       };
                       any_bitmap |= bm.is_some();
                       clauses.push((entry.doc_freq, entry, bm));
@@ -3107,7 +3018,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                           seg, field, &entries, needs_freq,
                       )?)));
                   }
-                  // tiers 1/2: one roaring engine; clauses without a sidecar
+                  // tiers 1/2: one roaring engine; clauses without an inline
                   // bitmap are materialized at query time (spec §5 tier 2,
                   // df < threshold bounded)
                   let mut bms: Vec<RoaringBitmap> = Vec::with_capacity(clauses.len());
@@ -3151,7 +3062,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
                           let bm = if needs_freq {
                               None
                           } else {
-                              seg.roaring_bitmap(field, t, entry.doc_freq)?
+                              seg.roaring_bitmap(&entry)?
                           };
                           any_bitmap |= bm.is_some();
                           clauses.push((entry.doc_freq, entry, bm));
@@ -3192,7 +3103,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   $ cargo test -p rustlucene-core three_tier 2>&1 | tail -3
   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   $ cargo test -p rustlucene-core 2>&1 | tail -3
-  test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+  test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   ```
 
 - [ ] **Step 5.5: 提交**
@@ -3204,11 +3115,12 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
 ---
 
-## Task 6: diff 电池 `--bitmap` 变体 + CLI 接线 + bench 三路报告
+## Task 6: diff 电池 `--bitmap` 变体（含 Java forceMerge 实证）+ CLI 接线 + bench 三路报告
 
 **Files:**
 - Modify: `crates/core/src/bin/rustlucene-cli.rs`（logwrite `--bitmap`/`--bitmap-threshold`、searchdump/searchbench `--no-bitmap`、usage 文本）
-- Modify: `interop/verify-log.sh`（变体参数改名 + `--bitmap` 分支：sidecar 存在性、CheckIndex 前后 sha256、on/off searchdump diff；verify-search.sh 旗标过滤）
+- Create: `interop/java/ForceMerge.java`（最小 forceMerge 工具，CFS 关）
+- Modify: `interop/verify-log.sh`（变体参数改名 + `--bitmap` 分支：on/off searchdump diff + Java forceMerge 后再对拍；verify-search.sh 旗标过滤）
 - Modify: `Makefile`（log-test 加第五变体）
 - Create: `bench/run-bitmap-bench.sh`
 - Test: 端到端即测试（`make log-test` 五变体 + 三路 counts diff）
@@ -3220,6 +3132,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions] [--sparse] [--bigdict] [--bitmap] [--bitmap-threshold N]
   rustlucene-cli searchdump <indexDir> <numDocs> <seed> [--positions] [--no-bitmap]
   rustlucene-cli searchbench <indexDir> <field> [...] [--load-queries FILE] [--no-bitmap]
+  java -cp <cp> ForceMerge <indexDir>
   interop/verify-log.sh [numDocs] [seed] [--positions|--sparse|--bigdict|--bitmap]
   ```
   bench 数据/报告：`.superpowers/sdd/m3-{write-on,write-off,disk}.out`、`.superpowers/sdd/m3-q.txt`、`.superpowers/sdd/m3-bench-{roaring,pfor,java}.out`、`.superpowers/sdd/m3-counts-*`、`.superpowers/sdd/m3-bitmap-bench-report.md`（gitignored，不进 git）。
@@ -3232,7 +3145,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   ```rust
   /// Single-writer log-schema indexing (the interop counterpart of JavaLogBench).
-  /// `bitmap` builds roaring sidecars for terms with df >= bitmap_threshold
+  /// `bitmap` writes inline roaring blocks for terms with df >= bitmap_threshold
   /// (M3 spec §3; CLI flags --bitmap / --bitmap-threshold N).
   #[allow(clippy::too_many_arguments)]
   fn logwrite(
@@ -3358,17 +3271,45 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       eprintln!("  rustlucene-cli searchbench <indexDir> <field> [--warmup N] [--iter N] [--tasks N] [--seed S] [--load-queries FILE] [--no-bitmap]");
   ```
 
-- [ ] **Step 6.2: `interop/verify-log.sh` 改造** — 全文件替换为（要点：变体参数改名 VARIANT；传给 verify-search.sh 的旗标过滤为仅 `--positions`；`--bitmap` 分支做 sidecar 存在性检查、CheckIndex 前后 sha256 比对、bitmap on/off searchdump diff；JavaLogBench 对未知旗标虽静默忽略——`JavaLogBench.java:73-76`——仍显式过滤掉 `--bitmap`）：
+- [ ] **Step 6.2: 新增 `interop/java/ForceMerge.java`** — `interop/java/` 现有 16 个工具无 forceMerge 入口（已核实），新增最小工具。**必须 `setUseCompoundFile(false)`**：Java 默认 merge 可能产出 CFS 复合文件，Rust 读侧无 CFS 支持（关键设计事实 6）；这也顺带实证 §4a.4"CFS 无关"不在本电池路径上。`Makefile:9-11` 的 `javac interop/java/*.java` 通配自动编译，无需改 Makefile 编译段：
+
+  ```java
+  import java.nio.file.*;
+  import org.apache.lucene.index.*;
+  import org.apache.lucene.store.*;
+
+  /**
+   * M3 battery tool (spec §8): force-merge an index in place to one segment.
+   * The merged segment is re-encoded through PostingsEnum, so it carries no
+   * inline roaring bitmap and per-segment execution naturally falls back to
+   * the postings tier (spec §4a.4). Compound files are disabled because the
+   * Rust reader has no CFS support. Used by interop/verify-log.sh --bitmap:
+   * after the merge, Rust and Java search dumps must still be identical.
+   *
+   * Usage: ForceMerge <indexDir>
+   */
+  public class ForceMerge {
+      public static void main(String[] args) throws Exception {
+          try (Directory dir = FSDirectory.open(Paths.get(args[0]));
+               IndexWriter w = new IndexWriter(dir, new IndexWriterConfig().setUseCompoundFile(false))) {
+              w.forceMerge(1);
+          }
+          System.out.println("FORCEMERGE_OK");
+      }
+  }
+  ```
+
+- [ ] **Step 6.3: `interop/verify-log.sh` 改造** — 全文件替换为（要点：变体参数改名 VARIANT；传给 verify-search.sh 的旗标过滤为仅 `--positions`；`--bitmap` 分支做 bitmap on/off searchdump diff + Java forceMerge 后 CheckIndex + 合并后 Java↔Rust 对拍 + 合并前后结果不变对拍，覆盖 spec §8 全部三项终验）：
 
   ```bash
   #!/usr/bin/env bash
   # M2 interop: Rust writes a log-schema index -> Java CheckIndex + query dump;
   # Java writes the same corpus with stock Lucene -> CheckIndex + query dump;
   # the two dumps must be identical.
-  # M3: with --bitmap the Rust logwrite also emits roaring sidecar files
-  # (rbm<seg>.bin, spec §4a); the variant additionally checks that the
-  # sidecars are present, that Java CheckIndex leaves them byte-identical
-  # (§4a.3/5), and that bitmap on/off searchdumps are identical (§8).
+  # M3: with --bitmap the Rust logwrite also inlines roaring bitmap blocks in
+  # .doc (spec §4); the variant additionally checks that bitmap on/off
+  # searchdumps are identical (§8), and force-merges the index with Java to
+  # prove the merged (bitmap-free) segment still searches identically (§8).
   # Usage: interop/verify-log.sh [numDocs] [seed] [--positions|--sparse|--bigdict|--bitmap]
   set -euo pipefail
 
@@ -3387,12 +3328,6 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
     logwrite "$RUST_DIR" "$NUM_DOCS" "$SEED" $VARIANT
 
-  if [ "$VARIANT" = "--bitmap" ]; then
-    echo "== Sidecar files present (rbm<seg>.bin, outside the .si files set)"
-    ls "$RUST_DIR"/rbm_*.bin
-    sha256sum "$RUST_DIR"/rbm_*.bin > /tmp/rl-rbm-before.sha256
-  fi
-
   echo "== Java: JavaLogBench (same corpus)"
   JAVA_VARIANT="$VARIANT"
   [ "$VARIANT" = "--bitmap" ] && JAVA_VARIANT=""
@@ -3403,11 +3338,6 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
       | grep -E "No problems|FAILED|error" || true
     java -cp "$CP" org.apache.lucene.index.CheckIndex "$side" > /dev/null 2>&1
   done
-
-  if [ "$VARIANT" = "--bitmap" ]; then
-    echo "== Sidecar survives Java CheckIndex byte-identical (§4a.3/5)"
-    sha256sum -c /tmp/rl-rbm-before.sha256
-  fi
 
   echo "== VerifyLogIndex: Rust vs Java dumps"
   EXPECT_POSITIONS=false
@@ -3428,6 +3358,20 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
     cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
       searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" --no-bitmap > /tmp/rl-search-nobitmap.out
     diff -u /tmp/rl-search-rust.out /tmp/rl-search-nobitmap.out
+
+    echo "== Java forceMerge: merged segment has no bitmap, results unchanged (spec §8)"
+    java -cp "$CP" ForceMerge "$RUST_DIR"
+    echo "== CheckIndex $RUST_DIR (post-merge)"
+    java -cp "$CP" org.apache.lucene.index.CheckIndex "$RUST_DIR" 2>&1 \
+      | grep -E "No problems|FAILED|error" || true
+    java -cp "$CP" org.apache.lucene.index.CheckIndex "$RUST_DIR" > /dev/null 2>&1
+    cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
+      searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" > /tmp/rl-search-merged-rust.out
+    java -cp "$CP" VerifySearchIndex "$RUST_DIR" > /tmp/rl-search-merged-java.out
+    echo "== Post-merge: Rust dump vs Java dump"
+    diff -u /tmp/rl-search-merged-rust.out /tmp/rl-search-merged-java.out
+    echo "== Post-merge vs pre-merge: results unchanged (natural fallback)"
+    diff -u /tmp/rl-search-rust.out /tmp/rl-search-merged-rust.out
   fi
 
   echo "LOG_INTEROP_OK"
@@ -3435,11 +3379,11 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   （`interop/verify-search.sh` 不改——它只在第五参收到 `--positions` 或空。）
 
-- [ ] **Step 6.3: `Makefile` 加第五变体** — `log-test` 目标改为（注释同步更新）：
+- [ ] **Step 6.4: `Makefile` 加第五变体** — `log-test` 目标改为（注释同步更新；recipe 行必须是制表符缩进）：
 
   ```make
   # M2 log-schema interop: Rust logwrite vs JavaLogBench, CheckIndex + query diff;
-  # M3 adds the --bitmap roaring-sidecar variant (sidecar survival + on/off diff)
+  # M3 adds the --bitmap inline-bitmap variant (on/off diff + Java forceMerge)
   log-test: build java-classes
   	interop/verify-log.sh 200000 42
   	interop/verify-log.sh 200000 43 --positions
@@ -3448,53 +3392,58 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   	interop/verify-log.sh 200000 46 --bitmap
   ```
 
-- [ ] **Step 6.4: 编译 + 单变体烟测**
+- [ ] **Step 6.5: 编译 + 单变体烟测**
 
   ```
   $ cargo build --release 2>&1 | tail -1
       Finished `release` profile [optimized] target(s) in ...
-  $ interop/verify-log.sh 200000 46 --bitmap 2>&1 | tail -12
-  == Sidecar files present (rbm<seg>.bin, outside the .si files set)
-  -rw-r--r-- ... /tmp/rl-log-rust/rbm_0.bin
+  $ interop/verify-log.sh 200000 46 --bitmap 2>&1 | tail -16
   ...
   == CheckIndex /tmp/rl-log-rust
   No problems were detected with this index.
-  == Sidecar survives Java CheckIndex byte-identical (§4a.3/5)
-  /tmp/rl-log-rust/rbm_0.bin: OK
   ...
   == Bitmap on/off searchdump diff (spec §8: 逐位一致)
+  （diff 无输出）
+  == Java forceMerge: merged segment has no bitmap, results unchanged (spec §8)
+  FORCEMERGE_OK
+  == CheckIndex /tmp/rl-log-rust (post-merge)
+  No problems were detected with this index.
+  == Post-merge: Rust dump vs Java dump
+  （diff 无输出）
+  == Post-merge vs pre-merge: results unchanged (natural fallback)
   （diff 无输出）
   SEARCH_INTEROP_OK
   LOG_INTEROP_OK
   ```
 
-  排错提示：on/off diff 非空 → roaring 路径结果与 postings 不一致，回 T4/T5 语义测试；sha256  mismatch → CheckIndex 动了 sidecar（违反 §4a.3/5，回 T3 命名）；`ls` 找不到 rbm → logwrite 的 `--bitmap` 没生效（Step 6.1）。
+  排错提示：on/off diff 非空 → roaring 路径结果与 postings 不一致，回 T4/T5 语义测试；forceMerge 后 Rust dump 报错 →  merged segment 是 CFS 或 Java 写出的 commit 文件读侧有缺口（回 Step 6.2 的 setUseCompoundFile(false)，再查 Rust 读侧对 Java-written .si 的解析）；合并前后 diff 非空 → merge 改变了 doc 集（不该发生，查 docID 映射）。
 
-- [ ] **Step 6.5: `make log-test` 五变体全绿（本任务验收门槛）**
-
-  ```
-  $ make log-test 2>&1 | grep -E "LOG_INTEROP_OK|No problems|FAILED|diff"
-  （五段各一次 LOG_INTEROP_OK；每个 Rust/Java 索引各一次 "No problems"；无任何 diff 输出、无 FAILED）
-  ```
-
-  既有四变体（无 sidecar）全绿 = 读侧自动探测对无 sidecar 索引零影响（档 3 回归）；`--bitmap` 变体绿 = §4a 全契约 + §8 对拍。
-
-- [ ] **Step 6.6: 提交（CLI + 电池）**
+- [ ] **Step 6.6: `make log-test` 五变体全绿（本任务验收门槛）**
 
   ```
-  git add crates/core/src/bin/rustlucene-cli.rs interop/verify-log.sh Makefile
-  git commit -m "feat: log-test --bitmap variant + CLI bitmap switches (M3 §8)"
+  $ make log-test 2>&1 | grep -E "LOG_INTEROP_OK|No problems|FAILED|diff|FORCEMERGE_OK"
+  （五段各一次 LOG_INTEROP_OK；每个 Rust/Java 索引各一次 "No problems"；--bitmap 段另有
+     post-merge 的 "No problems" 与 FORCEMERGE_OK；无任何 diff 输出、无 FAILED）
   ```
 
-- [ ] **Step 6.7: bench 脚本 + 执行** — 新建 `bench/run-bitmap-bench.sh`（chmod +x）：
+  既有四变体（无内联 bitmap）全绿 = 写侧默认 off 字节零变化 + 读侧探测对无 bitmap 索引零影响（档 3 回归）；`--bitmap` 变体绿 = spec §8 三项终验（on/off 逐位一致、CheckIndex、forceMerge 后再对拍）。
+
+- [ ] **Step 6.7: 提交（CLI + 电池 + ForceMerge 工具）**
+
+  ```
+  git add crates/core/src/bin/rustlucene-cli.rs interop/java/ForceMerge.java interop/verify-log.sh Makefile
+  git commit -m "feat: log-test --bitmap variant with Java forceMerge proof + CLI bitmap switches (M3 §8)"
+  ```
+
+- [ ] **Step 6.8: bench 脚本 + 执行** — 新建 `bench/run-bitmap-bench.sh`（chmod +x）：
 
   ```bash
   #!/usr/bin/env bash
-  # M3 roaring sidecar bench (spec §8): three-way comparison on the SAME
-  # bitmap index — Rust roaring (default) vs Rust PFOR (--no-bitmap) vs
-  # Java Lucene 9.12.3 (--no-cache) — plus write-throughput loss and disk
-  # overhead. 1M docs so message terms cross df 4096 (see 关键设计事实 12).
-  # Data + report land in .superpowers/sdd/ (gitignored).
+  # M3 inline roaring bitmap bench (spec §8): three-way comparison on the
+  # SAME bitmap index — Rust roaring (default) vs Rust PFOR (--no-bitmap)
+  # vs Java Lucene 9.12.3 (--no-cache) — plus write-throughput loss and
+  # .doc size overhead. 1M docs so message terms cross df 4096 (see
+  # 关键设计事实 13). Data + report land in .superpowers/sdd/ (gitignored).
   # Usage: bench/run-bitmap-bench.sh [numDocs] [seed] [tasks]
   set -euo pipefail
 
@@ -3518,7 +3467,7 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
   "$CLI" logwrite "$IDX_OFF" "$DOCS" "$SEED" | tee "$OUT/m3-write-off.out"
   "$CLI" logwrite "$IDX_ON" "$DOCS" "$SEED" --bitmap | tee "$OUT/m3-write-on.out"
   du -sb "$IDX_ON" "$IDX_OFF" | tee "$OUT/m3-disk.out"
-  ls -l "$IDX_ON"/rbm_*.bin | tee -a "$OUT/m3-disk.out"
+  ls -l "$IDX_ON"/_*_Lucene912_0.doc "$IDX_OFF"/_*_Lucene912_0.doc | tee -a "$OUT/m3-disk.out"
 
   echo "== [2/4] dump query set from the bitmap index (Java SearchBench)"
   java -cp "$CP" SearchBench "$IDX_ON" message \
@@ -3557,14 +3506,14 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
   （counts 三路 diff 为空 = spec §8 "同一查询电池 bitmap on/off 结果逐位一致" + Java 终验在 bench 语料上成立。）
 
-- [ ] **Step 6.8: bench 报告落盘** — 写 `.superpowers/sdd/m3-bitmap-bench-report.md`（gitignored，不进 git），内容必须含：
+- [ ] **Step 6.9: bench 报告落盘** — 写 `.superpowers/sdd/m3-bitmap-bench-report.md`（gitignored，不进 git），内容必须含：
   - 口径行：`--no-cache`（Java 旗标；Rust 本无 query cache）、1000000 docs、seed 42、`--warmup 10 --iter 30`、tasks 100、单线程 logwrite。
-  - 写侧：从 `m3-write-{on,off}.out` 取 `docs_per_sec` 双侧数值与 bitmap 开销百分比；从 `m3-disk.out` 取两索引总字节、rbm 文件总字节与占比。
+  - 写侧：从 `m3-write-{on,off}.out` 取 `docs_per_sec` 双侧数值与 bitmap 开销百分比；从 `m3-disk.out` 取两索引总字节与 `.doc` 文件字节差（内联增量占比）。
   - 读侧三路表：按 `m3-bench-{roaring,pfor,java}.out` 的分组行（query_type × freq），列出 qps 与 p50/p90/p99 三方数值，重点给出 **and/high、or/high、iterm/high** 三组的 roaring vs PFOR 提速比与 roaring vs Java 比。
   - 结论一句：对照 spec §8 预期（高 df AND 提速一个数量级；count 早已 O(1) 无变化空间）判定达标与否；未达标的组只记录不追责。
   - AVX2 有效性（spec §6 "bench 数据门槛"）：`RL_SIMD=0` 重跑一次 Rust roaring searchbench 取同组 qps，与默认（AVX2 分发）对比一句话。
 
-- [ ] **Step 6.9: 提交（bench 脚本；`.superpowers/` 已被 gitignore）**
+- [ ] **Step 6.10: 提交（bench 脚本；`.superpowers/` 已被 gitignore）**
 
   ```
   git add bench/run-bitmap-bench.sh
@@ -3575,11 +3524,12 @@ codec 拥有 sidecar 文件 FORMAT（写 + 读 + 校验 + GC）；core 只在 fl
 
 ## 收尾检查单（全部 Task 完成后逐项核对）
 
-- [ ] `cargo test -p codec-lucene9` 全绿（T1/T2/T3 共 13 个新测试）
-- [ ] `cargo test -p rustlucene-core` 全绿（T3/T4/T5 共 7 个新测试）
+- [ ] `cargo test -p codec-lucene9` 全绿（T1/T2/T3/T4 共 11 个新测试）
+- [ ] `cargo test -p rustlucene-core` 全绿（T3/T4/T5 共 6 个新测试）
 - [ ] `RL_SIMD=0 cargo test -p codec-lucene9 roaring` 全绿（kill switch 标量路径）
-- [ ] `make log-test` 五变体全绿，CheckIndex 全部 "No problems"
+- [ ] `make log-test` 五变体全绿，CheckIndex 全部 "No problems"（含 forceMerge 后）
+- [ ] `make log-test` 的 `--bitmap` 变体：on/off searchdump diff 为空、post-merge Java↔Rust diff 为空、合并前后 diff 为空
 - [ ] `grep -rn "unsafe" crates/core/src/` 无新增（`#![forbid(unsafe_code)]` 兜底）；`#[allow(unsafe_code)]` 仍只出现在 `postings_ll/simd.rs` 与 `roaring/simd.rs`
 - [ ] `Cargo.toml` 两个 crate 均无新依赖
-- [ ] `.si` files 集合不含 rbm（T3 core 测试覆盖）；`make log-test` 的 `--bitmap` 变体 sha256 检查证明 CheckIndex 后 sidecar 字节不变
-- [ ] bench 报告在 `.superpowers/sdd/m3-bitmap-bench-report.md`，含写侧吞吐/磁盘增量/三路读侧数值
+- [ ] bitmap on/off 同语料文件名集合一致（T3 core 测试覆盖，spec §2 不新增任何文件）
+- [ ] bench 报告在 `.superpowers/sdd/m3-bitmap-bench-report.md`，含写侧吞吐/.doc 增量/三路读侧数值

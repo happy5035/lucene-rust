@@ -32,10 +32,12 @@ impl Searcher {
     }
 
     /// Drives the query per segment and feeds global docIDs to the
-    /// collector (leaf-level execution + docBase mapping).
+    /// collector (leaf-level execution + docBase mapping). Collectors that
+    /// don't consume freqs get no-freq postings enums and are passed freq=1.
     pub fn search<C: Collector>(&mut self, query: &Query, collector: &mut C) -> io::Result<()> {
+        let needs_freq = collector.needs_freq();
         for (doc_base, seg) in self.reader.leaves() {
-            let Some(mut iter) = query.segment_iterator(seg)? else {
+            let Some(mut iter) = query.segment_iterator(seg, needs_freq)? else {
                 continue;
             };
             loop {
@@ -43,7 +45,8 @@ impl Searcher {
                 if doc == NO_MORE_DOCS {
                     break;
                 }
-                collector.collect(doc_base + doc, iter.freq());
+                let freq = if needs_freq { iter.freq() } else { 1 };
+                collector.collect(doc_base + doc, freq);
             }
         }
         Ok(())

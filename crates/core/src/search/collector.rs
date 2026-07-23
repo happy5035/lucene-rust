@@ -5,6 +5,12 @@ pub trait Collector {
     /// `doc` is the global docID (docBase applied), `freq` the term freq
     /// (1 for docs-only iterators).
     fn collect(&mut self, doc: i32, freq: u32);
+    /// Whether `collect` consumes the freq argument. When false the search
+    /// drive requests no-freq postings enums (freq PFOR blocks are skipped,
+    /// never decoded) and passes 1 — the count-only fast path.
+    fn needs_freq(&self) -> bool {
+        false
+    }
 }
 
 /// Total hit count (diff battery workhorse).
@@ -57,5 +63,8 @@ pub struct FreqSumCollector {
 impl Collector for FreqSumCollector {
     fn collect(&mut self, _doc: i32, freq: u32) {
         self.total_freq += freq as u64;
+    }
+    fn needs_freq(&self) -> bool {
+        true
     }
 }

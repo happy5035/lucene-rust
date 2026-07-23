@@ -8,8 +8,8 @@ use crate::directory::FSDirectory;
 use crate::io::{DataInput, IndexInput};
 use crate::postings::{file_name, DOC_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX};
 use crate::postings_ll::{
-    for_delta_util_decode, pfor_util_decode, read_group_vints, read_vint15, read_vlong15,
-    BLOCK_SIZE,
+    for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints, read_vint15,
+    read_vlong15, BLOCK_SIZE,
 };
 use crate::terms_read::TermEntry;
 
@@ -66,7 +66,7 @@ impl PostingsReader {
     /// Docs iterator over a DOCS field's postings (no freq blocks on disk).
     pub fn docs(&self, entry: &TermEntry) -> io::Result<DocsEnum> {
         Ok(DocsEnum {
-            core: EnumCore::new(self.fresh_input()?, entry, false)?,
+            core: EnumCore::new(self.fresh_input()?, entry, false, false)?,
         })
     }
 
@@ -74,7 +74,17 @@ impl PostingsReader {
     /// (IndexOptions >= DOCS_AND_FREQS).
     pub fn docs_and_freqs(&self, entry: &TermEntry) -> io::Result<DocsFreqsEnum> {
         Ok(DocsFreqsEnum {
-            core: EnumCore::new(self.fresh_input()?, entry, true)?,
+            core: EnumCore::new(self.fresh_input()?, entry, true, true)?,
+        })
+    }
+
+    /// Docs-only iterator over a field WITH frequencies on disk: full-block
+    /// freq PFOR payloads are skipped byte-wise (self-describing length,
+    /// never decoded), tail freq vints are parsed and discarded. For
+    /// count-only consumers; `freq()` on the returned enum panics.
+    pub fn docs_and_freqs_no_freq(&self, entry: &TermEntry) -> io::Result<DocsFreqsEnum> {
+        Ok(DocsFreqsEnum {
+            core: EnumCore::new(self.fresh_input()?, entry, true, false)?,
         })
     }
 
@@ -85,15 +95,19 @@ impl PostingsReader {
 }
 
 /// BlockDocsEnum state machine (:345-625), shared by the two public enums.
-/// `has_freqs` selects the freq-block decode (DocsFreqsEnum) — Java decodes
-/// freqs lazily on first `freq()` call; M1 decodes eagerly per block
-/// (identical output, simpler control flow).
+/// `has_freqs` describes the on-disk layout (freq blocks present); Java
+/// decodes freqs lazily on first `freq()` call via freqFP, M1 decodes eagerly
+/// per block — except in no-freq mode (`decode_freqs == false`), where the
+/// self-describing PFOR block is stepped over byte-wise and tail freq vints
+/// are parsed and discarded, keeping the stream position identical while
+/// never materializing freq_buffer. `freq()` panics in no-freq mode.
 struct EnumCore {
     doc_in: IndexInput,
     doc_freq: u32,
     total_term_freq: u64,
     singleton_doc_id: i64,
     has_freqs: bool,
+    decode_freqs: bool,
     doc: i64,
     prev_doc_id: i64,
     doc_count_upto: u32,
@@ -108,13 +122,19 @@ struct EnumCore {
 
 impl EnumCore {
     /// reset (:413-446).
-    fn new(doc_in: IndexInput, entry: &TermEntry, has_freqs: bool) -> io::Result<EnumCore> {
+    fn new(
+        doc_in: IndexInput,
+        entry: &TermEntry,
+        has_freqs: bool,
+        decode_freqs: bool,
+    ) -> io::Result<EnumCore> {
         let mut c = EnumCore {
             doc_in,
             doc_freq: entry.doc_freq,
             total_term_freq: entry.total_term_freq,
             singleton_doc_id: entry.state.singleton_doc_id,
             has_freqs,
+            decode_freqs: decode_freqs && has_freqs,
             doc: -1,
             prev_doc_id: -1,
             doc_count_upto: 0,
@@ -235,17 +255,23 @@ impl EnumCore {
     }
 
     /// refillFullBlock (:484-499): ForDelta decode + prefix sum; freq block
-    /// decoded eagerly (Java defers it to the first freq() call via freqFP).
+    /// decoded eagerly (Java defers it to the first freq() call via freqFP),
+    /// or stepped over byte-wise in no-freq mode (same bytes consumed, so the
+    /// stream stays positioned exactly as the decode path leaves it).
     fn refill_full_block(&mut self) -> io::Result<()> {
         let mut deltas = [0u64; BLOCK_SIZE];
         for_delta_util_decode(&mut self.doc_in, &mut deltas)?;
         prefix_sum(&mut deltas, self.prev_doc_id);
         self.doc_buffer[..BLOCK_SIZE].copy_from_slice(&deltas);
         if self.has_freqs {
-            let mut freqs = [0u64; BLOCK_SIZE];
-            pfor_util_decode(&mut self.doc_in, &mut freqs)?;
-            for (dst, src) in self.freq_buffer.iter_mut().zip(freqs) {
-                *dst = src as u32;
+            if self.decode_freqs {
+                let mut freqs = [0u64; BLOCK_SIZE];
+                pfor_util_decode(&mut self.doc_in, &mut freqs)?;
+                for (dst, src) in self.freq_buffer.iter_mut().zip(freqs) {
+                    *dst = src as u32;
+                }
+            } else {
+                pfor_util_skip(&mut self.doc_in)?;
             }
         }
         self.doc_count_upto += BLOCK_SIZE as u32;
@@ -256,7 +282,9 @@ impl EnumCore {
 
     /// refillRemainder (:501-520) + PostingsUtil.readVIntBlock (:30-52):
     /// singleton (no file bytes at all), or a group-vint tail with
-    /// freq==1 folded into the delta's low bit.
+    /// freq==1 folded into the delta's low bit. The (docDelta, freq) vints
+    /// are interleaved, so no-freq mode still parses every freq vint but
+    /// discards it instead of filling freq_buffer.
     fn refill_remainder(&mut self) -> io::Result<()> {
         let left = (self.doc_freq - self.doc_count_upto) as usize;
         if self.doc_freq == 1 {
@@ -271,11 +299,14 @@ impl EnumCore {
                 for i in 0..left {
                     let freq_is_one = values[i] & 1;
                     self.doc_buffer[i] = (values[i] >> 1) as u64;
-                    self.freq_buffer[i] = if freq_is_one == 1 {
+                    let freq = if freq_is_one == 1 {
                         1
                     } else {
                         self.doc_in.read_vint()? as u32
                     };
+                    if self.decode_freqs {
+                        self.freq_buffer[i] = freq;
+                    }
                 }
             } else {
                 for i in 0..left {
@@ -292,6 +323,10 @@ impl EnumCore {
 
     fn freq(&self) -> u32 {
         if self.has_freqs {
+            assert!(
+                self.decode_freqs,
+                "freq() on a no-freq enum: the codec was asked to skip freq decoding"
+            );
             self.freq_buffer[self.doc_buffer_upto - 1]
         } else {
             1
@@ -672,5 +707,107 @@ mod tests {
         let mut en = postings.docs(&e).unwrap();
         assert_eq!(en.advance(100).unwrap(), NO_MORE_DOCS);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// no-freq 模式（多块 + tail）：doc 序列与 freq 解码模式逐 doc 一致，
+    /// 且迭代结束后流位置相同（freq 字节记账不错位）。
+    #[test]
+    fn no_freq_mode_matches_decoding_mode_doc_sequence() {
+        let root = temp_dir("nofreq");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, warm_docs, _) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+
+        // hot df=5000：39 整块（跨 level-1）+ tail 8
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let mut skip_en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        let mut dec_en = postings.docs_and_freqs(&e).unwrap();
+        loop {
+            let (a, b) = (skip_en.next_doc().unwrap(), dec_en.next_doc().unwrap());
+            assert_eq!(a, b);
+            if a == NO_MORE_DOCS {
+                break;
+            }
+        }
+        assert_eq!(
+            skip_en.core.doc_in.file_pointer(),
+            dec_en.core.doc_in.file_pointer(),
+            "stream positions must agree after full iteration"
+        );
+
+        // warm df=200：1 整块（含 PFor 异常）+ tail 72
+        let e = seek(&dir, &fis, "tx", b"warm");
+        let mut en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        for i in 0..200 {
+            assert_eq!(en.next_doc().unwrap(), warm_docs[i] as i32, "doc {i}");
+        }
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        // singleton：df=1 无文件字节，doc 命中
+        let e = seek(&dir, &fis, "tx", b"one");
+        let mut en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        assert_eq!(en.next_doc().unwrap(), 42);
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// no-freq 模式下 advance（跳块、跨 level-1、落空）命中序列与解码模式一致，
+    /// 跳块后与 next_doc 交替不错位。
+    #[test]
+    fn no_freq_mode_advance_matches_decoding_mode() {
+        let root = temp_dir("nofreqadv");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, warm_docs, _) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+
+        // hot：跨多块 + 跨 level-1 的目标序列，两种模式逐点一致
+        let e = seek(&dir, &fis, "tx", b"hot");
+        for target in [0, 1, 127, 128, 1300, 4095, 4096, 4224, 4999, 5000, 9999] {
+            let mut skip_en = postings.docs_and_freqs_no_freq(&e).unwrap();
+            let mut dec_en = postings.docs_and_freqs(&e).unwrap();
+            assert_eq!(
+                skip_en.advance(target).unwrap(),
+                dec_en.advance(target).unwrap(),
+                "target {target}"
+            );
+        }
+        // advance 与 next_doc 交替：跳块后继续迭代，字节位置保持一致
+        let mut skip_en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        let mut dec_en = postings.docs_and_freqs(&e).unwrap();
+        for op in [200, 4096, 4999] {
+            assert_eq!(skip_en.advance(op).unwrap(), dec_en.advance(op).unwrap());
+            assert_eq!(skip_en.next_doc().unwrap(), dec_en.next_doc().unwrap());
+            assert_eq!(
+                skip_en.core.doc_in.file_pointer(),
+                dec_en.core.doc_in.file_pointer(),
+                "stream positions must agree after advance({op})"
+            );
+        }
+        // warm：落空落在下一 doc，与线性扫描期望逐位一致
+        let e = seek(&dir, &fis, "tx", b"warm");
+        for target in [0, 2, 3, 299, 300, 596, 597, 598] {
+            let mut en = postings.docs_and_freqs_no_freq(&e).unwrap();
+            let want = warm_docs
+                .iter()
+                .find(|&&d| d >= target as u32)
+                .map(|&d| d as i32)
+                .unwrap_or(NO_MORE_DOCS);
+            assert_eq!(en.advance(target).unwrap(), want, "target {target}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// no-freq 模式下 freq() 必须 panic（防止误用）。
+    #[test]
+    #[should_panic(expected = "no-freq enum")]
+    fn no_freq_mode_freq_panics() {
+        let root = temp_dir("nofreqpanic");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, _, _) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"warm");
+        let mut en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        assert_eq!(en.next_doc().unwrap(), 0);
+        fs::remove_dir_all(&root).unwrap();
+        let _ = en.freq();
     }
 }

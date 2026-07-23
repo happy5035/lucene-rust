@@ -47,8 +47,11 @@ enum PostingsIter {
     Freqs(DocsFreqsEnum),
 }
 impl PostingsIter {
-    fn new(seg: &SegmentReader, entry: &TermEntry, has_freqs: bool) -> io::Result<Self> {
-        if has_freqs { Ok(PostingsIter::Freqs(seg.docs_freqs_enum(entry)?)) }
+    /// `needs_freq == false` over a DOCS_AND_FREQS field yields a no-freq
+    /// enum: freq blocks are skipped byte-wise and `freq()` panics — only
+    /// count-only consumers (which never call freq) may take that path.
+    fn new(seg: &SegmentReader, entry: &TermEntry, has_freqs: bool, needs_freq: bool) -> io::Result<Self> {
+        if has_freqs { Ok(PostingsIter::Freqs(seg.docs_freqs_enum(entry, needs_freq)?)) }
         else { Ok(PostingsIter::Docs(seg.docs_enum(entry)?)) }
     }
     fn doc_id(&self) -> i32 { match self { Self::Docs(d) => d.doc_id(), Self::Freqs(f) => f.doc_id() } }
@@ -62,11 +65,11 @@ impl PostingsIter {
 pub struct ConjunctionDocIter { sub: Vec<PostingsIter>, doc: i32, lead: usize }
 
 impl ConjunctionDocIter {
-    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)]) -> io::Result<Self> {
+    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)], needs_freq: bool) -> io::Result<Self> {
         let fi = seg.field_info(field);
         let has_freqs = fi.map(|f| f.index_options != IndexOptions::Docs).unwrap_or(false);
         let mut sub = Vec::with_capacity(sorted_entries.len());
-        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs)?); }
+        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?); }
         for s in &mut sub { if s.next_doc()? == NO_MORE_DOCS { return Ok(ConjunctionDocIter { sub, doc: NO_MORE_DOCS, lead: 0 }); } }
         Ok(ConjunctionDocIter { sub, doc: -1, lead: 0 })
     }
@@ -111,11 +114,11 @@ impl DocIter for ConjunctionDocIter {
 pub struct DisjunctionDocIter { sub: Vec<PostingsIter>, doc: i32 }
 
 impl DisjunctionDocIter {
-    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)]) -> io::Result<Self> {
+    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)], needs_freq: bool) -> io::Result<Self> {
         let fi = seg.field_info(field);
         let has_freqs = fi.map(|f| f.index_options != IndexOptions::Docs).unwrap_or(false);
         let mut sub = Vec::with_capacity(sorted_entries.len());
-        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs)?); }
+        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?); }
         for s in &mut sub { s.next_doc()?; }
         Ok(DisjunctionDocIter { sub, doc: -1 })
     }

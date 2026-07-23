@@ -498,6 +498,24 @@ pub fn pfor_util_decode(
     Ok(())
 }
 
+/// PForUtil block skip: consumes exactly the bytes [`pfor_util_decode`]
+/// would read — token, then the packed data (bpv*2 longs = bpv*16 bytes) or
+/// the constant-block VLong, then the (position, high-byte) exception pairs —
+/// without decoding anything. The token's 5 bpv bits cap bpv at 31, so the
+/// bpv > 32 guard of the decode path cannot fire here.
+pub fn pfor_util_skip(input: &mut impl DataInput) -> io::Result<()> {
+    let token = input.read_byte()?;
+    let bits_per_value = token & 0x1f;
+    let num_exceptions = token >> 5;
+    if bits_per_value == 0 {
+        let _ = input.read_vlong()?;
+    } else {
+        input.skip_bytes(bits_per_value as u64 * 16)?;
+    }
+    input.skip_bytes(num_exceptions as u64 * 2)?;
+    Ok(())
+}
+
 /// Lucene912PostingsReader.readVInt15 (:2043-2047): LE short; when the top
 /// bit is set, a VInt carries the high bits. Mirrors [`write_vint15`].
 pub fn read_vint15(input: &mut impl DataInput) -> io::Result<u32> {
@@ -771,6 +789,30 @@ mod tests {
         let bytes = enc(|o| pfor_util_encode(o, &values));
         dec(&bytes, |i| pfor_util_decode(i, &mut back));
         assert_eq!(back, values);
+    }
+
+    #[test]
+    fn pfor_skip_consumes_exact_block_bytes() {
+        // plain / exceptions / constant-with-exception / pure-constant: the
+        // skip walk must land exactly at the end of each encoded block.
+        let mut with_exceptions = java_vector(|x, i| *x = (i % 5 + 1) as u64);
+        with_exceptions[3] = 3000;
+        with_exceptions[77] = 65535;
+        with_exceptions[100] = 999;
+        let mut constant_with_exception = [1u64; BLOCK_SIZE];
+        constant_with_exception[3] = 255;
+        let cases = [
+            enc(|o| pfor_util_encode(o, &java_vector(|x, i| *x = (i % 5 + 1) as u64))),
+            enc(|o| pfor_util_encode(o, &with_exceptions)),
+            enc(|o| pfor_util_encode(o, &constant_with_exception)),
+            enc(|o| pfor_util_encode(o, &[1u64; BLOCK_SIZE])),
+        ];
+        for bytes in cases {
+            let len = bytes.len() as u64;
+            let mut input = IndexInput::in_memory(bytes);
+            pfor_util_skip(&mut input).unwrap();
+            assert_eq!(input.file_pointer(), len);
+        }
     }
 
     #[test]

@@ -62,8 +62,16 @@ impl SegmentReader {
         self.postings.docs(entry)
     }
 
-    pub(crate) fn docs_freqs_enum(&self, entry: &TermEntry) -> io::Result<DocsFreqsEnum> {
-        self.postings.docs_and_freqs(entry)
+    pub(crate) fn docs_freqs_enum(
+        &self,
+        entry: &TermEntry,
+        needs_freq: bool,
+    ) -> io::Result<DocsFreqsEnum> {
+        if needs_freq {
+            self.postings.docs_and_freqs(entry)
+        } else {
+            self.postings.docs_and_freqs_no_freq(entry)
+        }
     }
 
     /// Look up a field info by name (for Boolean query construction).

@@ -25,18 +25,22 @@ impl Query {
         Query::Or { field: field.to_string(), terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect() }
     }
 
-    pub(crate) fn segment_iterator(&self, seg: &mut SegmentReader) -> io::Result<Option<SegmentDocIter>> {
+    pub(crate) fn segment_iterator(
+        &self,
+        seg: &mut SegmentReader,
+        needs_freq: bool,
+    ) -> io::Result<Option<SegmentDocIter>> {
         match self {
             Query::MatchAll => Ok(Some(SegmentDocIter::All(MatchAllIter::new(seg.max_doc())))),
             Query::Term { field, term } => {
                 let Some((has_freqs, entry)) = seg.seek_term(field, term)? else { return Ok(None); };
-                if has_freqs { Ok(Some(SegmentDocIter::Freqs(seg.docs_freqs_enum(&entry)?))) }
+                if has_freqs { Ok(Some(SegmentDocIter::Freqs(seg.docs_freqs_enum(&entry, needs_freq)?))) }
                 else { Ok(Some(SegmentDocIter::Docs(seg.docs_enum(&entry)?))) }
             }
             Query::And { field, terms } => {
                 if terms.len() < 2 {
                     return if let Some(t) = terms.first() {
-                        Query::Term { field: field.clone(), term: t.clone() }.segment_iterator(seg)
+                        Query::Term { field: field.clone(), term: t.clone() }.segment_iterator(seg, needs_freq)
                     } else { Ok(None) };
                 }
                 let mut entries: Vec<(u32, codec_lucene9::terms_read::TermEntry)> = Vec::new();
@@ -45,12 +49,12 @@ impl Query {
                     entries.push((entry.doc_freq, entry));
                 }
                 entries.sort_by_key(|(df, _)| *df);
-                Ok(Some(SegmentDocIter::And(ConjunctionDocIter::new(seg, field, &entries)?)))
+                Ok(Some(SegmentDocIter::And(ConjunctionDocIter::new(seg, field, &entries, needs_freq)?)))
             }
             Query::Or { field, terms } => {
                 if terms.len() < 2 {
                     return if let Some(t) = terms.first() {
-                        Query::Term { field: field.clone(), term: t.clone() }.segment_iterator(seg)
+                        Query::Term { field: field.clone(), term: t.clone() }.segment_iterator(seg, needs_freq)
                     } else { Ok(None) };
                 }
                 let mut entries: Vec<(u32, codec_lucene9::terms_read::TermEntry)> = Vec::new();
@@ -59,7 +63,7 @@ impl Query {
                 }
                 if entries.is_empty() { return Ok(None); }
                 entries.sort_by_key(|(df, _)| *df);
-                Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(seg, field, &entries)?)))
+                Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(seg, field, &entries, needs_freq)?)))
             }
         }
     }

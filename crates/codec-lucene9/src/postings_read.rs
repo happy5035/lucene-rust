@@ -7,7 +7,10 @@ use crate::codec_util::{check_footer, check_footer_structure, check_index_header
 use crate::directory::FSDirectory;
 use crate::io::{DataInput, IndexInput};
 use crate::postings::{file_name, DOC_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX};
-use crate::postings_ll::{for_delta_util_decode, pfor_util_decode, read_group_vints, BLOCK_SIZE};
+use crate::postings_ll::{
+    for_delta_util_decode, pfor_util_decode, read_group_vints, read_vint15, read_vlong15,
+    BLOCK_SIZE,
+};
 use crate::terms_read::TermEntry;
 
 /// DocIdSetIterator.NO_MORE_DOCS.
@@ -133,6 +136,10 @@ impl EnumCore {
             c.level1_last_doc = -1;
             c.level1_doc_end_fp = entry.state.doc_start_fp;
         }
+        // Sentinel (BlockDocsEnum.java:395): refillFullBlock never writes
+        // index BLOCK_SIZE, refillRemainder plants its own sentinel at
+        // `left`; this guarantees the advance buffer scan terminates.
+        c.doc_buffer[BLOCK_SIZE] = NO_MORE_DOCS as u64;
         Ok(c)
     }
 
@@ -189,6 +196,38 @@ impl EnumCore {
                     let num_skip_bytes = self.doc_in.read_short()? as u16 as u64;
                     self.doc_in.skip_bytes(num_skip_bytes)?;
                 }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// skipLevel0To (:548-571): consumes level-0 skip entries (VLong
+    /// skip0NumBytes, VInt15 docDelta, VLong15 blockTotalBytes — impacts/pos
+    /// sections skipped via skip0NumBytes), skipping every full block whose
+    /// last doc < target without decoding it. On return either the stream is
+    /// positioned at the data of the block that may contain target
+    /// (level0_last_doc >= target), or the full blocks are exhausted
+    /// (level0_last_doc == NO_MORE_DOCS, stream at the VInt tail).
+    fn skip_level0_to(&mut self, target: i64) -> io::Result<()> {
+        loop {
+            self.prev_doc_id = self.level0_last_doc;
+            if self.doc_freq - self.doc_count_upto >= BLOCK_SIZE as u32 {
+                let skip0_num_bytes = self.doc_in.read_vlong()? as u64;
+                // end offset of skip data (before the actual data starts)
+                let skip0_end_fp = self.doc_in.file_pointer() + skip0_num_bytes;
+                let doc_delta = read_vint15(&mut self.doc_in)?;
+                self.level0_last_doc += doc_delta as i64;
+                if target <= self.level0_last_doc {
+                    self.doc_in.seek(skip0_end_fp)?;
+                    break;
+                }
+                // skip block
+                let block_total_bytes = read_vlong15(&mut self.doc_in)?;
+                self.doc_in.skip_bytes(block_total_bytes)?;
+                self.doc_count_upto += BLOCK_SIZE as u32;
+            } else {
+                self.level0_last_doc = NO_MORE_DOCS as i64;
                 break;
             }
         }
@@ -273,39 +312,42 @@ fn prefix_sum(buffer: &mut [u64], base: i64) {
     }
 }
 
-/// Optimized advance: fast-path buffer scan when target is within the
-/// current decoded block, otherwise falls back to next_doc loop (which
-/// correctly handles block and level-1 transitions). Block-level skipping
-/// via level-0 skip entries is deferred to a later phase.
+/// BlockDocsEnum.advance (:598-619): when target lies beyond the current
+/// block, skip whole blocks via the level-1/level-0 skip entries instead of
+/// decoding them, decode only the block that may contain target, then scan
+/// the buffer (findFirstGreater :215-222). The `doc >= target` early return
+/// is a lenient extension over the DISI contract (existing callers rely on
+/// it); NO_MORE_DOCS stays sticky. Output sequence is identical to the
+/// previous linear-advance fallback.
 fn advance(core: &mut EnumCore, target: i32) -> io::Result<i32> {
-    let t = target as u64;
-    if core.doc >= t as i64 {
+    let t = target as i64;
+    if core.doc >= t {
         return Ok(core.doc as i32);
     }
     if core.doc == NO_MORE_DOCS as i64 {
         return Ok(NO_MORE_DOCS);
     }
-    // Fast path: target is within the current decoded block
-    if t <= core.level0_last_doc as u64 && core.level0_last_doc > 0 {
-        let mut upto = core.doc_buffer_upto;
-        let buf_len = core.doc_buffer.len();
-        while upto < buf_len && core.doc_buffer[upto] < t {
-            upto += 1;
+    if t > core.level0_last_doc {
+        // advance skip data on level 1, then level 0
+        if t > core.level1_last_doc {
+            core.skip_level1_to(t)?;
         }
-        if upto < buf_len {
-            let d = core.doc_buffer[upto] as i64;
-            core.doc = d;
-            core.doc_buffer_upto = upto + 1;
-            return Ok(d as i32);
+        core.skip_level0_to(t)?;
+        if core.doc_freq - core.doc_count_upto >= BLOCK_SIZE as u32 {
+            core.refill_full_block()?;
+        } else {
+            core.refill_remainder()?;
         }
     }
-    // Fallback: linear advance via next_doc
-    loop {
-        let d = core.next_doc()?;
-        if d >= target {
-            return Ok(d);
-        }
+    // First buffer entry >= target, starting at doc_buffer_upto; the
+    // NO_MORE_DOCS sentinel guarantees termination.
+    let mut upto = core.doc_buffer_upto;
+    while (core.doc_buffer[upto] as i64) < t {
+        upto += 1;
     }
+    core.doc = core.doc_buffer[upto] as i64;
+    core.doc_buffer_upto = upto + 1;
+    Ok(core.doc as i32)
 }
 
 /// Docs iterator (no frequencies; for IndexOptions.DOCS fields).
@@ -515,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_is_linear_but_correct() {
+    fn advance_block_local_and_tail() {
         let root = temp_dir("advance");
         let dir = FSDirectory::open(&root).unwrap();
         let (fis, _, _) = write_segment(&dir);
@@ -524,8 +566,111 @@ mod tests {
         let mut en = postings.docs(&e).unwrap();
         assert_eq!(en.advance(57).unwrap(), 57);
         assert_eq!(en.advance(57).unwrap(), 57); // 已在目标上不动
+        // target == level0_last_doc（块 0 末 doc 127）：块内扫描，不跳块
+        assert_eq!(en.advance(127).unwrap(), 127);
+        // target 在 tail（remainder）首 doc：跨块边界
+        assert_eq!(en.advance(128).unwrap(), 128);
         assert_eq!(en.advance(199).unwrap(), 199);
+        // advance 到尾块之后：NO_MORE_DOCS 且粘滞
         assert_eq!(en.advance(200).unwrap(), NO_MORE_DOCS);
+        assert_eq!(en.advance(5000).unwrap(), NO_MORE_DOCS);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 跨多块 skip：命中/落空/边界，与线性扫描的期望逐位一致。
+    /// hot df=5000 dense（39 整块的 level-0 跳块 + 跨 4096 的 level-1）。
+    #[test]
+    fn advance_skips_whole_blocks() {
+        let root = temp_dir("advskip");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, _, _) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"hot");
+        // 单枚枚举上单调推进（conjunction 的使用形态）
+        let mut en = postings.docs_and_freqs(&e).unwrap();
+        assert_eq!(en.advance(1300).unwrap(), 1300); // 跳过块 0..10
+        assert_eq!(en.freq(), 1);
+        assert_eq!(en.advance(4095).unwrap(), 4095); // level-1 组末 doc
+        assert_eq!(en.advance(4096).unwrap(), 4096); // 跨 level-1 边界
+        assert_eq!(en.advance(4999).unwrap(), 4999); // tail 末 doc
+        assert_eq!(en.advance(5000).unwrap(), NO_MORE_DOCS);
+        assert_eq!(en.advance(9999).unwrap(), NO_MORE_DOCS); // 粘滞
+        // 全新枚举逐 target 验证（含正好落在跳过块之后首块的 target）
+        for target in [0, 1, 127, 128, 129, 4223, 4224, 4998, 4999] {
+            let mut en = postings.docs_and_freqs(&e).unwrap();
+            assert_eq!(en.advance(target).unwrap(), target, "target {target}");
+        }
+        for target in [5000, 6000, NO_MORE_DOCS - 1] {
+            let mut en = postings.docs_and_freqs(&e).unwrap();
+            assert_eq!(en.advance(target).unwrap(), NO_MORE_DOCS, "target {target}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 落空（target 不在 postings 中）+ 跳块后 freq 指针不变式。
+    /// warm df=200 docs step 3，freqs 含 PFor 异常值（i=3/77/100）。
+    #[test]
+    fn advance_miss_lands_on_next_doc_and_freqs_stay_aligned() {
+        let root = temp_dir("advmiss");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, warm_docs, warm_freqs) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"warm");
+        let mut en = postings.docs_and_freqs(&e).unwrap();
+        assert_eq!(en.advance(9).unwrap(), 9); // PFor 异常 doc（块 0）
+        assert_eq!(en.freq(), 3000);
+        assert_eq!(en.advance(301).unwrap(), 303); // 落空 → 下一个 doc（块内扫描）
+        assert_eq!(en.freq(), warm_freqs[101]);
+        assert_eq!(en.advance(597).unwrap(), 597); // 最末 doc
+        assert_eq!(en.freq(), warm_freqs[199]);
+        assert_eq!(en.advance(598).unwrap(), NO_MORE_DOCS);
+        // 每个 target 的 advance 结果 == 线性扫描第一个 >= target 的 doc
+        for target in [0, 2, 3, 299, 300, 596, 597] {
+            let mut en = postings.docs_and_freqs(&e).unwrap();
+            let want = warm_docs
+                .iter()
+                .find(|&&d| d >= target as u32)
+                .map(|&d| d as i32)
+                .unwrap_or(NO_MORE_DOCS);
+            assert_eq!(en.advance(target).unwrap(), want, "target {target}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// advance 与 next_doc 交替：跳块后 next_doc 从命中 doc 之后继续。
+    #[test]
+    fn advance_interleaved_with_next_doc() {
+        let root = temp_dir("advmix");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, _, _) = write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let mut en = postings.docs_and_freqs(&e).unwrap();
+        assert_eq!(en.advance(200).unwrap(), 200);
+        assert_eq!(en.next_doc().unwrap(), 201);
+        assert_eq!(en.advance(4096).unwrap(), 4096); // 跨 level-1
+        assert_eq!(en.next_doc().unwrap(), 4097);
+        assert_eq!(en.freq(), 1);
+        assert_eq!(en.advance(4999).unwrap(), 4999);
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// singleton（df=1，.doc 无字节）：advance 命中、落空、越过。
+    #[test]
+    fn advance_singleton() {
+        let root = temp_dir("advsingle");
+        let dir = FSDirectory::open(&root).unwrap();
+        write_segment(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = entry(1, 3, 0, 17);
+        let mut en = postings.docs(&e).unwrap();
+        assert_eq!(en.advance(5).unwrap(), 17);
+        assert_eq!(en.advance(17).unwrap(), 17);
+        assert_eq!(en.advance(18).unwrap(), NO_MORE_DOCS);
+        let e = entry(1, 3, 0, 17);
+        let mut en = postings.docs(&e).unwrap();
+        assert_eq!(en.advance(100).unwrap(), NO_MORE_DOCS);
         fs::remove_dir_all(&root).unwrap();
     }
 }

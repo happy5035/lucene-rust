@@ -1,9 +1,11 @@
 //! Search read path (search spec §3): per-segment iteration, docID-ordered
-//! and count collectors, Term and MatchAll queries (ConstantScore semantics).
+//! and count collectors, Term/MatchAll/Boolean/multi-term queries
+//! (ConstantScore semantics).
 
 pub mod bitset;
 pub mod collector;
 pub mod doc_iter;
+pub mod multi_term;
 pub mod query;
 pub mod reader;
 pub mod searcher;
@@ -208,6 +210,120 @@ mod tests {
         let (total, docs) = s.top_docs(&Query::MatchAll, 10).unwrap();
         assert_eq!(total, 0);
         assert!(docs.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 40 docs; doc i carries tokens t(i%20) and t((i+7)%20) — every t-term
+    /// has df=4 and the term sets overlap, so union sizes are non-trivial.
+    fn write_terms_corpus(root: &std::path::Path) {
+        let mut w = IndexWriter::create(root, schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..40 {
+            let m = format!("t{:02} t{:02}", i % 20, (i + 7) % 20);
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    fn t_terms(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("t{i:02}")).collect()
+    }
+
+    #[test]
+    fn terms_query_matches_or_on_both_paths() {
+        let root = temp_dir("termsdual");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let all = t_terms(0..20);
+        let all_ref: Vec<&str> = all.iter().map(String::as_str).collect();
+
+        // >16 terms -> bitset path; result must equal the literal OR query
+        let or_q = Query::or("message", &all_ref);
+        let (or_total, or_docs) = s.top_docs(&or_q, 100).unwrap();
+        let terms_q = Query::terms("message", &all_ref);
+        let (t_total, t_docs) = s.top_docs(&terms_q, 100).unwrap();
+        assert_eq!((or_total, or_docs.clone()), (t_total, t_docs));
+        assert_eq!(s.count(&terms_q).unwrap(), or_total);
+        assert_eq!(s.count(&terms_q).unwrap(), 40); // every doc has two t-terms
+
+        // exactly 16 terms -> OR rewrite path, still equal to OR
+        let t16: Vec<&str> = all_ref[..16].to_vec();
+        let or16 = Query::or("message", &t16);
+        let terms16 = Query::terms("message", &t16);
+        let (a_total, a_docs) = s.top_docs(&or16, 100).unwrap();
+        let (b_total, b_docs) = s.top_docs(&terms16, 100).unwrap();
+        assert_eq!((a_total, a_docs), (b_total, b_docs));
+        assert_eq!(s.count(&terms16).unwrap(), a_total);
+
+        // 17 terms -> bitset path boundary
+        let t17: Vec<&str> = all_ref[..17].to_vec();
+        let or17 = Query::or("message", &t17);
+        let terms17 = Query::terms("message", &t17);
+        let (a_total, a_docs) = s.top_docs(&or17, 100).unwrap();
+        let (b_total, b_docs) = s.top_docs(&terms17, 100).unwrap();
+        assert_eq!((a_total, a_docs), (b_total, b_docs));
+        assert_eq!(s.count(&terms17).unwrap(), a_total);
+
+        // dedup: docs carrying two of the terms are counted once
+        let dup = Query::terms("message", &["t00", "t07"]); // doc 0 has both
+        let (total, docs) = s.top_docs(&dup, 100).unwrap();
+        assert_eq!(docs.iter().filter(|&&d| d == 0).count(), 1);
+        assert_eq!(total as usize, docs.len());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn terms_query_edge_cases() {
+        let root = temp_dir("termsedge");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // all terms missing -> 0
+        assert_eq!(s.count(&Query::terms("message", &["zz1", "zz2"])).unwrap(), 0);
+        // mixed present/missing
+        let (total, _) = s.top_docs(&Query::terms("message", &["t00", "zz1"]), 100).unwrap();
+        assert_eq!(total, 4); // df(t00) = 4
+        // empty term set -> 0
+        assert_eq!(s.count(&Query::terms("message", &[])).unwrap(), 0);
+        // single term degenerates to a Term query
+        assert_eq!(s.count(&Query::terms("message", &["t00"])).unwrap(), 4);
+        // keyword field (DOCS layout)
+        assert_eq!(s.count(&Query::terms("level", &["INFO", "WARN"])).unwrap(), 40);
+        // unknown / stored-only fields -> empty
+        assert_eq!(s.count(&Query::terms("nope", &["x"])).unwrap(), 0);
+        assert_eq!(s.count(&Query::terms("title", &["stored"])).unwrap(), 0);
+        // duplicated input terms are harmless
+        assert_eq!(s.count(&Query::terms("message", &["t00", "t00"])).unwrap(), 4);
+        // >16 on the keyword field too (bitset over DOCS postings)
+        let tids: Vec<String> = (0..18).map(|i| format!("tid-{i}")).collect();
+        let tids_ref: Vec<&str> = tids.iter().map(String::as_str).collect();
+        assert_eq!(s.count(&Query::terms("tid", &tids_ref)).unwrap(), 18);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn terms_query_multi_segment() {
+        let root = temp_dir("termsseg");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..3 {
+            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha")).unwrap();
+        }
+        w.commit().unwrap();
+        for i in 3..7 {
+            w.add_document(doc("WARN", &format!("tid-{i}"), "beta")).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 2);
+        let q = Query::terms("level", &["INFO", "WARN"]);
+        assert_eq!(s.count(&q).unwrap(), 7);
+        let (_, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!(docs, vec![0, 1, 2, 3, 4, 5, 6]);
+        let q = Query::terms("message", &["alpha", "beta"]);
+        assert_eq!(s.count(&q).unwrap(), 7);
         fs::remove_dir_all(&root).unwrap();
     }
 }

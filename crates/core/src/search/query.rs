@@ -4,6 +4,7 @@
 use std::io;
 
 use super::doc_iter::{ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, SegmentDocIter};
+use super::multi_term;
 use super::segment_reader::SegmentReader;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub enum Query {
     MatchAll,
     And { field: String, terms: Vec<Vec<u8>> },
     Or { field: String, terms: Vec<Vec<u8>> },
+    Terms { field: String, terms: Vec<Vec<u8>> },
 }
 
 impl Query {
@@ -23,6 +25,38 @@ impl Query {
     }
     pub fn or(field: &str, terms: &[&str]) -> Query {
         Query::Or { field: field.to_string(), terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect() }
+    }
+
+    /// Terms(IN) — Boolean SHOULD sugar (spec M2 §1): the doc union of the
+    /// term set, executed via the <=16/>16 dual path (spec M2 §4).
+    pub fn terms(field: &str, terms: &[&str]) -> Query {
+        Query::Terms {
+            field: field.to_string(),
+            terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect(),
+        }
+    }
+
+    /// Multi-term queries (Terms/Prefix/Wildcard) share the Searcher::count
+    /// dual path (popcount on the bitset path, iteration otherwise).
+    pub(crate) fn is_multi_term(&self) -> bool {
+        matches!(self, Query::Terms { .. })
+    }
+
+    /// Per-segment count shortcut: `Some(popcount)` when this query takes
+    /// the bitset path in this segment, `None` otherwise (caller iterates).
+    pub(crate) fn bitset_count(&self, seg: &mut SegmentReader) -> io::Result<Option<u64>> {
+        match self {
+            Query::Terms { field, terms } => {
+                if terms.len() < 2 {
+                    return Ok(None); // degenerate: empty set / single-term Term path
+                }
+                let Some((has_freqs, collected)) = multi_term::collect_direct(seg, field, terms)? else {
+                    return Ok(Some(0)); // unknown field: empty hit set
+                };
+                multi_term::bitset_count(seg, has_freqs, &collected)
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(crate) fn segment_iterator(
@@ -64,6 +98,22 @@ impl Query {
                 if entries.is_empty() { return Ok(None); }
                 entries.sort_by_key(|(df, _)| *df);
                 Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(seg, field, &entries, needs_freq)?)))
+            }
+            Query::Terms { field, terms } => {
+                if terms.is_empty() {
+                    return Ok(None);
+                }
+                if terms.len() == 1 {
+                    return Query::Term {
+                        field: field.clone(),
+                        term: terms[0].clone(),
+                    }
+                    .segment_iterator(seg, needs_freq);
+                }
+                let Some((has_freqs, collected)) = multi_term::collect_direct(seg, field, terms)? else {
+                    return Ok(None);
+                };
+                multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)
             }
         }
     }

@@ -55,6 +55,8 @@ impl Searcher {
     /// ConstantScore TermQuery: count = sum of per-segment doc_freq (no
     /// postings iteration needed — doc_freq is in the TermEntry after
     /// seek_exact). Fallback to iteration for MatchAll and unknown terms.
+    /// Multi-term queries count per segment: popcount on the bitset path
+    /// (spec §4), plain iteration on the OR path.
     pub fn count(&mut self, query: &Query) -> io::Result<u64> {
         if let Query::Term { field, term } = query {
             let mut total = 0u64;
@@ -65,7 +67,25 @@ impl Searcher {
             }
             return Ok(total);
         }
-        // MatchAll or future query types: iterate
+        if query.is_multi_term() {
+            let mut total = 0u64;
+            for (_doc_base, seg) in self.reader.leaves() {
+                if let Some(c) = query.bitset_count(seg)? {
+                    total += c;
+                    continue;
+                }
+                if let Some(mut iter) = query.segment_iterator(seg, false)? {
+                    loop {
+                        let doc = iter.next_doc()?;
+                        if doc == NO_MORE_DOCS {
+                            break;
+                        }
+                        total += 1;
+                    }
+                }
+            }
+            return Ok(total);
+        }
         let mut c = CountCollector::default();
         self.search(query, &mut c)?;
         Ok(c.count)

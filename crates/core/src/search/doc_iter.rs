@@ -8,6 +8,7 @@ use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, NO_MORE_DOCS};
 use codec_lucene9::terms_read::TermEntry;
 
+use super::bitset::FixedBitSet;
 use super::segment_reader::SegmentReader;
 
 pub trait DocIter {
@@ -148,16 +149,63 @@ impl DocIter for DisjunctionDocIter {
     fn freq(&self) -> u32 { for s in &self.sub { if s.doc_id() == self.doc { return s.freq(); } } 1 }
 }
 
+// ── Bitset (multi-term materialization) ───────────────────────────────
+
+/// DocIter over a materialized FixedBitSet (spec §4 bitset path): next_doc /
+/// advance are next_set_bit scans. freq() is 1 (doc-set semantics).
+pub struct BitsetDocIter {
+    bits: FixedBitSet,
+    doc: i32,
+}
+
+impl BitsetDocIter {
+    pub fn new(bits: FixedBitSet) -> Self {
+        BitsetDocIter { bits, doc: -1 }
+    }
+
+    /// FixedBitSet.cardinality — the count fast path (spec §4).
+    pub fn popcount(&self) -> u64 {
+        self.bits.popcount()
+    }
+}
+
+impl DocIter for BitsetDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = match self.bits.next_set_bit((self.doc + 1) as usize) {
+            Some(d) => d as i32,
+            None => NO_MORE_DOCS,
+        };
+        Ok(self.doc)
+    }
+
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if target > self.doc {
+            self.doc = match self.bits.next_set_bit(target.max(0) as usize) {
+                Some(d) => d as i32,
+                None => NO_MORE_DOCS,
+            };
+        }
+        Ok(self.doc)
+    }
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
     Docs(DocsEnum), Freqs(DocsFreqsEnum), All(MatchAllIter),
-    And(ConjunctionDocIter), Or(DisjunctionDocIter),
+    And(ConjunctionDocIter), Or(DisjunctionDocIter), Bitset(BitsetDocIter),
 }
 
 impl DocIter for SegmentDocIter {
-    fn doc_id(&self) -> i32 { match self { Self::Docs(d) => d.doc_id(), Self::Freqs(f) => f.doc_id(), Self::All(a) => a.doc_id(), Self::And(a) => a.doc_id(), Self::Or(o) => o.doc_id() } }
-    fn next_doc(&mut self) -> io::Result<i32> { match self { Self::Docs(d) => d.next_doc(), Self::Freqs(f) => f.next_doc(), Self::All(a) => a.next_doc(), Self::And(a) => a.next_doc(), Self::Or(o) => o.next_doc() } }
-    fn advance(&mut self, t: i32) -> io::Result<i32> { match self { Self::Docs(d) => d.advance(t), Self::Freqs(f) => f.advance(t), Self::All(a) => a.advance(t), Self::And(a) => a.advance(t), Self::Or(o) => o.advance(t) } }
+    fn doc_id(&self) -> i32 { match self { Self::Docs(d) => d.doc_id(), Self::Freqs(f) => f.doc_id(), Self::All(a) => a.doc_id(), Self::And(a) => a.doc_id(), Self::Or(o) => o.doc_id(), Self::Bitset(b) => b.doc_id() } }
+    fn next_doc(&mut self) -> io::Result<i32> { match self { Self::Docs(d) => d.next_doc(), Self::Freqs(f) => f.next_doc(), Self::All(a) => a.next_doc(), Self::And(a) => a.next_doc(), Self::Or(o) => o.next_doc(), Self::Bitset(b) => b.next_doc() } }
+    fn advance(&mut self, t: i32) -> io::Result<i32> { match self { Self::Docs(d) => d.advance(t), Self::Freqs(f) => f.advance(t), Self::All(a) => a.advance(t), Self::And(a) => a.advance(t), Self::Or(o) => o.advance(t), Self::Bitset(b) => b.advance(t) } }
     fn freq(&self) -> u32 { match self { Self::Freqs(f) => f.freq(), Self::And(a) => a.freq(), Self::Or(o) => o.freq(), _ => 1 } }
 }

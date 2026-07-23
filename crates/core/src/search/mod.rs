@@ -326,4 +326,40 @@ mod tests {
         assert_eq!(s.count(&q).unwrap(), 7);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn prefix_query_dual_path() {
+        let root = temp_dir("prefixdual");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // "t1" -> t10..t19 (10 terms, <=16 OR path); equal to the literal OR
+        let t1 = t_terms(10..20);
+        let t1_ref: Vec<&str> = t1.iter().map(String::as_str).collect();
+        let or_q = Query::or("message", &t1_ref);
+        let (a_total, a_docs) = s.top_docs(&or_q, 100).unwrap();
+        let pq = Query::prefix("message", "t1");
+        let (b_total, b_docs) = s.top_docs(&pq, 100).unwrap();
+        assert_eq!((a_total, a_docs), (b_total, b_docs));
+        assert_eq!(s.count(&pq).unwrap(), a_total);
+        // "t" -> all 20 terms (>16 bitset path); every doc has two t-terms
+        let pq = Query::prefix("message", "t");
+        assert_eq!(s.count(&pq).unwrap(), 40);
+        // empty prefix enumerates the whole field dictionary
+        let pq = Query::prefix("message", "");
+        assert_eq!(s.count(&pq).unwrap(), 40);
+        // exact-term prefix
+        let pq = Query::prefix("message", "t07");
+        assert_eq!(s.count(&pq).unwrap(), 4);
+        // zero-hit prefix / unknown field
+        assert_eq!(s.count(&Query::prefix("message", "zzz")).unwrap(), 0);
+        assert_eq!(s.count(&Query::prefix("nope", "t")).unwrap(), 0);
+        // keyword field (DOCS layout)
+        assert_eq!(s.count(&Query::prefix("level", "INF")).unwrap(), 40);
+        let pq = Query::prefix("tid", "tid-1");
+        let (total, docs) = s.top_docs(&pq, 100).unwrap();
+        assert_eq!(total as usize, docs.len());
+        assert!(docs.contains(&1) && docs.iter().all(|&d| d == 1 || (10..=19).contains(&d)));
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

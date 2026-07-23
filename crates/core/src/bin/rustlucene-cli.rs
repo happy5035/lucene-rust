@@ -241,6 +241,32 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()>
             doc_csv(&docs)
         ));
     }
+
+    // M2 prefix battery (search spec M2 §3): "connection3" expands to 10
+    // terms (<=16 OR path), "conn" to 40 (>16 bitset path); "zzzz" is the
+    // zero-hit case and the trace_id prefix hits the df=1 singleton path.
+    // Mirrored in VerifySearchIndex.java.
+    let prefix_battery: [(&str, &str); 4] = [
+        ("level", "IN"),
+        ("message", "connection3"),
+        ("message", "conn"),
+        ("message", "zzzz"),
+    ];
+    for (field, prefix) in prefix_battery {
+        let q = Query::prefix(field, prefix);
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "prefix {field}={prefix} count={count} first20={}\n",
+            doc_csv(&docs)
+        ));
+    }
+    if num_docs > 7 {
+        let tid8 = trace_id_of_doc(seed, 7)[..8].to_string();
+        let q = Query::prefix("trace_id", &tid8);
+        let count = searcher.count(&q)?;
+        out.push_str(&format!("prefix trace_id={tid8} count={count}\n"));
+    }
     print!("{out}");
     Ok(())
 }

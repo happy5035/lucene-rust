@@ -8,7 +8,7 @@ use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PostingsReader};
 use codec_lucene9::segment_infos::SegmentCommitInfo;
-use codec_lucene9::terms_read::{TermEntry, TermsDict};
+use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
 pub struct SegmentReader {
     max_doc: i32,
@@ -85,5 +85,13 @@ impl SegmentReader {
         self.field_infos
             .by_name(field)
             .map(|fi| fi.index_options != IndexOptions::Docs && fi.index_options != IndexOptions::None)
+    }
+
+    /// TermsIter over a field by name (None = unknown field; a field with no
+    /// .tmd record yields an immediately-exhausted iterator). Borrows the
+    /// terms dict mutably for the iterator's lifetime.
+    pub(crate) fn terms_iter(&mut self, field: &str) -> Option<TermsIter<'_>> {
+        let fi = self.field_infos.by_name(field)?;
+        Some(self.terms.terms_iter(fi))
     }
 }

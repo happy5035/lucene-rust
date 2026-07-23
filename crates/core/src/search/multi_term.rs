@@ -73,6 +73,37 @@ pub(crate) fn collect_direct(
     Ok(Some((has_freqs, collected)))
 }
 
+/// Prefix collection (spec §3): seek_ceil(prefix) then next() until
+/// !starts_with(prefix). `None` = unknown field (empty-hit semantics).
+pub(crate) fn collect_prefix(
+    seg: &mut SegmentReader,
+    field: &str,
+    prefix: &[u8],
+) -> io::Result<Option<(bool, CollectedTerms)>> {
+    let Some(has_freqs) = seg.field_has_freqs(field) else {
+        return Ok(None);
+    };
+    let mut collected = CollectedTerms {
+        terms: Vec::new(),
+        entries: Vec::new(),
+    };
+    {
+        let Some(mut it) = seg.terms_iter(field) else {
+            return Ok(None);
+        };
+        it.seek_ceil(prefix)?;
+        while let Some((term, entry)) = it.next()? {
+            if !term.starts_with(prefix) {
+                break;
+            }
+            collected.entries.push((entry.doc_freq, entry));
+            collected.terms.push(term);
+        }
+    }
+    collected.sort_by_df();
+    Ok(Some((has_freqs, collected)))
+}
+
 /// Threshold dispatch (spec §4): <=16 terms rewrite to `Query::Or` (heap
 /// merge, zero new execution code); >16 materialize a FixedBitSet.
 pub(crate) fn segment_iterator(

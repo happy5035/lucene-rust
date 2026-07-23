@@ -128,6 +128,30 @@ public class VerifySearchIndex {
                    .append(" count=").append(s.count(q))
                    .append(" first20=").append(b).append('\n');
             }
+
+            // M2 prefix battery: same items/format as searchdump. PrefixQuery
+            // is Lucene's counterpart of the Rust TermsIter-driven expansion.
+            String[][] prefixBattery = {
+                {"level", "IN"},
+                {"message", "connection3"},
+                {"message", "conn"},
+                {"message", "zzzz"},
+            };
+            for (String[] item : prefixBattery) {
+                Query q = new ConstantScoreQuery(new PrefixQuery(new Term(item[0], item[1])));
+                TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                StringBuilder b = new StringBuilder();
+                for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                out.append("prefix ").append(item[0]).append('=').append(item[1])
+                   .append(" count=").append(s.count(q))
+                   .append(" first20=").append(b).append('\n');
+            }
+            if (r.maxDoc() > 7) {
+                String tid8 = stored.document(7).get("trace_id").substring(0, 8);
+                Query q = new ConstantScoreQuery(new PrefixQuery(new Term("trace_id", tid8)));
+                out.append("prefix trace_id=").append(tid8)
+                   .append(" count=").append(s.count(q)).append('\n');
+            }
         }
         System.out.print(out);
     }

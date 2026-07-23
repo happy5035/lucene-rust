@@ -14,6 +14,7 @@ pub enum Query {
     And { field: String, terms: Vec<Vec<u8>> },
     Or { field: String, terms: Vec<Vec<u8>> },
     Terms { field: String, terms: Vec<Vec<u8>> },
+    Prefix { field: String, prefix: Vec<u8> },
 }
 
 impl Query {
@@ -36,10 +37,18 @@ impl Query {
         }
     }
 
+    /// Prefix query (spec M2 §3): all docs whose term starts with `prefix`.
+    pub fn prefix(field: &str, prefix: &str) -> Query {
+        Query::Prefix {
+            field: field.to_string(),
+            prefix: prefix.as_bytes().to_vec(),
+        }
+    }
+
     /// Multi-term queries (Terms/Prefix/Wildcard) share the Searcher::count
     /// dual path (popcount on the bitset path, iteration otherwise).
     pub(crate) fn is_multi_term(&self) -> bool {
-        matches!(self, Query::Terms { .. })
+        matches!(self, Query::Terms { .. } | Query::Prefix { .. })
     }
 
     /// Per-segment count shortcut: `Some(popcount)` when this query takes
@@ -52,6 +61,12 @@ impl Query {
                 }
                 let Some((has_freqs, collected)) = multi_term::collect_direct(seg, field, terms)? else {
                     return Ok(Some(0)); // unknown field: empty hit set
+                };
+                multi_term::bitset_count(seg, has_freqs, &collected)
+            }
+            Query::Prefix { field, prefix } => {
+                let Some((has_freqs, collected)) = multi_term::collect_prefix(seg, field, prefix)? else {
+                    return Ok(Some(0));
                 };
                 multi_term::bitset_count(seg, has_freqs, &collected)
             }
@@ -111,6 +126,12 @@ impl Query {
                     .segment_iterator(seg, needs_freq);
                 }
                 let Some((has_freqs, collected)) = multi_term::collect_direct(seg, field, terms)? else {
+                    return Ok(None);
+                };
+                multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)
+            }
+            Query::Prefix { field, prefix } => {
+                let Some((has_freqs, collected)) = multi_term::collect_prefix(seg, field, prefix)? else {
                     return Ok(None);
                 };
                 multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)

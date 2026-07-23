@@ -3,10 +3,10 @@
 
 use std::io;
 
-use crate::codec_util::{check_footer, check_footer_structure, check_index_header};
+use crate::codec_util::{check_footer, check_footer_structure, check_index_header, corrupt};
 use crate::directory::FSDirectory;
 use crate::io::{DataInput, IndexInput};
-use crate::postings::{file_name, DOC_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX};
+use crate::postings::{file_name, DOC_CODEC, POS_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX};
 use crate::postings_ll::{
     for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints, read_vint15,
     read_vlong15, BLOCK_SIZE,
@@ -19,9 +19,11 @@ pub const NO_MORE_DOCS: i32 = i32::MAX;
 /// Lucene912PostingsFormat.java:347-352.
 const LEVEL1_NUM_DOCS: u32 = 4096;
 
-/// Owns the segment's .doc stream (Lucene912PostingsReader :83-206).
+/// Owns the segment's .doc stream (Lucene912PostingsReader :83-206) plus
+/// the .pos stream when the segment has any positions field (:135-177).
 pub struct PostingsReader {
     doc_in: IndexInput,
+    pos_in: Option<IndexInput>,
 }
 
 impl PostingsReader {
@@ -45,9 +47,11 @@ impl PostingsReader {
         let _ = psm.read_int()?;
         let doc_len = psm.read_long()? as u64;
         // posLen is present iff the writer created a .pos file (:106).
-        if dir.file_exists(&file_name(segment, "pos")) {
-            let _pos_len = psm.read_long()?;
-        }
+        let pos_len = if dir.file_exists(&file_name(segment, "pos")) {
+            Some(psm.read_long()? as u64)
+        } else {
+            None
+        };
         check_footer(&mut psm)?;
         let mut doc_in = dir.open_input(&file_name(segment, "doc"))?;
         check_index_header(
@@ -60,7 +64,24 @@ impl PostingsReader {
         )?;
         // retrieveChecksum (:150-172): length + trailing footer structure
         check_footer_structure(&doc_in, doc_len)?;
-        Ok(PostingsReader { doc_in })
+        let pos_in = match pos_len {
+            Some(len) => {
+                let mut pos_in = dir.open_input(&file_name(segment, "pos"))?;
+                check_index_header(
+                    &mut pos_in,
+                    POS_CODEC,
+                    POSTINGS_VERSION,
+                    POSTINGS_VERSION,
+                    segment_id,
+                    SEGMENT_SUFFIX,
+                )?;
+                // retrieveChecksum (:160-161)
+                check_footer_structure(&pos_in, len)?;
+                Some(pos_in)
+            }
+            None => None,
+        };
+        Ok(PostingsReader { doc_in, pos_in })
     }
 
     /// Docs iterator over a DOCS field's postings (no freq blocks on disk).
@@ -85,6 +106,22 @@ impl PostingsReader {
     pub fn docs_and_freqs_no_freq(&self, entry: &TermEntry) -> io::Result<DocsFreqsEnum> {
         Ok(DocsFreqsEnum {
             core: EnumCore::new(self.fresh_input()?, entry, true, false)?,
+        })
+    }
+
+    /// Docs+freqs+positions iterator (EverythingEnum), for fields with
+    /// IndexOptions >= DOCS_AND_FREQS_AND_POSITIONS.
+    pub fn positions(&self, entry: &TermEntry) -> io::Result<PositionsEnum> {
+        let pos_in = self
+            .pos_in
+            .as_ref()
+            .ok_or_else(|| corrupt("positions enum requested but the segment has no .pos file"))?;
+        Ok(PositionsEnum {
+            core: EnumCore::new_with_positions(
+                self.fresh_input()?,
+                pos_in.slice(0, pos_in.length())?,
+                entry,
+            )?,
         })
     }
 
@@ -118,6 +155,31 @@ struct EnumCore {
     doc_buffer: [u64; BLOCK_SIZE + 1],
     freq_buffer: [u32; BLOCK_SIZE],
     doc_buffer_upto: usize,
+    has_positions: bool,
+    // level-0/level-1 pos skip state (EverythingEnum :696-710); the pos fp
+    // deltas chain across blocks, first block's base = posTermStartFP
+    // (writer postings.rs:566-568).
+    level0_pos_end_fp: u64,
+    level0_block_pos_upto: u64,
+    level1_pos_end_fp: u64,
+    level1_block_pos_upto: u64,
+    pos: Option<PosCore>,
+}
+
+/// EverythingEnum position state (:650-710): .pos stream + pending
+/// bookkeeping. No payloads/offsets exist in this system's indexes, so only
+/// the delta buffer is kept.
+struct PosCore {
+    pos_in: IndexInput,
+    /// File pointer of the tail (VInt) block; -1 when ttf == BLOCK_SIZE
+    /// (EverythingEnum.reset :789-797).
+    last_pos_block_fp: i64,
+    pos_delta_buffer: [u32; BLOCK_SIZE],
+    pos_buffer_upto: usize,
+    /// How many positions "behind" we are; next_position catches up
+    /// (:675-679).
+    pos_pending_count: u64,
+    position: u32,
 }
 
 impl EnumCore {
@@ -145,6 +207,12 @@ impl EnumCore {
             doc_buffer: [0; BLOCK_SIZE + 1],
             freq_buffer: [0; BLOCK_SIZE],
             doc_buffer_upto: BLOCK_SIZE,
+            has_positions: false,
+            level0_pos_end_fp: 0,
+            level0_block_pos_upto: 0,
+            level1_pos_end_fp: 0,
+            level1_block_pos_upto: 0,
+            pos: None,
         };
         if entry.doc_freq < LEVEL1_NUM_DOCS {
             c.level1_last_doc = NO_MORE_DOCS as i64;
@@ -163,7 +231,7 @@ impl EnumCore {
         Ok(c)
     }
 
-    /// nextDoc (:589-596).
+    /// nextDoc (:589-596; EverythingEnum pos bookkeeping :940-952).
     fn next_doc(&mut self) -> io::Result<i32> {
         if self.doc == NO_MORE_DOCS as i64 {
             return Ok(NO_MORE_DOCS);
@@ -173,15 +241,90 @@ impl EnumCore {
         }
         self.doc = self.doc_buffer[self.doc_buffer_upto] as i64;
         self.doc_buffer_upto += 1;
+        if self.pos.is_some() && self.doc != NO_MORE_DOCS as i64 {
+            let f = self.freq() as u64; // :948 — freq of the doc just returned
+            let pos = self.pos.as_mut().unwrap();
+            pos.pos_pending_count += f;
+            pos.position = 0; // :951
+        }
         Ok(self.doc as i32)
     }
 
-    /// moveToNextLevel0Block (:573-587).
+    /// EverythingEnum.reset (:770-826) for the positions profile: freqs
+    /// always decoded (phrase needs them), pos state initialized from the
+    /// term state.
+    fn new_with_positions(
+        doc_in: IndexInput,
+        mut pos_in: IndexInput,
+        entry: &TermEntry,
+    ) -> io::Result<EnumCore> {
+        let mut c = EnumCore::new(doc_in, entry, true, true)?;
+        c.has_positions = true;
+        c.level0_pos_end_fp = entry.state.pos_start_fp;
+        c.level1_pos_end_fp = entry.state.pos_start_fp;
+        // lastPosBlockFP (:789-797): tail block fp; -1 when ttf == BLOCK_SIZE
+        let last_pos_block_fp = if entry.total_term_freq < BLOCK_SIZE as u64 {
+            entry.state.pos_start_fp as i64
+        } else if entry.total_term_freq == BLOCK_SIZE as u64 {
+            -1
+        } else {
+            entry.state.pos_start_fp as i64 + entry.state.last_pos_block_offset
+        };
+        pos_in.seek(entry.state.pos_start_fp)?;
+        c.pos = Some(PosCore {
+            pos_in,
+            last_pos_block_fp,
+            pos_delta_buffer: [0; BLOCK_SIZE],
+            pos_buffer_upto: BLOCK_SIZE,
+            pos_pending_count: 0,
+            position: 0,
+        });
+        Ok(c)
+    }
+
+    /// EverythingEnum block-boundary resync (:908-917 / :962-970): when the
+    /// .pos decode cursor has not passed the upcoming doc block's start fp,
+    /// seek it there and account the already-consumed positions of the
+    /// pos-block containing the boundary.
+    fn resync_pos_stream(&mut self) -> io::Result<()> {
+        if let Some(pos) = &mut self.pos {
+            if self.level0_pos_end_fp >= pos.pos_in.file_pointer() {
+                pos.pos_in.seek(self.level0_pos_end_fp)?;
+                pos.pos_pending_count = self.level0_block_pos_upto;
+                pos.pos_buffer_upto = BLOCK_SIZE;
+            }
+        }
+        Ok(())
+    }
+
+    /// moveToNextLevel0Block (:573-587) + EverythingEnum's positions variant
+    /// (:899-937): the has_positions branch parses the level-0 skip entry
+    /// instead of skipping it wholesale and resyncs the .pos stream first.
     fn move_to_next_level0_block(&mut self) -> io::Result<()> {
         if self.doc == self.level1_last_doc {
             self.skip_level1_to(self.doc + 1)?;
         }
         self.prev_doc_id = self.level0_last_doc;
+        if self.has_positions {
+            // resync BEFORE parsing the new skip entry (:908-917 uses the
+            // boundary fp of the block being entered)
+            self.resync_pos_stream()?;
+            if self.doc_freq - self.doc_count_upto >= BLOCK_SIZE as u32 {
+                let _skip0_num_bytes = self.doc_in.read_vlong()?;
+                let doc_delta = read_vint15(&mut self.doc_in)?;
+                self.level0_last_doc += doc_delta as i64;
+                let _block_total_bytes = read_vlong15(&mut self.doc_in)?;
+                let impact_bytes = self.doc_in.read_vlong()? as u64;
+                self.doc_in.skip_bytes(impact_bytes)?;
+                self.level0_pos_end_fp += self.doc_in.read_vlong()? as u64; // :926
+                self.level0_block_pos_upto = self.doc_in.read_byte()? as u64; // :927
+                self.refill_full_block()?;
+            } else {
+                self.level0_last_doc = NO_MORE_DOCS as i64;
+                self.refill_remainder()?;
+            }
+            return Ok(());
+        }
         if self.doc_freq - self.doc_count_upto >= BLOCK_SIZE as u32 {
             let skip0_num_bytes = self.doc_in.read_vlong()? as u64;
             self.doc_in.skip_bytes(skip0_num_bytes)?;
@@ -201,6 +344,11 @@ impl EnumCore {
         loop {
             self.prev_doc_id = self.level1_last_doc;
             self.level0_last_doc = self.level1_last_doc;
+            if self.has_positions {
+                // carry level-1 pos state into level 0 (:854-856)
+                self.level0_pos_end_fp = self.level1_pos_end_fp;
+                self.level0_block_pos_upto = self.level1_block_pos_upto;
+            }
             self.doc_in.seek(self.level1_doc_end_fp)?;
             self.doc_count_upto = self.level1_doc_count_upto;
             self.level1_doc_count_upto += LEVEL1_NUM_DOCS;
@@ -211,11 +359,22 @@ impl EnumCore {
             self.level1_last_doc += self.doc_in.read_vint()? as i64;
             self.level1_doc_end_fp =
                 self.doc_in.read_vlong()? as u64 + self.doc_in.file_pointer();
+            if self.has_freqs && self.has_positions {
+                // parse the numSkipBytes section EVERY record (:883-886):
+                // Short numSkipBytes, Short impactBytes + impacts,
+                // VLong posFpDelta, Byte posBufferUpto
+                let num_skip_bytes = self.doc_in.read_short()? as u16 as u64;
+                let skip1_end_fp = num_skip_bytes + self.doc_in.file_pointer();
+                let impact_bytes = self.doc_in.read_short()? as u16 as u64;
+                self.doc_in.skip_bytes(impact_bytes)?;
+                self.level1_pos_end_fp += self.doc_in.read_vlong()? as u64;
+                self.level1_block_pos_upto = self.doc_in.read_byte()? as u64;
+                debug_assert_eq!(self.doc_in.file_pointer(), skip1_end_fp); // :891
+            } else if self.has_freqs && self.level1_last_doc >= target {
+                let num_skip_bytes = self.doc_in.read_short()? as u16 as u64;
+                self.doc_in.skip_bytes(num_skip_bytes)?;
+            }
             if self.level1_last_doc >= target {
-                if self.has_freqs {
-                    let num_skip_bytes = self.doc_in.read_short()? as u16 as u64;
-                    self.doc_in.skip_bytes(num_skip_bytes)?;
-                }
                 break;
             }
         }
@@ -229,23 +388,63 @@ impl EnumCore {
     /// positioned at the data of the block that may contain target
     /// (level0_last_doc >= target), or the full blocks are exhausted
     /// (level0_last_doc == NO_MORE_DOCS, stream at the VInt tail).
+    /// skipLevel0To (:548-571) + EverythingEnum's positions variant
+    /// (:954-1003): the has_positions branch parses impacts/pos fields of
+    /// every skip entry (pos fp deltas chain across blocks) and resyncs the
+    /// .pos stream per skipped block.
     fn skip_level0_to(&mut self, target: i64) -> io::Result<()> {
         loop {
             self.prev_doc_id = self.level0_last_doc;
-            if self.doc_freq - self.doc_count_upto >= BLOCK_SIZE as u32 {
-                let skip0_num_bytes = self.doc_in.read_vlong()? as u64;
-                // end offset of skip data (before the actual data starts)
-                let skip0_end_fp = self.doc_in.file_pointer() + skip0_num_bytes;
-                let doc_delta = read_vint15(&mut self.doc_in)?;
-                self.level0_last_doc += doc_delta as i64;
-                if target <= self.level0_last_doc {
-                    self.doc_in.seek(skip0_end_fp)?;
-                    break;
+            if self.has_positions {
+                // :958-975 — resync to the block boundary, or (positions
+                // already decoded past it) accumulate the remaining docs'
+                // freqs of the current buffer instead of seeking backwards
+                if self.level0_pos_end_fp >= self.pos.as_ref().unwrap().pos_in.file_pointer() {
+                    self.resync_pos_stream()?;
+                } else {
+                    let upto = self.doc_buffer_upto;
+                    let pos = self.pos.as_mut().unwrap();
+                    for i in upto..BLOCK_SIZE {
+                        pos.pos_pending_count += self.freq_buffer[i] as u64;
+                    }
                 }
-                // skip block
-                let block_total_bytes = read_vlong15(&mut self.doc_in)?;
-                self.doc_in.skip_bytes(block_total_bytes)?;
-                self.doc_count_upto += BLOCK_SIZE as u32;
+            }
+            if self.doc_freq - self.doc_count_upto >= BLOCK_SIZE as u32 {
+                if self.has_positions {
+                    let _skip0_num_bytes = self.doc_in.read_vlong()?;
+                    let doc_delta = read_vint15(&mut self.doc_in)?;
+                    self.level0_last_doc += doc_delta as i64;
+                    let block_total_bytes = read_vlong15(&mut self.doc_in)? as u64;
+                    // blockTotalBytes counts from HERE (after the vlong15)
+                    // to the end of the packed data (:983); the impacts/pos
+                    // fields parsed below are part of it, so skipping the
+                    // block must seek to blockEndFP (:997), not skip_bytes
+                    // (which would overshoot by the parsed fields' length)
+                    let block_end_fp = self.doc_in.file_pointer() + block_total_bytes;
+                    let impact_bytes = self.doc_in.read_vlong()? as u64;
+                    self.doc_in.skip_bytes(impact_bytes)?;
+                    self.level0_pos_end_fp += self.doc_in.read_vlong()? as u64; // :986
+                    self.level0_block_pos_upto = self.doc_in.read_byte()? as u64; // :987
+                    if target <= self.level0_last_doc {
+                        break;
+                    }
+                    self.doc_in.seek(block_end_fp)?;
+                    self.doc_count_upto += BLOCK_SIZE as u32;
+                } else {
+                    let skip0_num_bytes = self.doc_in.read_vlong()? as u64;
+                    // end offset of skip data (before the actual data starts)
+                    let skip0_end_fp = self.doc_in.file_pointer() + skip0_num_bytes;
+                    let doc_delta = read_vint15(&mut self.doc_in)?;
+                    self.level0_last_doc += doc_delta as i64;
+                    if target <= self.level0_last_doc {
+                        self.doc_in.seek(skip0_end_fp)?;
+                        break;
+                    }
+                    // skip block
+                    let block_total_bytes = read_vlong15(&mut self.doc_in)?;
+                    self.doc_in.skip_bytes(block_total_bytes)?;
+                    self.doc_count_upto += BLOCK_SIZE as u32;
+                }
             } else {
                 self.level0_last_doc = NO_MORE_DOCS as i64;
                 break;
@@ -377,11 +576,22 @@ fn advance(core: &mut EnumCore, target: i32) -> io::Result<i32> {
     // First buffer entry >= target, starting at doc_buffer_upto; the
     // NO_MORE_DOCS sentinel guarantees termination.
     let mut upto = core.doc_buffer_upto;
+    let from = upto;
     while (core.doc_buffer[upto] as i64) < t {
         upto += 1;
     }
     core.doc = core.doc_buffer[upto] as i64;
     core.doc_buffer_upto = upto + 1;
+    if let Some(pos) = &mut core.pos {
+        if core.doc != NO_MORE_DOCS as i64 {
+            // :1020-1025 — positions of the docs skipped inside the buffer,
+            // plus the landed doc's own freq, become pending
+            for i in from..=upto {
+                pos.pos_pending_count += core.freq_buffer[i] as u64;
+            }
+            pos.position = 0;
+        }
+    }
     Ok(core.doc as i32)
 }
 
@@ -425,6 +635,95 @@ impl DocsFreqsEnum {
     /// PostingsEnum.freq(): current doc's term frequency.
     pub fn freq(&self) -> u32 {
         self.core.freq()
+    }
+}
+
+/// EverythingEnum.skipPositions (:1031-1082), positions-only profile:
+/// steps over the `pos_pending_count - freq` deltas that precede the
+/// current doc's positions in the .pos stream.
+fn skip_positions(pos: &mut PosCore, freq: u64, total_term_freq: u64) -> io::Result<()> {
+    let mut to_skip = pos.pos_pending_count - freq;
+    let left_in_block = (BLOCK_SIZE - pos.pos_buffer_upto) as u64;
+    if to_skip < left_in_block {
+        pos.pos_buffer_upto += to_skip as usize;
+    } else {
+        to_skip -= left_in_block;
+        while to_skip >= BLOCK_SIZE as u64 {
+            pfor_util_skip(&mut pos.pos_in)?;
+            to_skip -= BLOCK_SIZE as u64;
+        }
+        refill_positions(pos, total_term_freq)?;
+        pos.pos_buffer_upto = to_skip as usize;
+    }
+    pos.position = 0;
+    Ok(())
+}
+
+/// EverythingEnum.refillPositions (:1084-1153) without payloads/offsets:
+/// tail block (fp == last_pos_block_fp) = per-delta VInts, else a PFOR
+/// block (mirrors writer write_positions, postings.rs:501-521).
+fn refill_positions(pos: &mut PosCore, total_term_freq: u64) -> io::Result<()> {
+    if pos.pos_in.file_pointer() as i64 == pos.last_pos_block_fp {
+        let count = (total_term_freq % BLOCK_SIZE as u64) as usize;
+        for slot in pos.pos_delta_buffer.iter_mut().take(count) {
+            *slot = pos.pos_in.read_vint()? as u32;
+        }
+    } else {
+        let mut deltas = [0u64; BLOCK_SIZE];
+        pfor_util_decode(&mut pos.pos_in, &mut deltas)?;
+        for (dst, src) in pos.pos_delta_buffer.iter_mut().zip(deltas) {
+            *dst = src as u32;
+        }
+    }
+    Ok(())
+}
+
+/// Docs+freqs+positions iterator (EverythingEnum), produced by
+/// [`PostingsReader::positions`].
+pub struct PositionsEnum {
+    core: EnumCore,
+}
+
+impl PositionsEnum {
+    pub fn doc_id(&self) -> i32 {
+        self.core.doc as i32
+    }
+
+    pub fn next_doc(&mut self) -> io::Result<i32> {
+        self.core.next_doc()
+    }
+
+    pub fn advance(&mut self, target: i32) -> io::Result<i32> {
+        advance(&mut self.core, target)
+    }
+
+    /// PostingsEnum.freq(): current doc's term frequency.
+    pub fn freq(&self) -> u32 {
+        self.core.freq()
+    }
+
+    /// EverythingEnum.nextPosition (:1156-1187): current doc's next
+    /// position (absolute, per-doc base reset).
+    pub fn next_position(&mut self) -> io::Result<u32> {
+        let freq = self.freq() as u64;
+        let total_term_freq = self.core.total_term_freq;
+        let pos = self.core.pos.as_mut().expect("PositionsEnum without pos state");
+        assert!(
+            pos.pos_pending_count > 0,
+            "next_position called more than freq() times in the current doc (:1157)"
+        );
+        if pos.pos_pending_count > freq {
+            skip_positions(pos, freq, total_term_freq)?;
+            pos.pos_pending_count = freq;
+        }
+        if pos.pos_buffer_upto == BLOCK_SIZE {
+            refill_positions(pos, total_term_freq)?;
+            pos.pos_buffer_upto = 0;
+        }
+        pos.position += pos.pos_delta_buffer[pos.pos_buffer_upto];
+        pos.pos_buffer_upto += 1;
+        pos.pos_pending_count -= 1;
+        Ok(pos.position)
     }
 }
 
@@ -809,5 +1108,179 @@ mod tests {
         assert_eq!(en.next_doc().unwrap(), 0);
         fs::remove_dir_all(&root).unwrap();
         let _ = en.freq();
+    }
+
+    /// px (DOCS_AND_FREQS_AND_POSITIONS):
+    /// "hot" df=5000 dense, freqs (i%3)+1, per-doc positions [0,2,..] —
+    ///     ttf=9999: 78 full .pos PFOR blocks + tail 15, level-0/level-1 skips
+    /// "warm" df=200 docs step 3, freqs (i%4)+1, positions [1,3,5,..] — varied deltas
+    /// "one" df=1 singleton doc 42 freq 7, positions [0,1,2,3,4,5,6]
+    fn write_segment_pos(dir: &FSDirectory) -> (FieldInfos, Vec<Vec<u32>>, Vec<Vec<u32>>) {
+        let id = [5u8; 16];
+        let px = indexed("px", 0, IndexOptions::DocsAndFreqsAndPositions);
+        let mut w = PostingsWriter::new(dir, "_0", &id).unwrap();
+        w.start_field(&px, 6000).unwrap();
+        let hot_docs: Vec<u32> = (0..5000).collect();
+        let hot_freqs: Vec<u32> = (0..5000).map(|i| (i % 3) + 1).collect();
+        let hot_pos: Vec<Vec<u32>> = hot_freqs
+            .iter()
+            .map(|&f| (0..f).map(|k| k * 2).collect())
+            .collect();
+        w.write_term(b"hot", &hot_docs, &hot_freqs, Some(&hot_pos)).unwrap();
+        let one_pos: Vec<Vec<u32>> = vec![(0..7).collect()];
+        w.write_term(b"one", &[42], &[7], Some(&one_pos)).unwrap();
+        let warm_docs: Vec<u32> = (0..200).map(|i| i * 3).collect();
+        let warm_freqs: Vec<u32> = (0..200).map(|i| (i % 4) + 1).collect();
+        let warm_pos: Vec<Vec<u32>> = warm_freqs
+            .iter()
+            .map(|&f| (0..f).map(|k| k * 2 + 1).collect())
+            .collect();
+        w.write_term(b"warm", &warm_docs, &warm_freqs, Some(&warm_pos)).unwrap();
+        w.finish_field().unwrap();
+        w.finish().unwrap();
+        let fis = FieldInfos::new(vec![px]);
+        fis.write(dir, "_0", &id, "").unwrap();
+        (fis, hot_pos, warm_pos)
+    }
+
+    fn seek_pos(dir: &FSDirectory, fis: &FieldInfos, term: &[u8]) -> TermEntry {
+        let mut dict = crate::terms_read::TermsDict::open(dir, "_0", &[5u8; 16], fis).unwrap();
+        let fi = fis.by_name("px").unwrap();
+        dict.seek_exact(fi, term).unwrap().expect("term must exist")
+    }
+
+    /// Drive (next_doc + freq × next_position) over the whole list.
+    fn drain_positions(en: &mut PositionsEnum) -> Vec<(i32, Vec<u32>)> {
+        let mut out = Vec::new();
+        loop {
+            let d = en.next_doc().unwrap();
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            let f = en.freq();
+            let mut ps = Vec::with_capacity(f as usize);
+            for _ in 0..f {
+                ps.push(en.next_position().unwrap());
+            }
+            out.push((d, ps));
+        }
+        out
+    }
+
+    #[test]
+    fn positions_sequential_round_trip() {
+        let root = temp_dir("posseq");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, hot_pos, warm_pos) = write_segment_pos(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[5u8; 16]).unwrap();
+        // hot: 5000 docs dense, crosses level-1 (4096) and 38 level-0 boundaries
+        let e = seek_pos(&dir, &fis, b"hot");
+        assert_eq!(e.total_term_freq, 9999);
+        let mut en = postings.positions(&e).unwrap();
+        let got = drain_positions(&mut en);
+        assert_eq!(got.len(), 5000);
+        for (d, ps) in &got {
+            assert_eq!(ps, &hot_pos[*d as usize], "doc {d}");
+        }
+        // warm: varied deltas
+        let e = seek_pos(&dir, &fis, b"warm");
+        let mut en = postings.positions(&e).unwrap();
+        let got = drain_positions(&mut en);
+        assert_eq!(got.len(), 200);
+        for (i, (d, ps)) in got.iter().enumerate() {
+            assert_eq!(*d, (i * 3) as i32);
+            assert_eq!(ps, &warm_pos[i], "warm doc index {i}");
+        }
+        // singleton: no .doc bytes, positions straight from pos_start_fp
+        let e = seek_pos(&dir, &fis, b"one");
+        let mut en = postings.positions(&e).unwrap();
+        assert_eq!(en.next_doc().unwrap(), 42);
+        assert_eq!(en.freq(), 7);
+        for p in 0..7 {
+            assert_eq!(en.next_position().unwrap(), p);
+        }
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn positions_advance_resync() {
+        let root = temp_dir("posadv");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, hot_pos, _) = write_segment_pos(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[5u8; 16]).unwrap();
+        let e = seek_pos(&dir, &fis, b"hot");
+        // fresh enum, advance deep (level-1 + level-0 skip) then read positions
+        let mut en = postings.positions(&e).unwrap();
+        assert_eq!(en.advance(1300).unwrap(), 1300);
+        assert_eq!(en.freq(), 2);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[1300]);
+        // advance to the level-1 boundary doc and past it
+        assert_eq!(en.advance(4095).unwrap(), 4095);
+        let _: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(en.advance(4096).unwrap(), 4096);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[4096]);
+        // into the doc tail (df % 128 != 0 region)
+        assert_eq!(en.advance(4999).unwrap(), 4999);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[4999]);
+        assert_eq!(en.advance(5000).unwrap(), NO_MORE_DOCS);
+        assert_eq!(en.advance(9999).unwrap(), NO_MORE_DOCS); // sticky
+        // advance to the same doc twice must not consume positions
+        let mut en = postings.positions(&e).unwrap();
+        assert_eq!(en.advance(200).unwrap(), 200);
+        assert_eq!(en.advance(200).unwrap(), 200);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[200]);
+        // every target: advance == linear scan, positions of the landed doc
+        for target in [0i32, 1, 127, 128, 4223, 4224, 4998] {
+            let mut en = postings.positions(&e).unwrap();
+            assert_eq!(en.advance(target).unwrap(), target, "target {target}");
+            let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+            assert_eq!(ps, hot_pos[target as usize], "target {target}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn positions_skip_positions_catch_up() {
+        // docs consumed WITHOUT reading their positions: the next
+        // next_position must skip the backlog (skipPositions :1031-1082)
+        let root = temp_dir("posskip");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, hot_pos, _) = write_segment_pos(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[5u8; 16]).unwrap();
+        let e = seek_pos(&dir, &fis, b"hot");
+        let mut en = postings.positions(&e).unwrap();
+        for _ in 0..205 {
+            en.next_doc().unwrap();
+        }
+        // now at doc 204, never read a single position
+        assert_eq!(en.doc_id(), 204);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[204]);
+        // move on to doc 205 and read it fully, then skip 206-209's
+        // positions via advance (buffer-local catch-up)
+        assert_eq!(en.next_doc().unwrap(), 205);
+        let ps205: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps205, hot_pos[205]);
+        assert_eq!(en.advance(210).unwrap(), 210);
+        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        assert_eq!(ps, hot_pos[210]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn positions_missing_pos_file_is_error() {
+        // a segment written without any positions field has no .pos file
+        let root = temp_dir("posnone");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, _, _) = write_segment(&dir); // kw/tx, no positions
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "kw", b"big");
+        assert!(postings.positions(&e).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

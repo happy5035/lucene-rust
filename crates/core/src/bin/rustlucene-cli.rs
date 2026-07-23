@@ -218,6 +218,29 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()>
             doc_csv(&docs)
         ));
     }
+
+    // M2 Terms(IN) battery (search spec M2 §4): 3-term sets take the <=16 OR
+    // rewrite path, the 17-term set the >16 bitset path; the mixed
+    // present/missing item locks the empty-term tolerance. Mirrored in
+    // VerifySearchIndex.java.
+    let terms17: Vec<String> = (0..17).map(|i| format!("connection{i}")).collect();
+    let terms_battery: [(&str, Vec<String>); 4] = [
+        ("level", vec!["INFO".into(), "WARN".into(), "DEBUG".into()]),
+        ("message", vec!["connection0".into(), "query23".into(), "queue39".into()]),
+        ("message", vec!["connection0".into(), "nosuchterm42".into()]),
+        ("message", terms17),
+    ];
+    for (field, terms) in &terms_battery {
+        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let q = Query::terms(field, &term_refs);
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "terms {field}={} count={count} first20={}\n",
+            terms.join(","),
+            doc_csv(&docs)
+        ));
+    }
     print!("{out}");
     Ok(())
 }

@@ -100,6 +100,34 @@ public class VerifySearchIndex {
                    .append(" count=").append(s.count(q))
                    .append(" first20=").append(b).append('\n');
             }
+
+            // M2 Terms(IN) battery: same items/format as the terms_battery in
+            // rustlucene-cli searchdump. Boolean SHOULD of TermQuery is the
+            // Java counterpart of Rust's Terms dual-path execution.
+            String[][][] termsBattery = {
+                {{"level"}, {"INFO", "WARN", "DEBUG"}},
+                {{"message"}, {"connection0", "query23", "queue39"}},
+                {{"message"}, {"connection0", "nosuchterm42"}},
+                {{"message"}, {"connection0","connection1","connection2","connection3",
+                                "connection4","connection5","connection6","connection7",
+                                "connection8","connection9","connection10","connection11",
+                                "connection12","connection13","connection14","connection15",
+                                "connection16"}},
+            };
+            for (String[][] item : termsBattery) {
+                String field = item[0][0];
+                BooleanQuery.Builder bq = new BooleanQuery.Builder();
+                for (String t : item[1])
+                    bq.add(new TermQuery(new Term(field, t)), BooleanClause.Occur.SHOULD);
+                Query q = new ConstantScoreQuery(bq.build());
+                TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                StringBuilder b = new StringBuilder();
+                for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                out.append("terms ").append(field).append('=')
+                   .append(String.join(",", item[1]))
+                   .append(" count=").append(s.count(q))
+                   .append(" first20=").append(b).append('\n');
+            }
         }
         System.out.print(out);
     }

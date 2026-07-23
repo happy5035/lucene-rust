@@ -21,7 +21,7 @@ use rustlucene_core::{
     commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
     JsonBinder, Schema, SegmentBuilder,
 };
-use rustlucene_core::search::{Query, Searcher};
+use rustlucene_core::search::{CountCollector, Query, Searcher};
 
 /// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
 struct XorShift {
@@ -235,7 +235,10 @@ fn doc_csv(docs: &[i32]) -> String {
 /// queries against sampled terms (bucketed by docFreq), measure QPS and
 /// latency percentiles. AND/OR term pairs recorded by Java SearchBench
 /// --dump-queries are replayed verbatim (no sampling) so both sides run the
-/// exact same Boolean query set.
+/// exact same Boolean query set. ITERM work items (every TERM line, bucket
+/// order then file order, no sampling) force full postings iteration via
+/// DocIter instead of the doc_freq count shortcut — the pure-iteration
+/// baseline, mirroring Java SearchBench's iterm type.
 ///
 /// Uses Java SearchBench --dump-queries output as query source.
 /// Output is tab-separated: query_type freq qps p50_us p90_us p99_us count
@@ -324,6 +327,7 @@ fn searchbench(
         Term(String),
         And(String, String),
         Or(String, String),
+        ITerm(String),
     }
     let mut work: Vec<(String, WorkItem)> = Vec::new();
     for t in &low_terms { work.push(("term\tlow".to_string(), WorkItem::Term(t.1.clone()))); }
@@ -339,6 +343,15 @@ fn searchbench(
         };
         work.push((format!("{op}\t{bucket}"), item));
     }
+    // ITERM items: every TERM line, grouped by bucket (low, med, high) then
+    // file order within a bucket — mirroring the Java SearchBench iterm block
+    // one-to-one. No sampling. Forced full postings iteration (see run_once),
+    // bypassing Searcher::count's doc_freq shortcut.
+    for bucket in ["low", "med", "high"] {
+        for (_, t, _) in terms.iter().filter(|(b, _, _)| b == bucket) {
+            work.push((format!("iterm\t{bucket}"), WorkItem::ITerm(t.clone())));
+        }
+    }
 
     if work.is_empty() {
         eprintln!("searchbench: no terms after sampling");
@@ -347,9 +360,24 @@ fn searchbench(
 
     let build_query = |item: &WorkItem| -> Query {
         match item {
-            WorkItem::Term(t) => Query::term(field, t),
+            WorkItem::Term(t) | WorkItem::ITerm(t) => Query::term(field, t),
             WorkItem::And(a, b) => Query::and(field, &[a.as_str(), b.as_str()]),
             WorkItem::Or(a, b) => Query::or(field, &[a.as_str(), b.as_str()]),
+        }
+    };
+    // One measured execution. ITERM forces a full DocIter walk through the
+    // postings (CountCollector over Searcher::search) instead of the
+    // doc_freq O(1) shortcut that Searcher::count takes for term queries —
+    // the pure-iteration counterpart of Java SearchBench's iterm type.
+    let run_once = |searcher: &mut Searcher, item: &WorkItem| -> std::io::Result<u64> {
+        match item {
+            WorkItem::ITerm(t) => {
+                let q = Query::term(field, t);
+                let mut c = CountCollector::default();
+                searcher.search(&q, &mut c)?;
+                Ok(c.count)
+            }
+            _ => searcher.count(&build_query(item)),
         }
     };
     // Correctness line matching the Java SearchBench stderr format verbatim.
@@ -358,6 +386,7 @@ fn searchbench(
             WorkItem::Term(t) => format!("term={t} bucket={label}"),
             WorkItem::And(a, b) => format!("and t1={a} t2={b} bucket={label}"),
             WorkItem::Or(a, b) => format!("or t1={a} t2={b} bucket={label}"),
+            WorkItem::ITerm(t) => format!("iterm={t} bucket={label}"),
         }
     };
 
@@ -370,25 +399,22 @@ fn searchbench(
 
     // Global warmup: run each query once to prime page cache
     for (_, item) in &work {
-        let q = build_query(item);
-        let _ = searcher.count(&q);
+        let _ = run_once(&mut searcher, item)?;
     }
 
     let mut query_counts: Vec<(String, u64)> = Vec::with_capacity(work.len());
 
     for (label, item) in &work {
-        let q = build_query(item);
-
         // Warmup iterations
         for _ in 0..warmup {
-            let _ = searcher.count(&q);
+            let _ = run_once(&mut searcher, item)?;
         }
 
         // Measurement iterations
         let mut latencies_ns = Vec::with_capacity(iter as usize);
         for _ in 0..iter {
             let t0 = Instant::now();
-            let count = searcher.count(&q)?;
+            let count = run_once(&mut searcher, item)?;
             latencies_ns.push(t0.elapsed().as_nanos() as u64);
             // Store count from last iteration for correctness check
             if latencies_ns.len() == iter as usize {

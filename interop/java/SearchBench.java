@@ -1,3 +1,4 @@
+import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -24,6 +25,17 @@ import org.apache.lucene.util.BytesRef;
  *   term  — single-term lookup
  *   and   — 2–3 terms, BooleanQuery MUST
  *   or    — 2–3 terms, BooleanQuery SHOULD (minShouldMatch=1)
+ *   iterm — (--load-queries only) same TermQuery as "term" but wrapped in
+ *           ForceIterQuery (hides the Weight.count docFreq shortcut from
+ *           TotalHitCountCollector) and run on a cache-free IndexSearcher
+ *           over every TERM line (no sampling), so it measures raw postings
+ *           iteration even when the main searcher has the LRUQueryCache
+ *           enabled.
+ *
+ * Flags:
+ *   --no-cache — disable the query cache on the main searcher
+ *                (setQueryCache(null) + a never-cache policy; default
+ *                behaviour is unchanged).
  *
  * Query file format (--dump-queries output, --load-queries input):
  *   TERM\t<bucket>\t<term>\t<docFreq>
@@ -43,6 +55,12 @@ import org.apache.lucene.util.BytesRef;
  *   BENCH query_type freq_bucket qps p50_us p90_us p99_us
  */
 public class SearchBench {
+    /** 9.12's QueryCachingPolicy has no NEVER_CACHE constant (added in 10.x); inline equivalent. */
+    static final QueryCachingPolicy NEVER_CACHE = new QueryCachingPolicy() {
+        @Override public void onUse(Query query) {}
+        @Override public boolean shouldCache(Query query) { return false; }
+    };
+
     static final class Stats {
         final double qps;
         final double p50us, p90us, p99us;
@@ -153,6 +171,64 @@ public class SearchBench {
 
     static final QueryGenerator[] QUERY_TYPES = { TERM_QUERY, AND_QUERY, OR_QUERY };
 
+    /**
+     * Wraps a query to force full postings iteration by hiding the
+     * {@code Weight.count} shortcut: {@code TotalHitCountCollector} consults
+     * {@code weight.count(context)} per leaf and skips iteration when it
+     * returns a value, and for an undeleted segment {@code TermQuery}'s weight
+     * answers O(1) from the dictionary (TermQuery.java:232-244) — which
+     * {@code ConstantScoreQuery} transparently delegates to. A single-MUST
+     * {@code BooleanQuery} does NOT help: {@code BooleanWeight.reqCount}
+     * returns the only clause's docFreq. Overriding {@code count} to return
+     * -1 makes the collector path iterate every hit (DefaultBulkScorer
+     * scoreAll), which is exactly what the Rust searchbench iterm mode does.
+     */
+    static final class ForceIterQuery extends Query {
+        private final Query inner;
+        ForceIterQuery(Query inner) { this.inner = inner; }
+
+        @Override
+        public Query rewrite(IndexReader reader) throws IOException {
+            Query rewritten = inner.rewrite(reader);
+            if (rewritten != inner) {
+                return new ForceIterQuery(rewritten);
+            }
+            return super.rewrite(reader);
+        }
+
+        @Override
+        public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost)
+                throws IOException {
+            final Weight in = inner.createWeight(searcher, scoreMode, boost);
+            return new FilterWeight(in) {
+                @Override
+                public int count(LeafReaderContext context) {
+                    return -1; // force the collector path to iterate
+                }
+            };
+        }
+
+        @Override
+        public void visit(QueryVisitor visitor) {
+            inner.visit(visitor.getSubVisitor(BooleanClause.Occur.MUST, this));
+        }
+
+        @Override
+        public String toString(String field) {
+            return "ForceIter(" + inner.toString(field) + ")";
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof ForceIterQuery && inner.equals(((ForceIterQuery) o).inner);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * ForceIterQuery.class.hashCode() + inner.hashCode();
+        }
+    }
+
     // --- query serialisation for cross-process comparison ------------------
 
     static String serialiseQuery(QueryGenerator gen, FreqBucket bucket, int idx) {
@@ -202,6 +278,7 @@ public class SearchBench {
         long seed = 42;
         String dumpQueriesFile = null;
         String loadQueriesFile = null;
+        boolean noCache = false;
         List<String> pos = new ArrayList<>();
 
         for (int i = 0; i < args.length; i++) {
@@ -212,11 +289,12 @@ public class SearchBench {
                 case "--seed":      seed = Long.parseLong(args[++i]); break;
                 case "--dump-queries": dumpQueriesFile = args[++i]; break;
                 case "--load-queries": loadQueriesFile = args[++i]; break;
+                case "--no-cache":  noCache = true; break;
                 default: pos.add(args[i]);
             }
         }
         if (pos.size() < 2) {
-            System.err.println("usage: SearchBench <indexDir> <field> [--tasks N] [--warmup N] [--iter N] [--seed S] [--dump-queries|--load-queries FILE]");
+            System.err.println("usage: SearchBench <indexDir> <field> [--tasks N] [--warmup N] [--iter N] [--seed S] [--no-cache] [--dump-queries|--load-queries FILE]");
             System.exit(2);
         }
 
@@ -225,6 +303,10 @@ public class SearchBench {
 
         try (DirectoryReader reader = DirectoryReader.open(FSDirectory.open(indexDir))) {
             IndexSearcher searcher = new IndexSearcher(reader);
+            if (noCache) {
+                searcher.setQueryCache(null);
+                searcher.setQueryCachingPolicy(NEVER_CACHE);
+            }
             Random rng = new Random(seed);
 
             if (dumpQueriesFile != null) {
@@ -326,7 +408,23 @@ public class SearchBench {
                     labels.add(op + "\t" + bl);
                     details.add(op + " t1=" + t1 + " t2=" + t2 + " bucket=" + op + "\t" + bl);
                 }
-                runAndPrint(searcher, queries, labels, details, warmup, iterations);
+                // ITERM queries: every TERM line (bucket enum order, file order
+                // within a bucket — matching the Rust searchbench iterm block),
+                // no sampling. They run on a dedicated cache-free searcher so
+                // the forced-iteration baseline stays honest even when the main
+                // searcher's LRUQueryCache is enabled.
+                IndexSearcher iterSearcher = new IndexSearcher(reader);
+                iterSearcher.setQueryCache(null);
+                iterSearcher.setQueryCachingPolicy(NEVER_CACHE);
+                for (FreqBucket bucket : FreqBucket.values()) {
+                    for (String t : loadedTerms.get(bucket)) {
+                        queries.add(new ForceIterQuery(
+                                new ConstantScoreQuery(new TermQuery(new Term(field, t)))));
+                        labels.add("iterm\t" + bucketLabel(bucket));
+                        details.add("iterm=" + t + " bucket=iterm\t" + bucketLabel(bucket));
+                    }
+                }
+                runAndPrint(searcher, iterSearcher, queries, labels, details, warmup, iterations);
                 return;
             }
 
@@ -344,9 +442,24 @@ public class SearchBench {
 
     static void runAndPrint(IndexSearcher searcher, List<Query> queries, List<String> labels,
                             List<String> details, int warmup, int iterations) throws Exception {
+        runAndPrint(searcher, null, queries, labels, details, warmup, iterations);
+    }
+
+    static void runAndPrint(IndexSearcher searcher, IndexSearcher iterSearcher,
+                            List<Query> queries, List<String> labels,
+                            List<String> details, int warmup, int iterations) throws Exception {
+        // Per-query searcher selection: labels starting with "iterm" run on the
+        // cache-free iterSearcher (when provided); everything else uses the
+        // main searcher.
+        IndexSearcher[] searchers = new IndexSearcher[queries.size()];
+        for (int i = 0; i < queries.size(); i++) {
+            searchers[i] = iterSearcher != null && labels.get(i).startsWith("iterm")
+                    ? iterSearcher : searcher;
+        }
+
         // Global warmup: run all queries once to prime JIT and page cache
-        for (Query q : queries) {
-            runOnce(searcher, q);
+        for (int i = 0; i < queries.size(); i++) {
+            runOnce(searchers[i], queries.get(i));
         }
 
         // Per-query measurement
@@ -356,7 +469,7 @@ public class SearchBench {
         Map<String, List<Double>> aggP99 = new LinkedHashMap<>();
 
         for (int i = 0; i < queries.size(); i++) {
-            Stats s = measure(searcher, queries.get(i), warmup, iterations);
+            Stats s = measure(searchers[i], queries.get(i), warmup, iterations);
             String group = labels.get(i);
             aggQps.computeIfAbsent(group, k -> new ArrayList<>()).add(s.qps);
             aggP50.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p50us);
@@ -366,7 +479,7 @@ public class SearchBench {
                 // Per-query hit count for correctness diffing against the Rust
                 // searchbench (which prints the same lines to stderr).
                 TotalHitCountCollector c = new TotalHitCountCollector();
-                searcher.search(queries.get(i), c);
+                searchers[i].search(queries.get(i), c);
                 System.err.printf(Locale.ROOT, "%s\t%d%n", details.get(i), c.getTotalHits());
             }
         }

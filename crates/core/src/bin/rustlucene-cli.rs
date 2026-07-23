@@ -403,6 +403,48 @@ fn searchbench(
         })
         .collect();
 
+    // M2 line types (same file, replayed verbatim like AND/OR)
+    let prefix_tasks: Vec<(String, String)> = content
+        .lines()
+        .filter(|l| l.starts_with("PREFIX\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 3 { Some((parts[1].to_string(), parts[2].to_string())) } else { None }
+        })
+        .collect();
+    let wildcard_tasks: Vec<(String, String)> = content
+        .lines()
+        .filter(|l| l.starts_with("WILDCARD\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 3 { Some((parts[1].to_string(), parts[2].to_string())) } else { None }
+        })
+        .collect();
+    let terms_tasks: Vec<(String, Vec<String>)> = content
+        .lines()
+        .filter(|l| l.starts_with("TERMS\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 3 {
+                Some((parts[1].to_string(), parts[2].split(',').map(str::to_string).collect()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let phrase_tasks: Vec<(String, String, String)> = content
+        .lines()
+        .filter(|l| l.starts_with("PHRASE\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 4 {
+                Some((parts[1].to_string(), parts[2].to_string(), parts[3].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Classify into freq buckets (luceneutil convention)
     let low_limit = 10u32;
     let med_limit = (max_doc as u32 / 100).max(11);
@@ -431,6 +473,10 @@ fn searchbench(
         And(String, String),
         Or(String, String),
         ITerm(String),
+        Prefix(String),
+        Wildcard(String),
+        Terms(Vec<String>),
+        Phrase(String, String),
     }
     let mut work: Vec<(String, WorkItem)> = Vec::new();
     for t in &low_terms { work.push(("term\tlow".to_string(), WorkItem::Term(t.1.clone()))); }
@@ -455,6 +501,23 @@ fn searchbench(
             work.push((format!("iterm\t{bucket}"), WorkItem::ITerm(t.clone())));
         }
     }
+    // M2 line types, replayed verbatim like AND/OR. (Both sides append them
+    // after the ITERM block — and the order is irrelevant anyway: the
+    // per-query count lines are sorted before diffing and group aggregation
+    // is order-independent.)
+    for (bucket, p) in &prefix_tasks {
+        work.push((format!("prefix\t{bucket}"), WorkItem::Prefix(p.clone())));
+    }
+    for (bucket, p) in &wildcard_tasks {
+        work.push((format!("wildcard\t{bucket}"), WorkItem::Wildcard(p.clone())));
+    }
+    for (bucket, ts) in &terms_tasks {
+        let type_label = if ts.len() > 16 { "termsbig" } else { "terms" };
+        work.push((format!("{type_label}\t{bucket}"), WorkItem::Terms(ts.clone())));
+    }
+    for (bucket, t1, t2) in &phrase_tasks {
+        work.push((format!("phrase\t{bucket}"), WorkItem::Phrase(t1.clone(), t2.clone())));
+    }
 
     if work.is_empty() {
         eprintln!("searchbench: no terms after sampling");
@@ -466,6 +529,13 @@ fn searchbench(
             WorkItem::Term(t) | WorkItem::ITerm(t) => Query::term(field, t),
             WorkItem::And(a, b) => Query::and(field, &[a.as_str(), b.as_str()]),
             WorkItem::Or(a, b) => Query::or(field, &[a.as_str(), b.as_str()]),
+            WorkItem::Prefix(p) => Query::prefix(field, p),
+            WorkItem::Wildcard(p) => Query::wildcard(field, p),
+            WorkItem::Terms(ts) => {
+                let refs: Vec<&str> = ts.iter().map(String::as_str).collect();
+                Query::terms(field, &refs)
+            }
+            WorkItem::Phrase(t1, t2) => Query::phrase(field, &[t1.as_str(), t2.as_str()]),
         }
     };
     // One measured execution. ITERM forces a full DocIter walk through the
@@ -490,6 +560,10 @@ fn searchbench(
             WorkItem::And(a, b) => format!("and t1={a} t2={b} bucket={label}"),
             WorkItem::Or(a, b) => format!("or t1={a} t2={b} bucket={label}"),
             WorkItem::ITerm(t) => format!("iterm={t} bucket={label}"),
+            WorkItem::Prefix(p) => format!("prefix={p} bucket={label}"),
+            WorkItem::Wildcard(p) => format!("wildcard={p} bucket={label}"),
+            WorkItem::Terms(ts) => format!("terms={} bucket={label}", ts.join(",")),
+            WorkItem::Phrase(t1, t2) => format!("phrase t1={t1} t2={t2} bucket={label}"),
         }
     };
 

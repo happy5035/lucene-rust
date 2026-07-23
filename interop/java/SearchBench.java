@@ -31,6 +31,12 @@ import org.apache.lucene.util.BytesRef;
  *           over every TERM line (no sampling), so it measures raw postings
  *           iteration even when the main searcher has the LRUQueryCache
  *           enabled.
+ *   prefix    — PrefixQuery over PREFIX lines
+ *   wildcard  — WildcardQuery over WILDCARD lines
+ *   terms     — TERMS lines with ≤16 terms (BooleanQuery SHOULD msm=1)
+ *   termsbig  — TERMS lines with >16 terms (same shape; label follows the
+ *               >16 rule on both sides)
+ *   phrase    — PhraseQuery (slop=0) over PHRASE lines
  *
  * Flags:
  *   --no-cache — disable the query cache on the main searcher
@@ -41,6 +47,11 @@ import org.apache.lucene.util.BytesRef;
  *   TERM\t<bucket>\t<term>\t<docFreq>
  *   AND\t<bucket>\t<term1>\t<term2>   (tasks pairs per bucket)
  *   OR\t<bucket>\t<term1>\t<term2>    (tasks pairs per bucket)
+ *   PREFIX\t<bucket>\t<prefix>
+ *   WILDCARD\t<bucket>\t<pattern>
+ *   TERMS\t<bucket>\t<term1,term2,...,termN>   (N=4 -> label "terms",
+ *                                              N>16 -> label "termsbig")
+ *   PHRASE\t<bucket>\t<term1>\t<term2>         (only when the field has positions)
  * --load-queries replays AND/OR lines verbatim (MUST+MUST / SHOULD+SHOULD
  * msm=1, both wrapped in ConstantScoreQuery) when present, and only falls
  * back to self-sampling when the file has none — so Java and the Rust
@@ -335,6 +346,58 @@ public class SearchBench {
                             pw.printf(Locale.ROOT, "OR\t%s\t%s\t%s%n", bucketLabel(bucket), t1, t2);
                         }
                     }
+                    // M2 multi-term query types, replayed verbatim by both
+                    // sides (Rust searchbench reads the same file).
+                    for (FreqBucket bucket : FreqBucket.values()) {
+                        List<TermStats> sample = buckets.get(bucket);
+                        if (sample.size() < 2) continue;
+                        for (int i = 0; i < tasks; i++) {
+                            String t = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            // PREFIX: leading 4 chars of a sampled term
+                            pw.printf(Locale.ROOT, "PREFIX\t%s\t%s%n",
+                                    bucketLabel(bucket), t.substring(0, Math.min(4, t.length())));
+                            // WILDCARD: alternate prefix* and prefix?+suffix shapes
+                            int keep = Math.max(1, t.length() - 2);
+                            String pattern = (i % 2 == 0)
+                                    ? t.substring(0, keep) + "*"
+                                    : t.substring(0, keep) + "?" + t.substring(t.length() - 1);
+                            pw.printf(Locale.ROOT, "WILDCARD\t%s\t%s%n", bucketLabel(bucket), pattern);
+                        }
+                        // TERMS: one 4-term line (OR path) and one 25-term line
+                        // (bitset path); label derived from the csv size (>16
+                        // -> termsbig) on both sides
+                        if (sample.size() >= 4) {
+                            StringBuilder csv = new StringBuilder();
+                            for (int k = 0; k < 4; k++) {
+                                if (k > 0) csv.append(',');
+                                csv.append(sample.get(rng.nextInt(sample.size())).term.utf8ToString());
+                            }
+                            pw.printf(Locale.ROOT, "TERMS\t%s\t%s%n", bucketLabel(bucket), csv);
+                        }
+                        if (sample.size() >= 25) {
+                            StringBuilder csv = new StringBuilder();
+                            for (int k = 0; k < 25; k++) {
+                                if (k > 0) csv.append(',');
+                                csv.append(sample.get(rng.nextInt(sample.size())).term.utf8ToString());
+                            }
+                            pw.printf(Locale.ROOT, "TERMS\t%s\t%s%n", bucketLabel(bucket), csv);
+                        }
+                    }
+                    // PHRASE pairs — only when the field has positions (the
+                    // Rust side fail-fasts phrase on non-positions fields)
+                    FieldInfo benchFi = FieldInfos.getMergedFieldInfos(reader).fieldInfo(field);
+                    if (benchFi != null
+                            && benchFi.getIndexOptions().compareTo(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS) >= 0) {
+                        for (FreqBucket bucket : FreqBucket.values()) {
+                            List<TermStats> sample = buckets.get(bucket);
+                            if (sample.size() < 2) continue;
+                            for (int i = 0; i < tasks; i++) {
+                                String t1 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                                String t2 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                                pw.printf(Locale.ROOT, "PHRASE\t%s\t%s\t%s%n", bucketLabel(bucket), t1, t2);
+                            }
+                        }
+                    }
                 }
                 System.out.println("DUMPED terms to " + dumpQueriesFile);
                 return;
@@ -346,6 +409,10 @@ public class SearchBench {
                 for (FreqBucket b : FreqBucket.values()) loadedTerms.put(b, new ArrayList<>());
                 // AND/OR lines: {op, bucketLabel, term1, term2}, kept in file order
                 List<String[]> loadedBool = new ArrayList<>();
+                List<String[]> loadedPrefix = new ArrayList<>();
+                List<String[]> loadedWildcard = new ArrayList<>();
+                List<String[]> loadedTermSets = new ArrayList<>();
+                List<String[]> loadedPhrase = new ArrayList<>();
                 for (String line : Files.readAllLines(Paths.get(loadQueriesFile))) {
                     String[] parts = line.split("\t");
                     if (parts[0].equals("TERM") && parts.length >= 3) {
@@ -354,6 +421,14 @@ public class SearchBench {
                     } else if ((parts[0].equals("AND") || parts[0].equals("OR")) && parts.length >= 4) {
                         loadedBool.add(new String[]{
                                 parts[0].toLowerCase(Locale.ROOT), parts[1], parts[2], parts[3]});
+                    } else if (parts[0].equals("PREFIX") && parts.length >= 3) {
+                        loadedPrefix.add(new String[]{parts[1], parts[2]});
+                    } else if (parts[0].equals("WILDCARD") && parts.length >= 3) {
+                        loadedWildcard.add(new String[]{parts[1], parts[2]});
+                    } else if (parts[0].equals("TERMS") && parts.length >= 3) {
+                        loadedTermSets.add(new String[]{parts[1], parts[2]});
+                    } else if (parts[0].equals("PHRASE") && parts.length >= 4) {
+                        loadedPhrase.add(new String[]{parts[1], parts[2], parts[3]});
                     }
                 }
                 // Build queries using the loaded terms
@@ -423,6 +498,33 @@ public class SearchBench {
                         labels.add("iterm\t" + bucketLabel(bucket));
                         details.add("iterm=" + t + " bucket=iterm\t" + bucketLabel(bucket));
                     }
+                }
+                // M2 line types, replayed verbatim like the AND/OR lines
+                for (String[] p : loadedPrefix) {
+                    queries.add(new ConstantScoreQuery(new PrefixQuery(new Term(field, p[1]))));
+                    labels.add("prefix\t" + p[0]);
+                    details.add("prefix=" + p[1] + " bucket=prefix\t" + p[0]);
+                }
+                for (String[] p : loadedWildcard) {
+                    queries.add(new ConstantScoreQuery(new WildcardQuery(new Term(field, p[1]))));
+                    labels.add("wildcard\t" + p[0]);
+                    details.add("wildcard=" + p[1] + " bucket=wildcard\t" + p[0]);
+                }
+                for (String[] p : loadedTermSets) {
+                    String[] ts = p[1].split(",");
+                    BooleanQuery.Builder b = new BooleanQuery.Builder();
+                    for (String t : ts)
+                        b.add(new ConstantScoreQuery(new TermQuery(new Term(field, t))), BooleanClause.Occur.SHOULD);
+                    b.setMinimumNumberShouldMatch(1);
+                    queries.add(new ConstantScoreQuery(b.build()));
+                    String type = ts.length > 16 ? "termsbig" : "terms";
+                    labels.add(type + "\t" + p[0]);
+                    details.add("terms=" + p[1] + " bucket=" + type + "\t" + p[0]);
+                }
+                for (String[] p : loadedPhrase) {
+                    queries.add(new ConstantScoreQuery(new PhraseQuery(field, p[1], p[2])));
+                    labels.add("phrase\t" + p[0]);
+                    details.add("phrase t1=" + p[1] + " t2=" + p[2] + " bucket=phrase\t" + p[0]);
                 }
                 runAndPrint(searcher, iterSearcher, queries, labels, details, warmup, iterations);
                 return;

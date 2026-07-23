@@ -4,3 +4,4 @@ target/
 /interop/indexes/
 
 .worktrees/
+.superpowers/

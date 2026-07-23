@@ -161,7 +161,7 @@ fn gen_log_document(
 /// Search battery over a log-corpus index, printed line by line in the exact
 /// format of interop/java/VerifySearchIndex.java — the two outputs are
 /// diffed by interop/verify-search.sh (make log-test).
-fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()> {
+fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> std::io::Result<()> {
     let dir = FSDirectory::open(index_dir)?;
     let mut searcher = Searcher::open(&dir)?;
     let mut out = String::new();
@@ -287,6 +287,39 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()>
             "wildcard {field}={pattern} count={count} first20={}\n",
             doc_csv(&docs)
         ));
+    }
+    // M2 phrase battery (search spec M2 §6), positions variant only: the
+    // two/three-term phrases come from doc7's real adjacent tokens (a
+    // guaranteed hit), the reversed pair exercises the not-adjacent case,
+    // "query23 query23" the repeated-term case, the missing-term and
+    // single-term items lock the degenerate behaviors. Mirrored in
+    // VerifySearchIndex.java (gated on the same flag).
+    if positions && num_docs > 7 {
+        let toks = message_tokens_of_doc(seed, 7, 3);
+        let (t0, t1, t2) = (toks[0].as_str(), toks[1].as_str(), toks[2].as_str());
+        let q = Query::phrase("message", &[t0, t1]);
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "phrase message={t0},{t1} count={count} first20={}\n",
+            doc_csv(&docs)
+        ));
+        let q = Query::phrase("message", &[t0, t1, t2]);
+        let count = searcher.count(&q)?;
+        out.push_str(&format!("phrase message={t0},{t1},{t2} count={count}\n"));
+        let q = Query::phrase("message", &[t1, t0]);
+        let count = searcher.count(&q)?;
+        out.push_str(&format!("phrase message={t1},{t0} count={count}\n"));
+        let degenerate: [&[&str]; 3] = [
+            &["query23", "query23"],
+            &["connection0", "nosuchterm42"],
+            &["connection0"],
+        ];
+        for terms in degenerate {
+            let q = Query::phrase("message", terms);
+            let count = searcher.count(&q)?;
+            out.push_str(&format!("phrase message={} count={count}\n", terms.join(",")));
+        }
     }
     print!("{out}");
     Ok(())
@@ -578,6 +611,22 @@ fn trace_id_of_doc(seed: u64, n: u64) -> String {
         };
     }
     tid
+}
+
+/// Replays the log corpus generator (same RNG stream as logwrite) to recover
+/// the first `k` whitespace tokens of doc `n`'s message without reading
+/// stored fields — the phrase battery's guaranteed-hit phrase source.
+fn message_tokens_of_doc(seed: u64, n: u64, k: usize) -> Vec<String> {
+    let vocab = vocab();
+    let mut rng = XorShift::new(seed);
+    let mut toks = Vec::new();
+    for doc_id in 0..=n {
+        let doc = gen_log_document(&mut rng, &vocab, doc_id, false, false);
+        if let Some((_, FieldValue::Text(m))) = doc.fields.iter().find(|(name, _)| name == "message") {
+            toks = m.split_ascii_whitespace().take(k).map(str::to_string).collect();
+        }
+    }
+    toks
 }
 
 /// Sharded log-schema bench, mirroring `bench` (private SegmentBuilder per
@@ -1049,7 +1098,7 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
-    eprintln!("  rustlucene-cli searchdump <indexDir> <numDocs> <seed>");
+    eprintln!("  rustlucene-cli searchdump <indexDir> <numDocs> <seed> [--positions]");
     eprintln!("  rustlucene-cli searchbench <indexDir> <field> [--warmup N] [--iter N] [--tasks N] [--seed S] [--load-queries FILE]");
     std::process::exit(2);
 }
@@ -1173,10 +1222,12 @@ fn main() -> std::io::Result<()> {
             if args.len() < 5 {
                 usage();
             }
+            let positions = args[5..].iter().any(|a| a == "--positions");
             searchdump(
                 Path::new(&args[2]),
                 args[3].parse().unwrap(),
                 args[4].parse().unwrap(),
+                positions,
             )
         }
         "searchbench" => {

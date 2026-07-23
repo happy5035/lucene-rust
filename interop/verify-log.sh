@@ -38,6 +38,6 @@ diff -u /tmp/rl-log-rust.out /tmp/rl-log-java.out
 cat /tmp/rl-log-rust.out
 
 echo "== Search diff: searchdump vs VerifySearchIndex"
-"$ROOT/interop/verify-search.sh" "$RUST_DIR" "$JAVA_DIR" "$NUM_DOCS" "$SEED"
+"$ROOT/interop/verify-search.sh" "$RUST_DIR" "$JAVA_DIR" "$NUM_DOCS" "$SEED" "$POSITIONS"
 
 echo "LOG_INTEROP_OK"

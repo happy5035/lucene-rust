@@ -16,6 +16,7 @@ import org.apache.lucene.util.BytesRef;
 public class VerifySearchIndex {
     public static void main(String[] args) throws Exception {
         Path indexDir = Paths.get(args[0]);
+        boolean positions = args.length > 1 && args[1].equals("--positions");
         StringBuilder out = new StringBuilder();
 
         try (Directory dir = FSDirectory.open(indexDir);
@@ -168,6 +169,42 @@ public class VerifySearchIndex {
                 out.append("wildcard ").append(item[0]).append('=').append(item[1])
                    .append(" count=").append(s.count(q))
                    .append(" first20=").append(b).append('\n');
+            }
+            // M2 phrase battery (positions variant only): same items/format
+            // as searchdump. The phrase terms are doc7's real adjacent tokens
+            // (a guaranteed hit), read from stored fields.
+            if (positions && r.maxDoc() > 7) {
+                String[] toks = stored.document(7).get("message").split(" ");
+                String t0 = toks[0], t1 = toks[1], t2 = toks[2];
+                {
+                    Query q = new ConstantScoreQuery(new PhraseQuery("message", t0, t1));
+                    TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                    StringBuilder b = new StringBuilder();
+                    for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                    out.append("phrase message=").append(t0).append(',').append(t1)
+                       .append(" count=").append(s.count(q))
+                       .append(" first20=").append(b).append('\n');
+                }
+                {
+                    Query q = new ConstantScoreQuery(new PhraseQuery("message", t0, t1, t2));
+                    out.append("phrase message=").append(t0).append(',').append(t1).append(',').append(t2)
+                       .append(" count=").append(s.count(q)).append('\n');
+                }
+                {
+                    Query q = new ConstantScoreQuery(new PhraseQuery("message", t1, t0));
+                    out.append("phrase message=").append(t1).append(',').append(t0)
+                       .append(" count=").append(s.count(q)).append('\n');
+                }
+                String[][] degenerate = {
+                    {"query23", "query23"},
+                    {"connection0", "nosuchterm42"},
+                    {"connection0"},
+                };
+                for (String[] terms : degenerate) {
+                    Query q = new ConstantScoreQuery(new PhraseQuery("message", terms));
+                    out.append("phrase message=").append(String.join(",", terms))
+                       .append(" count=").append(s.count(q)).append('\n');
+                }
             }
         }
         System.out.print(out);

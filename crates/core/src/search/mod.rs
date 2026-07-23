@@ -1,6 +1,7 @@
 //! Search read path (search spec §3): per-segment iteration, docID-ordered
 //! and count collectors, Term and MatchAll queries (ConstantScore semantics).
 
+pub mod bitset;
 pub mod collector;
 pub mod doc_iter;
 pub mod query;
@@ -8,6 +9,7 @@ pub mod reader;
 pub mod searcher;
 pub mod segment_reader;
 
+pub use bitset::FixedBitSet;
 pub use collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
 pub use doc_iter::{DocIter, MatchAllIter, SegmentDocIter};
 pub use query::Query;

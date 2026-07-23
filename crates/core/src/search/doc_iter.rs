@@ -15,28 +15,54 @@ pub trait DocIter {
     fn doc_id(&self) -> i32;
     fn next_doc(&mut self) -> io::Result<i32>;
     fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if self.doc_id() >= target { return Ok(self.doc_id()); }
-        loop { let d = self.next_doc()?; if d >= target { return Ok(d); } }
+        if self.doc_id() >= target {
+            return Ok(self.doc_id());
+        }
+        loop {
+            let d = self.next_doc()?;
+            if d >= target {
+                return Ok(d);
+            }
+        }
     }
-    fn freq(&self) -> u32 { 1 }
+    fn freq(&self) -> u32 {
+        1
+    }
 }
 
 // ── MatchAll ──────────────────────────────────────────────────────────
 
-pub struct MatchAllIter { doc: i32, max_doc: i32 }
+pub struct MatchAllIter {
+    doc: i32,
+    max_doc: i32,
+}
 impl MatchAllIter {
-    pub fn new(max_doc: i32) -> Self { MatchAllIter { doc: -1, max_doc } }
+    pub fn new(max_doc: i32) -> Self {
+        MatchAllIter { doc: -1, max_doc }
+    }
 }
 impl DocIter for MatchAllIter {
-    fn doc_id(&self) -> i32 { self.doc }
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
     fn next_doc(&mut self) -> io::Result<i32> {
-        if self.doc == NO_MORE_DOCS { return Ok(NO_MORE_DOCS); }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
         self.doc += 1;
-        if self.doc >= self.max_doc { self.doc = NO_MORE_DOCS; }
+        if self.doc >= self.max_doc {
+            self.doc = NO_MORE_DOCS;
+        }
         Ok(self.doc)
     }
     fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if target > self.doc { self.doc = if target >= self.max_doc { NO_MORE_DOCS } else { target }; }
+        if target > self.doc {
+            self.doc = if target >= self.max_doc {
+                NO_MORE_DOCS
+            } else {
+                target
+            };
+        }
         Ok(self.doc)
     }
 }
@@ -51,102 +77,237 @@ impl PostingsIter {
     /// `needs_freq == false` over a DOCS_AND_FREQS field yields a no-freq
     /// enum: freq blocks are skipped byte-wise and `freq()` panics — only
     /// count-only consumers (which never call freq) may take that path.
-    fn new(seg: &SegmentReader, entry: &TermEntry, has_freqs: bool, needs_freq: bool) -> io::Result<Self> {
-        if has_freqs { Ok(PostingsIter::Freqs(seg.docs_freqs_enum(entry, needs_freq)?)) }
-        else { Ok(PostingsIter::Docs(seg.docs_enum(entry)?)) }
+    fn new(
+        seg: &SegmentReader,
+        entry: &TermEntry,
+        has_freqs: bool,
+        needs_freq: bool,
+    ) -> io::Result<Self> {
+        if has_freqs {
+            Ok(PostingsIter::Freqs(seg.docs_freqs_enum(entry, needs_freq)?))
+        } else {
+            Ok(PostingsIter::Docs(seg.docs_enum(entry)?))
+        }
     }
-    fn doc_id(&self) -> i32 { match self { Self::Docs(d) => d.doc_id(), Self::Freqs(f) => f.doc_id() } }
-    fn next_doc(&mut self) -> io::Result<i32> { match self { Self::Docs(d) => d.next_doc(), Self::Freqs(f) => f.next_doc() } }
-    fn advance(&mut self, t: i32) -> io::Result<i32> { match self { Self::Docs(d) => d.advance(t), Self::Freqs(f) => f.advance(t) } }
-    fn freq(&self) -> u32 { match self { Self::Freqs(f) => f.freq(), _ => 1 } }
+    fn doc_id(&self) -> i32 {
+        match self {
+            Self::Docs(d) => d.doc_id(),
+            Self::Freqs(f) => f.doc_id(),
+        }
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        match self {
+            Self::Docs(d) => d.next_doc(),
+            Self::Freqs(f) => f.next_doc(),
+        }
+    }
+    fn advance(&mut self, t: i32) -> io::Result<i32> {
+        match self {
+            Self::Docs(d) => d.advance(t),
+            Self::Freqs(f) => f.advance(t),
+        }
+    }
+    fn freq(&self) -> u32 {
+        match self {
+            Self::Freqs(f) => f.freq(),
+            _ => 1,
+        }
+    }
 }
 
 // ── Conjunction (AND) ─────────────────────────────────────────────────
 
-pub struct ConjunctionDocIter { sub: Vec<PostingsIter>, doc: i32, lead: usize }
+pub struct ConjunctionDocIter {
+    sub: Vec<PostingsIter>,
+    doc: i32,
+    lead: usize,
+}
 
 impl ConjunctionDocIter {
-    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)], needs_freq: bool) -> io::Result<Self> {
+    pub fn new(
+        seg: &SegmentReader,
+        field: &str,
+        sorted_entries: &[(u32, TermEntry)],
+        needs_freq: bool,
+    ) -> io::Result<Self> {
         let fi = seg.field_info(field);
-        let has_freqs = fi.map(|f| f.index_options != IndexOptions::Docs).unwrap_or(false);
+        let has_freqs = fi
+            .map(|f| f.index_options != IndexOptions::Docs)
+            .unwrap_or(false);
         let mut sub = Vec::with_capacity(sorted_entries.len());
-        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?); }
-        for s in &mut sub { if s.next_doc()? == NO_MORE_DOCS { return Ok(ConjunctionDocIter { sub, doc: NO_MORE_DOCS, lead: 0 }); } }
-        Ok(ConjunctionDocIter { sub, doc: -1, lead: 0 })
+        for (_, entry) in sorted_entries {
+            sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
+        }
+        for s in &mut sub {
+            if s.next_doc()? == NO_MORE_DOCS {
+                return Ok(ConjunctionDocIter {
+                    sub,
+                    doc: NO_MORE_DOCS,
+                    lead: 0,
+                });
+            }
+        }
+        Ok(ConjunctionDocIter {
+            sub,
+            doc: -1,
+            lead: 0,
+        })
     }
     fn advance_all_past(&mut self, doc: i32) -> io::Result<bool> {
-        for s in &mut self.sub { if s.doc_id() == doc && s.next_doc()? == NO_MORE_DOCS { return Ok(false); } }
+        for s in &mut self.sub {
+            if s.doc_id() == doc && s.next_doc()? == NO_MORE_DOCS {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 }
 
 impl DocIter for ConjunctionDocIter {
-    fn doc_id(&self) -> i32 { self.doc }
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
     fn next_doc(&mut self) -> io::Result<i32> {
-        if self.doc == NO_MORE_DOCS { return Ok(NO_MORE_DOCS); }
-        if self.doc >= 0 && !self.advance_all_past(self.doc)? { self.doc = NO_MORE_DOCS; return Ok(NO_MORE_DOCS); }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 && !self.advance_all_past(self.doc)? {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
         loop {
             let candidate = self.sub[self.lead].doc_id();
-            if candidate == NO_MORE_DOCS { self.doc = NO_MORE_DOCS; return Ok(NO_MORE_DOCS); }
-            let target = candidate; let mut matched = true;
-            for i in 0..self.sub.len() {
-                if i == self.lead { continue; }
-                let d = self.sub[i].advance(target)?;
-                if d == NO_MORE_DOCS { self.doc = NO_MORE_DOCS; return Ok(NO_MORE_DOCS); }
-                if d > target { self.lead = i; matched = false; break; }
+            if candidate == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
             }
-            if matched { self.doc = target; return Ok(target); }
+            let target = candidate;
+            let mut matched = true;
+            for i in 0..self.sub.len() {
+                if i == self.lead {
+                    continue;
+                }
+                let d = self.sub[i].advance(target)?;
+                if d == NO_MORE_DOCS {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+                if d > target {
+                    self.lead = i;
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                self.doc = target;
+                return Ok(target);
+            }
         }
     }
     fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if self.doc >= target { return Ok(self.doc); }
-        if self.doc == NO_MORE_DOCS { return Ok(NO_MORE_DOCS); }
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
         self.sub[self.lead].advance(target)?;
         self.doc = -1;
         self.next_doc()
     }
     // ConstantScore: no consumer calls freq() on a conjunction and AND-freq is
     // undefined anyway; the sum of sub freqs is a placeholder.
-    fn freq(&self) -> u32 { self.sub.iter().map(|s| s.freq()).sum() }
+    fn freq(&self) -> u32 {
+        self.sub.iter().map(|s| s.freq()).sum()
+    }
 }
 
 // ── Disjunction (OR) ──────────────────────────────────────────────────
 
-pub struct DisjunctionDocIter { sub: Vec<PostingsIter>, doc: i32 }
+pub struct DisjunctionDocIter {
+    sub: Vec<PostingsIter>,
+    doc: i32,
+}
 
 impl DisjunctionDocIter {
-    pub fn new(seg: &SegmentReader, field: &str, sorted_entries: &[(u32, TermEntry)], needs_freq: bool) -> io::Result<Self> {
+    pub fn new(
+        seg: &SegmentReader,
+        field: &str,
+        sorted_entries: &[(u32, TermEntry)],
+        needs_freq: bool,
+    ) -> io::Result<Self> {
         let fi = seg.field_info(field);
-        let has_freqs = fi.map(|f| f.index_options != IndexOptions::Docs).unwrap_or(false);
+        let has_freqs = fi
+            .map(|f| f.index_options != IndexOptions::Docs)
+            .unwrap_or(false);
         let mut sub = Vec::with_capacity(sorted_entries.len());
-        for (_, entry) in sorted_entries { sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?); }
-        for s in &mut sub { s.next_doc()?; }
+        for (_, entry) in sorted_entries {
+            sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
+        }
+        for s in &mut sub {
+            s.next_doc()?;
+        }
         Ok(DisjunctionDocIter { sub, doc: -1 })
     }
 }
 
 impl DocIter for DisjunctionDocIter {
-    fn doc_id(&self) -> i32 { self.doc }
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
     fn next_doc(&mut self) -> io::Result<i32> {
-        if self.doc == NO_MORE_DOCS { return Ok(NO_MORE_DOCS); }
-        if self.doc >= 0 { for s in &mut self.sub { if s.doc_id() == self.doc { s.next_doc()?; } } }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 {
+            for s in &mut self.sub {
+                if s.doc_id() == self.doc {
+                    s.next_doc()?;
+                }
+            }
+        }
         let mut best = NO_MORE_DOCS;
-        for s in &self.sub { let d = s.doc_id(); if d != NO_MORE_DOCS && d < best { best = d; } }
+        for s in &self.sub {
+            let d = s.doc_id();
+            if d != NO_MORE_DOCS && d < best {
+                best = d;
+            }
+        }
         self.doc = best;
         Ok(best)
     }
     fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if self.doc >= target { return Ok(self.doc); }
-        if self.doc == NO_MORE_DOCS { return Ok(NO_MORE_DOCS); }
-        for s in &mut self.sub { if s.doc_id() < target { s.advance(target)?; } }
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        for s in &mut self.sub {
+            if s.doc_id() < target {
+                s.advance(target)?;
+            }
+        }
         let mut best = NO_MORE_DOCS;
-        for s in &self.sub { let d = s.doc_id(); if d != NO_MORE_DOCS && d < best { best = d; } }
+        for s in &self.sub {
+            let d = s.doc_id();
+            if d != NO_MORE_DOCS && d < best {
+                best = d;
+            }
+        }
         self.doc = best;
         Ok(best)
     }
     // ConstantScore: no consumer calls freq() on a disjunction and OR-freq is
     // undefined anyway; the first matching sub's freq is a placeholder.
-    fn freq(&self) -> u32 { for s in &self.sub { if s.doc_id() == self.doc { return s.freq(); } } 1 }
+    fn freq(&self) -> u32 {
+        for s in &self.sub {
+            if s.doc_id() == self.doc {
+                return s.freq();
+            }
+        }
+        1
+    }
 }
 
 // ── Bitset (multi-term materialization) ───────────────────────────────
@@ -161,11 +322,6 @@ pub struct BitsetDocIter {
 impl BitsetDocIter {
     pub fn new(bits: FixedBitSet) -> Self {
         BitsetDocIter { bits, doc: -1 }
-    }
-
-    /// FixedBitSet.cardinality — the count fast path (spec §4).
-    pub fn popcount(&self) -> u64 {
-        self.bits.popcount()
     }
 }
 
@@ -235,7 +391,8 @@ impl PhraseDocIter {
         }
         if !matches!(
             fi.index_options,
-            IndexOptions::DocsAndFreqsAndPositions | IndexOptions::DocsAndFreqsAndPositionsAndOffsets
+            IndexOptions::DocsAndFreqsAndPositions
+                | IndexOptions::DocsAndFreqsAndPositionsAndOffsets
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -259,7 +416,11 @@ impl PhraseDocIter {
             .into_iter()
             .map(|(_, offset, en)| Occurrence { en, offset })
             .collect();
-        Ok(Some(PhraseDocIter { occ, doc: -1, lead: 0 }))
+        Ok(Some(PhraseDocIter {
+            occ,
+            doc: -1,
+            lead: 0,
+        }))
     }
 
     /// ExactPhraseMatcher (:138-167): collects each occurrence's positions
@@ -354,14 +515,55 @@ impl DocIter for PhraseDocIter {
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
-    Docs(DocsEnum), Freqs(DocsFreqsEnum), All(MatchAllIter),
-    And(ConjunctionDocIter), Or(DisjunctionDocIter), Bitset(BitsetDocIter),
+    Docs(DocsEnum),
+    Freqs(DocsFreqsEnum),
+    All(MatchAllIter),
+    And(ConjunctionDocIter),
+    Or(DisjunctionDocIter),
+    Bitset(BitsetDocIter),
     Phrase(PhraseDocIter),
 }
 
 impl DocIter for SegmentDocIter {
-    fn doc_id(&self) -> i32 { match self { Self::Docs(d) => d.doc_id(), Self::Freqs(f) => f.doc_id(), Self::All(a) => a.doc_id(), Self::And(a) => a.doc_id(), Self::Or(o) => o.doc_id(), Self::Bitset(b) => b.doc_id(), Self::Phrase(p) => p.doc_id() } }
-    fn next_doc(&mut self) -> io::Result<i32> { match self { Self::Docs(d) => d.next_doc(), Self::Freqs(f) => f.next_doc(), Self::All(a) => a.next_doc(), Self::And(a) => a.next_doc(), Self::Or(o) => o.next_doc(), Self::Bitset(b) => b.next_doc(), Self::Phrase(p) => p.next_doc() } }
-    fn advance(&mut self, t: i32) -> io::Result<i32> { match self { Self::Docs(d) => d.advance(t), Self::Freqs(f) => f.advance(t), Self::All(a) => a.advance(t), Self::And(a) => a.advance(t), Self::Or(o) => o.advance(t), Self::Bitset(b) => b.advance(t), Self::Phrase(p) => p.advance(t) } }
-    fn freq(&self) -> u32 { match self { Self::Freqs(f) => f.freq(), Self::And(a) => a.freq(), Self::Or(o) => o.freq(), _ => 1 } }
+    fn doc_id(&self) -> i32 {
+        match self {
+            Self::Docs(d) => d.doc_id(),
+            Self::Freqs(f) => f.doc_id(),
+            Self::All(a) => a.doc_id(),
+            Self::And(a) => a.doc_id(),
+            Self::Or(o) => o.doc_id(),
+            Self::Bitset(b) => b.doc_id(),
+            Self::Phrase(p) => p.doc_id(),
+        }
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        match self {
+            Self::Docs(d) => d.next_doc(),
+            Self::Freqs(f) => f.next_doc(),
+            Self::All(a) => a.next_doc(),
+            Self::And(a) => a.next_doc(),
+            Self::Or(o) => o.next_doc(),
+            Self::Bitset(b) => b.next_doc(),
+            Self::Phrase(p) => p.next_doc(),
+        }
+    }
+    fn advance(&mut self, t: i32) -> io::Result<i32> {
+        match self {
+            Self::Docs(d) => d.advance(t),
+            Self::Freqs(f) => f.advance(t),
+            Self::All(a) => a.advance(t),
+            Self::And(a) => a.advance(t),
+            Self::Or(o) => o.advance(t),
+            Self::Bitset(b) => b.advance(t),
+            Self::Phrase(p) => p.advance(t),
+        }
+    }
+    fn freq(&self) -> u32 {
+        match self {
+            Self::Freqs(f) => f.freq(),
+            Self::And(a) => a.freq(),
+            Self::Or(o) => o.freq(),
+            _ => 1,
+        }
+    }
 }

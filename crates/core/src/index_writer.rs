@@ -117,7 +117,11 @@ impl IndexWriter {
 /// Commits an externally-assembled `SegmentInfos` (e.g. the union of segments
 /// produced by sharded builders) as the next generation in `dir`. Flushed
 /// segment files must already be fully written.
-pub fn commit_segments(dir_path: &Path, mut infos: SegmentInfos, generation: i64) -> io::Result<()> {
+pub fn commit_segments(
+    dir_path: &Path,
+    mut infos: SegmentInfos,
+    generation: i64,
+) -> io::Result<()> {
     let dir = FSDirectory::open(dir_path)?;
     commit_infos(&dir, &mut infos, generation)
 }

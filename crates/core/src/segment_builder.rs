@@ -176,7 +176,10 @@ impl SegmentBuilder {
         //    including all-missing fields (the .fnm/.dvm pairing is required:
         //    docs/format-notes-docvalues.md §8).
         let mut dv_files: Vec<String> = Vec::new();
-        let has_dv = dw.fields().iter().any(|f| f.doc_values != DocValuesType::None);
+        let has_dv = dw
+            .fields()
+            .iter()
+            .any(|f| f.doc_values != DocValuesType::None);
         if has_dv {
             let mut dvw = DocValuesWriter::new(&dir, &seg_name, &seg_id, DV_SEGMENT_SUFFIX)?;
             for number in 0..dw.fields().len() {
@@ -188,8 +191,12 @@ impl SegmentBuilder {
                 match dv_type {
                     DocValuesType::Numeric => {
                         let dv = buf.numeric_dv.as_ref().unwrap();
-                        let pairs: Vec<(u32, i64)> =
-                            dv.docs.iter().copied().zip(dv.values.iter().copied()).collect();
+                        let pairs: Vec<(u32, i64)> = dv
+                            .docs
+                            .iter()
+                            .copied()
+                            .zip(dv.values.iter().copied())
+                            .collect();
                         dvw.add_numeric_field(number as i32, max_doc as u32, &pairs)?;
                     }
                     DocValuesType::Sorted => {
@@ -227,7 +234,9 @@ impl SegmentBuilder {
         if has_points {
             let mut ptw = PointsWriter::new(&dir, &seg_name, &seg_id)?;
             for number in 0..dw.fields().len() {
-                let Some(p) = dw.fields()[number].points else { continue };
+                let Some(p) = dw.fields()[number].points else {
+                    continue;
+                };
                 if !field_has_points(&dw, number) {
                     continue;
                 }

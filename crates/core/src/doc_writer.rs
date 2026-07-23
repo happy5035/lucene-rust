@@ -276,10 +276,10 @@ pub struct FieldBuf {
 impl FieldBuf {
     fn new(spec: FieldSpec) -> Self {
         let dict = spec.is_indexed().then(TermDict::new);
-        let numeric_dv = (spec.doc_values == codec_lucene9::DocValuesType::Numeric)
-            .then(NumericDvBuf::default);
-        let sorted_dv = (spec.doc_values == codec_lucene9::DocValuesType::Sorted)
-            .then(SortedDvBuf::default);
+        let numeric_dv =
+            (spec.doc_values == codec_lucene9::DocValuesType::Numeric).then(NumericDvBuf::default);
+        let sorted_dv =
+            (spec.doc_values == codec_lucene9::DocValuesType::Sorted).then(SortedDvBuf::default);
         let points = spec.points.map(|_| PointsBuf::default());
         Self {
             spec,
@@ -292,7 +292,9 @@ impl FieldBuf {
     }
 
     fn needs_buffer(spec: &FieldSpec) -> bool {
-        spec.is_indexed() || spec.doc_values != codec_lucene9::DocValuesType::None || spec.points.is_some()
+        spec.is_indexed()
+            || spec.doc_values != codec_lucene9::DocValuesType::None
+            || spec.points.is_some()
     }
 }
 
@@ -375,11 +377,16 @@ impl DocWriter {
                         for token in WhitespaceTokens::new(&text) {
                             let tok = token.as_bytes();
                             let (id, is_new) = dict.lookup_or_insert_flag(tok);
-                            let new_doc = dict.recs[id as usize]
-                                .postings
-                                .add_occurrence(doc_id, if has_positions { Some(position) } else { None });
+                            let new_doc = dict.recs[id as usize].postings.add_occurrence(
+                                doc_id,
+                                if has_positions { Some(position) } else { None },
+                            );
                             self.ram_bytes += if is_new { TERM_RAM + tok.len() } else { 0 }
-                                + if new_doc { POSTING_NEW_DOC_RAM } else { POSTING_SAME_DOC_RAM };
+                                + if new_doc {
+                                    POSTING_NEW_DOC_RAM
+                                } else {
+                                    POSTING_SAME_DOC_RAM
+                                };
                             saw_term = true;
                             position += 1;
                         }
@@ -405,7 +412,11 @@ impl DocWriter {
                         let (id, is_new) = dict.lookup_or_insert_flag(kw.as_bytes());
                         let new_doc = dict.recs[id as usize].postings.add_occurrence(doc_id, None);
                         self.ram_bytes += if is_new { TERM_RAM + kw.len() } else { 0 }
-                            + if new_doc { POSTING_NEW_DOC_RAM } else { POSTING_SAME_DOC_RAM };
+                            + if new_doc {
+                                POSTING_NEW_DOC_RAM
+                            } else {
+                                POSTING_SAME_DOC_RAM
+                            };
                         if new_doc {
                             buf.doc_count += 1;
                         }
@@ -648,7 +659,10 @@ mod tests {
         for i in 0..3u32 {
             let mut d = Document::new();
             d.add("ts", FieldValue::Long(1000 + i as i64));
-            d.add("level", FieldValue::Keyword(if i % 2 == 0 { "INFO" } else { "ERROR" }.into()));
+            d.add(
+                "level",
+                FieldValue::Keyword(if i % 2 == 0 { "INFO" } else { "ERROR" }.into()),
+            );
             dw.add_document(&schema, d, None).unwrap();
         }
         // missing ts/level in a 4th doc is allowed (sparse)
@@ -656,7 +670,10 @@ mod tests {
 
         let ts = dw.field_buffer(0).unwrap();
         assert_eq!(ts.points.as_ref().unwrap().points.len(), 3);
-        assert_eq!(ts.numeric_dv.as_ref().unwrap().values, vec![1000, 1001, 1002]);
+        assert_eq!(
+            ts.numeric_dv.as_ref().unwrap().values,
+            vec![1000, 1001, 1002]
+        );
         let level = dw.field_buffer(1).unwrap();
         let dv = level.sorted_dv.as_ref().unwrap();
         assert_eq!(dv.docs, vec![0, 1, 2]);

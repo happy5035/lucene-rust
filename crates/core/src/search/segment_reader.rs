@@ -87,9 +87,9 @@ impl SegmentReader {
     /// Whether the field indexes freqs (IndexOptions >= DOCS_AND_FREQS);
     /// None = unknown field (empty-hit semantics).
     pub(crate) fn field_has_freqs(&self, field: &str) -> Option<bool> {
-        self.field_infos
-            .by_name(field)
-            .map(|fi| fi.index_options != IndexOptions::Docs && fi.index_options != IndexOptions::None)
+        self.field_infos.by_name(field).map(|fi| {
+            fi.index_options != IndexOptions::Docs && fi.index_options != IndexOptions::None
+        })
     }
 
     /// TermsIter over a field by name (None = unknown field; a field with no

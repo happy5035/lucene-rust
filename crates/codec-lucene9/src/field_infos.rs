@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use crate::codec_util::{check_footer, check_index_header, corrupt, write_footer, write_index_header};
+use crate::codec_util::{
+    check_footer, check_index_header, corrupt, write_footer, write_index_header,
+};
 use crate::directory::FSDirectory;
 use crate::io::DataInput;
 
@@ -288,11 +290,8 @@ mod tests {
     use crate::io::{ChecksumIndexOutput, IndexOutput};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codec-lucene9-fnm-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codec-lucene9-fnm-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

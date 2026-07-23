@@ -136,7 +136,10 @@ impl DocValuesWriter {
         debug_assert!(dict.windows(2).all(|w| w[0] < w[1]));
         debug_assert!(dict.iter().all(|t| t.len() <= 32766));
         debug_assert!(ords.windows(2).all(|w| w[0].0 < w[1].0));
-        debug_assert!(ords.iter().all(|&(d, o)| d < max_doc && (o as usize) < dict.len()));
+        debug_assert!(
+            ords.iter()
+                .all(|&(d, o)| d < max_doc && (o as usize) < dict.len())
+        );
         #[cfg(debug_assertions)]
         {
             let mut seen = vec![false; dict.len()];
@@ -278,9 +281,7 @@ impl DocValuesWriter {
                 let prefix_length = bytes_difference(prev, term);
                 let suffix_length = term.len() - prefix_length;
                 debug_assert!(suffix_length > 0, "terms are unique");
-                buf.push(
-                    (prefix_length.min(15) | ((suffix_length - 1).min(15) << 4)) as u8,
-                );
+                buf.push((prefix_length.min(15) | ((suffix_length - 1).min(15) << 4)) as u8);
                 if prefix_length >= 15 {
                     write_vint_to_vec(&mut buf, prefix_length - 15);
                 }
@@ -361,8 +362,7 @@ impl DocValuesWriter {
                 debug_assert!(sort_key_length <= term.len());
                 offset += sort_key_length as u64;
                 self.data.write_bytes(&term[..sort_key_length])?;
-            } else if ord & (TERMS_DICT_REVERSE_INDEX_SIZE - 1)
-                == TERMS_DICT_REVERSE_INDEX_SIZE - 1
+            } else if ord & (TERMS_DICT_REVERSE_INDEX_SIZE - 1) == TERMS_DICT_REVERSE_INDEX_SIZE - 1
             {
                 prev = term;
             }
@@ -386,8 +386,7 @@ impl DocValuesWriter {
         let terms_index_addresses_offset = self.data.file_pointer();
         let addr_bytes = addr_data.into_bytes();
         self.data.write_bytes(&addr_bytes)?;
-        self.meta
-            .write_long(terms_index_addresses_offset as i64)?; // :690
+        self.meta.write_long(terms_index_addresses_offset as i64)?; // :690
         self.meta
             .write_long((self.data.file_pointer() - terms_index_addresses_offset) as i64)?; // :691
         Ok(())
@@ -567,7 +566,7 @@ fn flush_disi_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec_util::{crc32, index_header_length, CODEC_MAGIC, FOOTER_MAGIC};
+    use crate::codec_util::{CODEC_MAGIC, FOOTER_MAGIC, crc32, index_header_length};
     use std::fs;
     use std::path::PathBuf;
 
@@ -575,11 +574,8 @@ mod tests {
     const SUFFIX: &str = "Lucene90_0";
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codec-lucene9-dv-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codec-lucene9-dv-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -885,8 +881,7 @@ mod tests {
                 let mut count = 0u32;
                 for (word, &b) in bits.iter().enumerate() {
                     if word & 7 == 0 {
-                        let entry =
-                            ((rank[word >> 2] as u32) << 8) | rank[(word >> 2) + 1] as u32;
+                        let entry = ((rank[word >> 2] as u32) << 8) | rank[(word >> 2) + 1] as u32;
                         assert_eq!(entry, count, "rank entry {}", word >> 3);
                     }
                     count += b.count_ones();
@@ -934,8 +929,7 @@ mod tests {
                 let (index, offset) = jumps[b];
                 assert_eq!(index, cum, "jump index for block {b}");
                 assert_eq!(
-                    offset,
-                    blocks[real_idx].header_offset as i32,
+                    offset, blocks[real_idx].header_offset as i32,
                     "jump offset for block {b}"
                 );
             }
@@ -1007,8 +1001,8 @@ mod tests {
     /// prefix-compressed entries from the LZ4 section), verifying block
     /// addresses and maxBlockLength.
     fn decode_terms(dvd: &[u8], tm: &TermsMeta) -> Vec<Vec<u8>> {
-        let data =
-            &dvd[tm.terms_data_offset as usize..(tm.terms_data_offset + tm.terms_data_length) as usize];
+        let data = &dvd
+            [tm.terms_data_offset as usize..(tm.terms_data_offset + tm.terms_data_length) as usize];
         let addr = &dvd[tm.terms_addresses_offset as usize
             ..(tm.terms_addresses_offset + tm.terms_addresses_length) as usize];
         let size = tm.dict_size as usize;
@@ -1068,8 +1062,8 @@ mod tests {
     /// Verifies the reverse index: sampled sort keys and DM addresses
     /// (writeTermsIndex :646-693).
     fn check_reverse_index(dvd: &[u8], tm: &TermsMeta, dict: &[&[u8]]) {
-        let index_data = &dvd
-            [tm.terms_index_offset as usize..(tm.terms_index_offset + tm.terms_index_length) as usize];
+        let index_data = &dvd[tm.terms_index_offset as usize
+            ..(tm.terms_index_offset + tm.terms_index_length) as usize];
         let addr = &dvd[tm.terms_index_addresses_offset as usize
             ..(tm.terms_index_addresses_offset + tm.terms_index_addresses_length) as usize];
         let size = dict.len();
@@ -1142,7 +1136,12 @@ mod tests {
             let m = read_numeric_meta(&mut r);
             // all docs have values: dense, no DISI
             assert_eq!(
-                (m.docs_offset, m.docs_length, m.jump_count, m.dense_rank_power),
+                (
+                    m.docs_offset,
+                    m.docs_length,
+                    m.jump_count,
+                    m.dense_rank_power
+                ),
                 (-1, 0, -1, -1)
             );
             assert_eq!(m.num_values, max_doc as i64);
@@ -1199,7 +1198,8 @@ mod tests {
 
         // field 2: single real block != block 0 → jump table exists and
         // covers the empty leading block
-        let block1_only: Vec<(u32, i64)> = (0..10u32).map(|d| (70000 + d, 1000 + d as i64)).collect();
+        let block1_only: Vec<(u32, i64)> =
+            (0..10u32).map(|d| (70000 + d, 1000 + d as i64)).collect();
 
         let (dvd, dvm) = run_writer("num-sparse", |w| {
             w.add_numeric_field(0, max_doc, &values).unwrap();
@@ -1282,7 +1282,8 @@ mod tests {
 
         let (dvd, dvm) = run_writer("sorted", |w| {
             w.add_sorted_field(0, 300, &dict150_refs, &ords150).unwrap();
-            w.add_sorted_field(2, 2060, &dict1030_refs, &ords1030).unwrap();
+            w.add_sorted_field(2, 2060, &dict1030_refs, &ords1030)
+                .unwrap();
         });
 
         check_footer(&dvd);
@@ -1295,7 +1296,12 @@ mod tests {
         assert_eq!(r.read_u8(), TYPE_SORTED);
         let om0 = read_numeric_meta(&mut r);
         assert_eq!(
-            (om0.docs_offset, om0.docs_length, om0.jump_count, om0.dense_rank_power),
+            (
+                om0.docs_offset,
+                om0.docs_length,
+                om0.jump_count,
+                om0.dense_rank_power
+            ),
             (-1, 0, -1, -1)
         );
         assert_eq!(om0.num_values, 300);
@@ -1370,13 +1376,22 @@ mod tests {
         assert_eq!(r.read_u8(), TYPE_NUMERIC);
         let m = read_numeric_meta(&mut r);
         assert_eq!(
-            (m.docs_offset, m.docs_length, m.jump_count, m.dense_rank_power),
+            (
+                m.docs_offset,
+                m.docs_length,
+                m.jump_count,
+                m.dense_rank_power
+            ),
             (-2, 0, -1, -1)
         );
         assert_eq!(m.num_values, 0);
         assert_eq!(m.table_size, -1);
         assert_eq!(m.bpv, 0);
-        assert_eq!(m.min, i64::MAX, "empty field keeps Long.MAX_VALUE min (:246)");
+        assert_eq!(
+            m.min,
+            i64::MAX,
+            "empty field keeps Long.MAX_VALUE min (:246)"
+        );
         assert_eq!(m.values_length, 0);
         assert_eq!(m.value_jump_table_offset, -1);
 

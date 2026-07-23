@@ -46,7 +46,7 @@
 use std::io;
 use std::sync::OnceLock;
 
-use super::{primitive_mask, BLOCK_SIZE};
+use super::{BLOCK_SIZE, primitive_mask};
 use crate::io::DataInput;
 
 /// Cached one-time AVX2 detection (spec §4a: runtime dispatch, detected
@@ -125,8 +125,7 @@ fn decode_block_avx2(
             if i < num_longs_per_shift {
                 debug_assert_eq!(num_longs_per_shift - i, 2);
                 let v = _mm_loadu_si128(buf.as_ptr().add(i * 8) as *const __m128i);
-                let v =
-                    _mm_and_si128(_mm_srl_epi64(v, count), _mm_set1_epi64x(value_mask as i64));
+                let v = _mm_and_si128(_mm_srl_epi64(v, count), _mm_set1_epi64x(value_mask as i64));
                 _mm_storeu_si128(longs.as_mut_ptr().add(idx) as *mut __m128i, v);
                 idx += 2;
             }
@@ -163,13 +162,14 @@ fn decode_block_avx2(
                 }
             } else {
                 let mask1 = primitive_mask(primitive, remaining_bits_per_value);
-                let mask2 =
-                    primitive_mask(primitive, remaining_bits_per_long - remaining_bits_per_value);
+                let mask2 = primitive_mask(
+                    primitive,
+                    remaining_bits_per_long - remaining_bits_per_value,
+                );
                 longs[idx] |=
                     (tmp[tmp_idx] >> (remaining_bits_per_long - remaining_bits_per_value)) & mask1;
                 idx += 1;
-                remaining_bits_per_value =
-                    bpv - remaining_bits_per_long + remaining_bits_per_value;
+                remaining_bits_per_value = bpv - remaining_bits_per_long + remaining_bits_per_value;
                 longs[idx] |= (tmp[tmp_idx] & mask2) << remaining_bits_per_value;
                 tmp_idx += 1;
             }

@@ -611,7 +611,9 @@ pub mod io_stats {
 
     pub fn enabled() -> bool {
         INIT.call_once(|| {
-            let on = std::env::var_os("RL_IO_STATS").map(|v| v != "0").unwrap_or(false);
+            let on = std::env::var_os("RL_IO_STATS")
+                .map(|v| v != "0")
+                .unwrap_or(false);
             ENABLED.store(on, Ordering::Relaxed);
         });
         ENABLED.load(Ordering::Relaxed)
@@ -619,14 +621,20 @@ pub mod io_stats {
 
     /// (bytes, calls) read so far.
     pub fn snapshot() -> (u64, u64) {
-        (READ_BYTES.load(Ordering::Relaxed), READ_CALLS.load(Ordering::Relaxed))
+        (
+            READ_BYTES.load(Ordering::Relaxed),
+            READ_CALLS.load(Ordering::Relaxed),
+        )
     }
 }
 
 enum InputSource {
     /// Positional reads at `base + pos`; slices share the file handle via
     /// `try_clone` and shift `base` (std::os::unix::fs::FileExt::read_at).
-    File { file: File, base: u64 },
+    File {
+        file: File,
+        base: u64,
+    },
     Memory(Vec<u8>),
 }
 
@@ -840,7 +848,10 @@ pub trait DataInput {
         let mut bytes = vec![0u8; len];
         self.read_bytes(&mut bytes)?;
         String::from_utf8(bytes).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8 string: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid UTF-8 string: {e}"),
+            )
         })
     }
 
@@ -911,7 +922,10 @@ impl DataInput for IndexInput {
         let target = self.position.checked_add(n).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("skip {n} bytes from position {} overflows u64", self.position),
+                format!(
+                    "skip {n} bytes from position {} overflows u64",
+                    self.position
+                ),
             )
         })?;
         self.seek(target)

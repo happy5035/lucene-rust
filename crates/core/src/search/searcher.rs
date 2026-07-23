@@ -99,8 +99,17 @@ impl Searcher {
     }
 
     /// ConstantScore TermQuery: freq_sum = total_term_freq from TermEntry
-    /// (no postings iteration needed).
+    /// (no postings iteration needed). Only defined for Term (and MatchAll,
+    /// where it degenerates to the doc count); multi-term and Boolean
+    /// queries have no well-defined freq sum and are rejected.
     pub fn freq_sum(&mut self, query: &Query) -> io::Result<u64> {
+        if query.is_multi_term() || matches!(query, Query::And { .. } | Query::Or { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "freq_sum is only defined for Term queries (MatchAll degenerates to \
+                 doc count); multi-term and And/Or queries have no well-defined freq sum",
+            ));
+        }
         if let Query::Term { field, term } = query {
             let mut total = 0u64;
             for (_doc_base, seg) in self.reader.leaves() {

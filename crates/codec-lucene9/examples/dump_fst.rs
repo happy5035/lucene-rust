@@ -5,8 +5,8 @@
 
 use std::io::Write;
 
-use codec_lucene9::fst::FstCompiler;
 use codec_lucene9::FSDirectory;
+use codec_lucene9::fst::FstCompiler;
 
 fn main() -> std::io::Result<()> {
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = vec![

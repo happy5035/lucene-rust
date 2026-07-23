@@ -638,8 +638,7 @@ impl FstReader {
     /// findTargetArc linear scan (:1100-1126): labels ascend, so the first
     /// arc with `label >= target` decides (match or miss).
     fn find_arc(arcs: &[FstArc], label: u8) -> Option<&FstArc> {
-        arcs
-            .iter()
+        arcs.iter()
             .find(|a| a.label >= label)
             .filter(|a| a.label == label)
     }
@@ -1148,8 +1147,7 @@ mod tests {
         let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());
         fst.write_metadata(&mut out).unwrap();
         let meta_bytes = out.into_bytes();
-        let metadata =
-            FstMetadata::read(&mut IndexInput::in_memory(meta_bytes)).unwrap();
+        let metadata = FstMetadata::read(&mut IndexInput::in_memory(meta_bytes)).unwrap();
         assert_eq!(metadata.start_node, fst.start_node());
         assert_eq!(metadata.num_bytes, fst.num_bytes());
         (
@@ -1209,9 +1207,15 @@ mod tests {
             vec![(2usize, b"X".to_vec()), (3usize, b"Y".to_vec())]
         );
         // "abd" walks to depth 2 then no arc: only ("ab", X)
-        assert_eq!(reader.trace_path(b"abd").unwrap(), vec![(2usize, b"X".to_vec())]);
+        assert_eq!(
+            reader.trace_path(b"abd").unwrap(),
+            vec![(2usize, b"X".to_vec())]
+        );
         // "c" no arc at root byte: empty
-        assert_eq!(reader.trace_path(b"c").unwrap(), Vec::<(usize, Vec<u8>)>::new());
+        assert_eq!(
+            reader.trace_path(b"c").unwrap(),
+            Vec::<(usize, Vec<u8>)>::new()
+        );
     }
 
     #[test]

@@ -5,7 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use crate::codec_util::{check_footer, check_header, check_index_header_suffix, corrupt, read_be_int, read_be_long, write_be_int, write_be_long, write_footer, write_index_header};
+use crate::codec_util::{
+    check_footer, check_header, check_index_header_suffix, corrupt, read_be_int, read_be_long,
+    write_be_int, write_be_long, write_footer, write_index_header,
+};
 use crate::directory::FSDirectory;
 use crate::io::{ChecksumIndexOutput, DataInput};
 use crate::segment_info::SegmentInfo;
@@ -316,9 +319,8 @@ impl SegmentInfos {
             };
             best = Some(best.map_or(gen_val, |b: i64| b.max(gen_val)));
         }
-        let generation = best.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no segments_N commit found")
-        })?;
+        let generation = best
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no segments_N commit found"))?;
         Ok((Self::read_commit(dir, generation)?, generation))
     }
 }
@@ -334,16 +336,19 @@ mod tests {
     use super::*;
     use crate::segment_info::SegmentInfo;
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codec-lucene9-sis-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codec-lucene9-sis-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
 
-    fn commit_one(dir: &FSDirectory, infos: &mut SegmentInfos, name: &str, id: [u8; 16], generation: i64) {
+    fn commit_one(
+        dir: &FSDirectory,
+        infos: &mut SegmentInfos,
+        name: &str,
+        id: [u8; 16],
+        generation: i64,
+    ) {
         let mut si = SegmentInfo::new(name, id, 10);
         si.files.insert(format!("{name}.si"));
         si.write(dir, "").unwrap();
@@ -376,7 +381,9 @@ mod tests {
         let root = temp_dir("read_commit");
         let dir = FSDirectory::open(&root).unwrap();
         let mut infos = SegmentInfos::new();
-        infos.user_data.insert("commit".to_string(), "first".to_string());
+        infos
+            .user_data
+            .insert("commit".to_string(), "first".to_string());
         commit_one(&dir, &mut infos, "_0", [1u8; 16], 1);
         commit_one(&dir, &mut infos, "_1", [2u8; 16], 2);
 

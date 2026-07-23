@@ -103,11 +103,8 @@ mod tests {
     use crate::io::DataInput;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codec-lucene9-dirt-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codec-lucene9-dirt-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

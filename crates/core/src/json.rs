@@ -111,7 +111,9 @@ impl JsonBinder {
                     }
                 },
             };
-            let Some(lucene_name) = lucene_name else { continue };
+            let Some(lucene_name) = lucene_name else {
+                continue;
+            };
             let spec = schema.get(&lucene_name).expect("field just resolved");
             if let Some(v) = coerce(spec, &value) {
                 doc.add(&lucene_name, v);
@@ -150,7 +152,9 @@ fn coerce(spec: &FieldSpec, value: &Value) -> Option<FieldValue> {
     };
     let as_int = |v: &Value| -> Option<i64> {
         match v {
-            Value::Number(n) => n.as_i64().or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
+            Value::Number(n) => n
+                .as_i64()
+                .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok())),
             Value::String(s) => s.trim().parse::<i64>().ok(),
             _ => None,
         }
@@ -298,11 +302,19 @@ mod tests {
             r#"{"timestamp":1700000000123,"level":"INFO","trace_id":"t-1",
                 "message":"hello world","latency_ms":"42"}"#,
         );
-        assert!(doc.fields.contains(&("timestamp".into(), FieldValue::Long(1700000000123))));
-        assert!(doc.fields.contains(&("level".into(), FieldValue::Keyword("INFO".into()))));
-        assert!(doc.fields.contains(&("message".into(), FieldValue::Text("hello world".into()))));
+        assert!(doc
+            .fields
+            .contains(&("timestamp".into(), FieldValue::Long(1700000000123))));
+        assert!(doc
+            .fields
+            .contains(&("level".into(), FieldValue::Keyword("INFO".into()))));
+        assert!(doc
+            .fields
+            .contains(&("message".into(), FieldValue::Text("hello world".into()))));
         // numeric string coerces into an int point
-        assert!(doc.fields.contains(&("latency_ms".into(), FieldValue::Int(42))));
+        assert!(doc
+            .fields
+            .contains(&("latency_ms".into(), FieldValue::Int(42))));
     }
 
     #[test]
@@ -310,8 +322,12 @@ mod tests {
         let mut schema = log_schema();
         let b = JsonBinder::new(&schema, &[], FieldPolicy::Strict);
         let doc = bind_ok(&b, &mut schema, r#"{"level":200,"message":12345}"#);
-        assert!(doc.fields.contains(&("level".into(), FieldValue::Keyword("200".into()))));
-        assert!(doc.fields.contains(&("message".into(), FieldValue::Text("12345".into()))));
+        assert!(doc
+            .fields
+            .contains(&("level".into(), FieldValue::Keyword("200".into()))));
+        assert!(doc
+            .fields
+            .contains(&("message".into(), FieldValue::Text("12345".into()))));
     }
 
     #[test]
@@ -319,10 +335,17 @@ mod tests {
         let (mut schema, aliases, _) =
             Schema::parse("message_raw:keyword+sorteddv@message").unwrap();
         let b = JsonBinder::new(&schema, &aliases, FieldPolicy::Strict);
-        let doc = bind_ok(&b, &mut schema, r#"{"message":"raw payload","message_raw":"ignored"}"#);
+        let doc = bind_ok(
+            &b,
+            &mut schema,
+            r#"{"message":"raw payload","message_raw":"ignored"}"#,
+        );
         assert_eq!(
             doc.fields,
-            vec![("message_raw".to_string(), FieldValue::Keyword("raw payload".into()))]
+            vec![(
+                "message_raw".to_string(),
+                FieldValue::Keyword("raw payload".into())
+            )]
         );
     }
 
@@ -330,7 +353,10 @@ mod tests {
     fn bad_json_and_non_object_lines_skip() {
         let mut schema = log_schema();
         let b = JsonBinder::new(&schema, &[], FieldPolicy::Strict);
-        assert!(matches!(b.bind(&mut schema, b"{not json"), BindOutcome::Skip));
+        assert!(matches!(
+            b.bind(&mut schema, b"{not json"),
+            BindOutcome::Skip
+        ));
         assert!(matches!(b.bind(&mut schema, b"[1,2,3]"), BindOutcome::Skip));
         assert!(matches!(b.bind(&mut schema, b"42"), BindOutcome::Skip));
         assert!(matches!(b.bind(&mut schema, b""), BindOutcome::Skip));
@@ -352,7 +378,9 @@ mod tests {
         let doc = bind_ok(&b, &mut schema, r#"{"noise_payload":"abc"}"#);
         let spec = schema.get("noise_payload").unwrap();
         assert!(!spec.is_indexed() && spec.stored);
-        assert!(doc.fields.contains(&("noise_payload".into(), FieldValue::Text("abc".into()))));
+        assert!(doc
+            .fields
+            .contains(&("noise_payload".into(), FieldValue::Text("abc".into()))));
     }
 
     #[test]
@@ -372,18 +400,25 @@ mod tests {
         assert!(schema.get("extra_bool").unwrap().is_indexed());
         // no double-point support: floats degrade to keyword strings
         assert!(schema.get("extra_float").unwrap().is_indexed());
-        assert!(doc1.fields.contains(&("extra_num".into(), FieldValue::Long(7))));
-        assert!(doc1.fields.contains(&("extra_float".into(), FieldValue::Keyword("1.5".into()))));
+        assert!(doc1
+            .fields
+            .contains(&("extra_num".into(), FieldValue::Long(7))));
+        assert!(doc1
+            .fields
+            .contains(&("extra_float".into(), FieldValue::Keyword("1.5".into()))));
 
         // second document reuses the registered types (no re-registration)
-        let (doc2, new2) =
-            match b.bind(&mut schema, br#"{"extra_num":"9","extra_float":2.5}"#) {
-                BindOutcome::Doc(d, n) => (d, n),
-                BindOutcome::Skip => panic!(),
-            };
+        let (doc2, new2) = match b.bind(&mut schema, br#"{"extra_num":"9","extra_float":2.5}"#) {
+            BindOutcome::Doc(d, n) => (d, n),
+            BindOutcome::Skip => panic!(),
+        };
         assert!(new2.is_empty());
-        assert!(doc2.fields.contains(&("extra_num".into(), FieldValue::Long(9))));
-        assert!(doc2.fields.contains(&("extra_float".into(), FieldValue::Keyword("2.5".into()))));
+        assert!(doc2
+            .fields
+            .contains(&("extra_num".into(), FieldValue::Long(9))));
+        assert!(doc2
+            .fields
+            .contains(&("extra_float".into(), FieldValue::Keyword("2.5".into()))));
     }
 
     #[test]
@@ -396,7 +431,9 @@ mod tests {
             r#"{"level":"WARN","obj":{"a":1},"arr":[1],"timestamp":"not-a-number","latency_ms":9999999999999}"#,
         );
         assert_eq!(doc.fields.len(), 1);
-        assert!(doc.fields.contains(&("level".into(), FieldValue::Keyword("WARN".into()))));
+        assert!(doc
+            .fields
+            .contains(&("level".into(), FieldValue::Keyword("WARN".into()))));
         assert!(schema.get("obj").is_none());
         assert!(schema.get("arr").is_none());
     }

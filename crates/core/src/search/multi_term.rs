@@ -36,11 +36,8 @@ impl CollectedTerms {
     }
 
     pub(crate) fn sort_by_df(&mut self) {
-        let mut pairs: Vec<(Vec<u8>, (u32, TermEntry))> = self
-            .terms
-            .drain(..)
-            .zip(self.entries.drain(..))
-            .collect();
+        let mut pairs: Vec<(Vec<u8>, (u32, TermEntry))> =
+            self.terms.drain(..).zip(self.entries.drain(..)).collect();
         pairs.sort_by_key(|(_, (df, _))| *df);
         for (t, e) in pairs {
             self.terms.push(t);
@@ -267,7 +264,9 @@ pub(crate) fn bitset_count(
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
         return Ok(None);
     }
-    Ok(Some(materialize(seg, &collected.entries, has_freqs)?.popcount()))
+    Ok(Some(
+        materialize(seg, &collected.entries, has_freqs)?.popcount(),
+    ))
 }
 
 /// Bitset materialization (spec §4): per-term full postings scan, one bit

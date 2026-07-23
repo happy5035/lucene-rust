@@ -91,11 +91,29 @@ impl PointsWriter {
     pub fn new(dir: &FSDirectory, segment: &str, segment_id: &[u8; 16]) -> io::Result<Self> {
         let [data_name, index_name, meta_name] = file_names(segment);
         let mut data_out = dir.create_output(&data_name)?;
-        write_index_header(&mut data_out, DATA_CODEC_NAME, FORMAT_VERSION, segment_id, "")?;
+        write_index_header(
+            &mut data_out,
+            DATA_CODEC_NAME,
+            FORMAT_VERSION,
+            segment_id,
+            "",
+        )?;
         let mut index_out = dir.create_output(&index_name)?;
-        write_index_header(&mut index_out, INDEX_CODEC_NAME, FORMAT_VERSION, segment_id, "")?;
+        write_index_header(
+            &mut index_out,
+            INDEX_CODEC_NAME,
+            FORMAT_VERSION,
+            segment_id,
+            "",
+        )?;
         let mut meta_out = dir.create_output(&meta_name)?;
-        write_index_header(&mut meta_out, META_CODEC_NAME, FORMAT_VERSION, segment_id, "")?;
+        write_index_header(
+            &mut meta_out,
+            META_CODEC_NAME,
+            FORMAT_VERSION,
+            segment_id,
+            "",
+        )?;
         Ok(PointsWriter {
             data_out,
             index_out,
@@ -199,8 +217,10 @@ impl PointsWriter {
         self.meta_out.write_vint(MAX_POINTS_IN_LEAF_NODE as i32)?; // (:1247)
         self.meta_out.write_vint(bytes_per_dim as i32)?; // (:1248)
         self.meta_out.write_vint(leaf_block_fps.len() as i32)?; // numLeaves (:1251)
-        self.meta_out.write_bytes(&min_packed_value[..bytes_per_dim])?; // (:1252)
-        self.meta_out.write_bytes(&max_packed_value[..bytes_per_dim])?; // (:1253)
+        self.meta_out
+            .write_bytes(&min_packed_value[..bytes_per_dim])?; // (:1252)
+        self.meta_out
+            .write_bytes(&max_packed_value[..bytes_per_dim])?; // (:1253)
         self.meta_out.write_vlong(point_count as i64)?; // (:1255)
         self.meta_out.write_vint(doc_count as i32)?; // docsSeen.cardinality() (:1256)
         self.meta_out.write_vint(packed_index.len() as i32)?; // (:1257)
@@ -542,8 +562,7 @@ impl IndexPacker<'_> {
         let first_diff_byte_delta: i32;
         if prefix < self.bytes_per_dim {
             // unsigned byte delta at the first differing byte (:1124-1126)
-            let mut delta =
-                i32::from(split_value[prefix]) - i32::from(last_split_value[prefix]);
+            let mut delta = i32::from(split_value[prefix]) - i32::from(last_split_value[prefix]);
             if negative_delta {
                 delta = -delta; // :1127-1129
             }
@@ -602,7 +621,7 @@ impl IndexPacker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec_util::{FOOTER_MAGIC, FOOTER_LENGTH, crc32, index_header_length};
+    use crate::codec_util::{FOOTER_LENGTH, FOOTER_MAGIC, crc32, index_header_length};
     use crate::io::IndexOutput;
     use std::fs;
     use std::path::PathBuf;
@@ -973,13 +992,16 @@ mod tests {
             }
             let old_byte = i32::from(split_value[prefix]);
             split_value[prefix] = (old_byte + first_diff_byte_delta) as u8; // :700-701
-            split_value[prefix + 1..prefix + 1 + (suffix - 1)].copy_from_slice(cur.bytes(suffix - 1)); // :702
+            split_value[prefix + 1..prefix + 1 + (suffix - 1)]
+                .copy_from_slice(cur.bytes(suffix - 1)); // :702
         }
         // else: split == last split on this dim (:704-706)
 
         let num_left = get_num_left_leaf_nodes(num_leaves);
         let right_offset = leaves_offset + num_left;
-        decoded.inners.push((node_id, split_value, right_offset - 1));
+        decoded
+            .inners
+            .push((node_id, split_value, right_offset - 1));
 
         // leftNumBytes is present iff the left child is an inner node (:708-713)
         let left_num_bytes = if node_id * 2 < total_num_leaves {
@@ -1092,9 +1114,7 @@ mod tests {
                     FieldSpec::Long(n, pts) => {
                         writer.write_field_long(*n, &mut pts.clone()).unwrap()
                     }
-                    FieldSpec::Int(n, pts) => {
-                        writer.write_field_int(*n, &mut pts.clone()).unwrap()
-                    }
+                    FieldSpec::Int(n, pts) => writer.write_field_int(*n, &mut pts.clone()).unwrap(),
                 }
             }
             let names = writer.finish().unwrap();
@@ -1129,10 +1149,7 @@ mod tests {
         assert_eq!(index_len, seg.kdi.len() as u64);
         assert_eq!(data_len, seg.kdd.len() as u64);
 
-        let expected: Vec<&FieldSpec> = fields
-            .iter()
-            .filter(|f| f.point_count() > 0)
-            .collect();
+        let expected: Vec<&FieldSpec> = fields.iter().filter(|f| f.point_count() > 0).collect();
         assert_eq!(metas.len(), expected.len(), "0-point fields write no entry");
 
         let mut prev_data_end = None;
@@ -1140,10 +1157,16 @@ mod tests {
         for (meta, spec) in metas.iter().zip(expected.iter()) {
             let (data_end, index_end) = check_field(seg, meta, spec);
             if let Some(prev) = prev_data_end {
-                assert_eq!(meta.data_start_fp, prev, "fields are tightly packed in .kdd");
+                assert_eq!(
+                    meta.data_start_fp, prev,
+                    "fields are tightly packed in .kdd"
+                );
             }
             if let Some(prev) = prev_index_end {
-                assert_eq!(meta.index_start_fp, prev, "fields are tightly packed in .kdi");
+                assert_eq!(
+                    meta.index_start_fp, prev,
+                    "fields are tightly packed in .kdi"
+                );
             }
             prev_data_end = Some(data_end);
             prev_index_end = Some(index_end);
@@ -1281,7 +1304,10 @@ mod tests {
         lo: [u8; 8],
         hi: [u8; 8],
     ) {
-        assert!(lo[..bpd] <= hi[..bpd], "cell min <= max (CheckIndex :3061-3135)");
+        assert!(
+            lo[..bpd] <= hi[..bpd],
+            "cell min <= max (CheckIndex :3061-3135)"
+        );
         if num_leaves == 1 {
             let (points, _) = decode_leaf(&seg.kdd, leaf_fps[leaves_offset], bpd);
             for (v, _) in points {
@@ -1306,7 +1332,14 @@ mod tests {
             "split == first value of the right subtree's left-most leaf"
         );
         check_node_bounds(
-            seg, bpd, splits, leaf_fps, leaves_offset, num_left, lo, split,
+            seg,
+            bpd,
+            splits,
+            leaf_fps,
+            leaves_offset,
+            num_left,
+            lo,
+            split,
         );
         check_node_bounds(
             seg,
@@ -1326,9 +1359,9 @@ mod tests {
         (0..n)
             .map(|_| {
                 let value = match rng.below(6) {
-                    0 => (rng.below(1_000)) as i64, // duplicates
+                    0 => (rng.below(1_000)) as i64,    // duplicates
                     1 => (rng.below(100)) as i64 - 50, // negatives + heavy duplicates
-                    2 => rng.next() as i64,         // full-range
+                    2 => rng.next() as i64,            // full-range
                     3 => [i64::MIN, i64::MAX, 0, -1, 1][rng.below(5) as usize],
                     4 => (rng.next() % 1_000_000) as i64,
                     _ => (rng.below(10)) as i64, // very heavy duplicates
@@ -1504,7 +1537,10 @@ mod tests {
         let decoded = decode_packed_index(index, 1, 8);
         assert!(decoded.inners.is_empty());
         assert_eq!(decoded.leaves, vec![(1, 0, 50)]);
-        check_segment(&seg, &[FieldSpec::Long(0, gen_long_points(&mut Rng(1), 100, 1000))]);
+        check_segment(
+            &seg,
+            &[FieldSpec::Long(0, gen_long_points(&mut Rng(1), 100, 1000))],
+        );
     }
 
     #[test]
@@ -1519,7 +1555,10 @@ mod tests {
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].field_number, 1);
         // no stray bytes: the only field's data starts right after the header
-        assert_eq!(metas[0].data_start_fp, index_header_length(DATA_CODEC_NAME, "") as u64);
+        assert_eq!(
+            metas[0].data_start_fp,
+            index_header_length(DATA_CODEC_NAME, "") as u64
+        );
         check_segment(&seg, &fields);
     }
 
@@ -1529,7 +1568,13 @@ mod tests {
         // prefix == bytesPerDim (delta 0)
         let points: Vec<(i64, u32)> = (0..1200u32).map(|doc| (777, doc)).collect();
         let seg = write_segment("all-equal", &[FieldSpec::Long(0, points)]);
-        check_segment(&seg, &[FieldSpec::Long(0, (0..1200u32).map(|doc| (777, doc)).collect())]);
+        check_segment(
+            &seg,
+            &[FieldSpec::Long(
+                0,
+                (0..1200u32).map(|doc| (777, doc)).collect(),
+            )],
+        );
     }
 
     #[test]
@@ -1582,7 +1627,11 @@ mod tests {
         }
         let mut rng = Rng(7);
         points.extend(gen_int_points(&mut rng, 4000, 500));
-        for (n, slice) in [(1, &points[..1]), (513, &points[..513]), (4700, &points[..])] {
+        for (n, slice) in [
+            (1, &points[..1]),
+            (513, &points[..513]),
+            (4700, &points[..]),
+        ] {
             let tag = format!("int-{n}");
             let seg = write_segment(&tag, &[FieldSpec::Int(5, slice.to_vec())]);
             check_segment(&seg, &[FieldSpec::Int(5, slice.to_vec())]);

@@ -83,7 +83,11 @@ mod tests {
             b.set(i);
         }
         for i in 0..130 {
-            assert_eq!(b.get(i), [0, 1, 63, 64, 65, 127, 128, 129].contains(&i), "bit {i}");
+            assert_eq!(
+                b.get(i),
+                [0, 1, 63, 64, 65, 127, 128, 129].contains(&i),
+                "bit {i}"
+            );
         }
         assert_eq!(b.popcount(), 8);
     }

@@ -116,10 +116,7 @@ pub fn check_header(
 }
 
 /// CodecUtil.checkIndexHeaderID (:363-375).
-pub fn check_index_header_id(
-    input: &mut impl DataInput,
-    expected_id: &[u8; 16],
-) -> io::Result<()> {
+pub fn check_index_header_id(input: &mut impl DataInput, expected_id: &[u8; 16]) -> io::Result<()> {
     let mut id = [0u8; 16];
     input.read_bytes(&mut id)?;
     if &id != expected_id {

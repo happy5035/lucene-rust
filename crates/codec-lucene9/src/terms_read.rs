@@ -15,10 +15,10 @@ use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use crate::fst::{FstMetadata, FstReader};
 use crate::io::{DataInput, IndexInput};
 use crate::postings::{
-    file_name, BLOCKTREE_VERSION, OUTPUT_FLAG_HAS_TERMS, OUTPUT_FLAG_IS_FLOOR, POSTINGS_VERSION,
-    SEGMENT_SUFFIX, TERMS_CODEC, TIM_CODEC, TIP_CODEC, TMD_CODEC,
+    BLOCKTREE_VERSION, OUTPUT_FLAG_HAS_TERMS, OUTPUT_FLAG_IS_FLOOR, POSTINGS_VERSION,
+    SEGMENT_SUFFIX, TERMS_CODEC, TIM_CODEC, TIP_CODEC, TMD_CODEC, file_name,
 };
-use crate::postings_ll::{read_msb_vlong, BLOCK_SIZE};
+use crate::postings_ll::{BLOCK_SIZE, read_msb_vlong};
 
 /// IntBlockTermState (Lucene912PostingsFormat.java:425-491): a term's
 /// postings entry points, decoded from the .tim metadata blob.
@@ -78,8 +78,7 @@ fn zigzag_decode(v: u64) -> i64 {
 fn field_has_positions(field: &FieldInfo) -> bool {
     matches!(
         field.index_options,
-        IndexOptions::DocsAndFreqsAndPositions
-            | IndexOptions::DocsAndFreqsAndPositionsAndOffsets
+        IndexOptions::DocsAndFreqsAndPositions | IndexOptions::DocsAndFreqsAndPositionsAndOffsets
     )
 }
 
@@ -131,9 +130,9 @@ impl TermsDict {
                 )));
             }
             let root_code = read_bytes_ref(&mut tmd)?;
-            let field_info = field_infos.by_number(field_number).ok_or_else(|| {
-                corrupt(format!("invalid field number {field_number}"))
-            })?;
+            let field_info = field_infos
+                .by_number(field_number)
+                .ok_or_else(|| corrupt(format!("invalid field number {field_number}")))?;
             let sum_total_term_freq = tmd.read_vlong()? as u64;
             // :195-198 — DOCS fields store a single value
             // (sumDocFreq == sumTotalTermFreq).
@@ -219,11 +218,7 @@ impl TermsDict {
     /// candidate frames (:477-545), floor navigation
     /// (SegmentTermsEnumFrame.scanToFloorFrame :361-431), block load
     /// (:145-240) and linear entry scan (:547-660,:732-830).
-    pub fn seek_exact(
-        &mut self,
-        field: &FieldInfo,
-        term: &[u8],
-    ) -> io::Result<Option<TermEntry>> {
+    pub fn seek_exact(&mut self, field: &FieldInfo, term: &[u8]) -> io::Result<Option<TermEntry>> {
         let Some(field_index) = self
             .fields
             .iter()
@@ -388,12 +383,11 @@ impl TermsDict {
                 }
                 if has_positions {
                     last_state.pos_start_fp += meta.read_vlong()? as u64;
-                    last_state.last_pos_block_offset =
-                        if total_term_freq > BLOCK_SIZE as u64 {
-                            meta.read_vlong()?
-                        } else {
-                            -1
-                        };
+                    last_state.last_pos_block_offset = if total_term_freq > BLOCK_SIZE as u64 {
+                        meta.read_vlong()?
+                    } else {
+                        -1
+                    };
                 }
                 last_entry = Some(TermEntry {
                     doc_freq,
@@ -408,9 +402,7 @@ impl TermsDict {
                     if is_sub_block {
                         // assert termExists in Frame :790-793 — the FST
                         // descent should have consumed this prefix.
-                        return Err(corrupt(
-                            "block-tree scan hit an exact sub-block match",
-                        ));
+                        return Err(corrupt("block-tree scan hit an exact sub-block match"));
                     }
                     return Ok(last_entry);
                 }
@@ -674,7 +666,9 @@ fn reload_and_scan_to_sub(
             }
         }
         if frame.is_last_in_floor {
-            return Err(corrupt("sub-block entry not found while popping the block-tree frame"));
+            return Err(corrupt(
+                "sub-block entry not found while popping the block-tree frame",
+            ));
         }
         frame.fp = frame.fp_end;
     }

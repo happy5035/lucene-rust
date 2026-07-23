@@ -106,7 +106,11 @@ fn expand_mask8(mask: u64) -> u64 {
     expand_mask16(mask | (mask << 8))
 }
 fn primitive_mask(primitive: u32, bits: u32) -> u64 {
-    let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let m = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     match primitive {
         8 => expand_mask8(m),
         16 => expand_mask16(m),
@@ -163,7 +167,10 @@ fn for_util_encode_primitive(
             }
         } else {
             let mask1 = primitive_mask(primitive, remaining_bits_per_value);
-            let mask2 = primitive_mask(primitive, remaining_bits_per_long - remaining_bits_per_value);
+            let mask2 = primitive_mask(
+                primitive,
+                remaining_bits_per_long - remaining_bits_per_value,
+            );
             tmp[tmp_idx] |=
                 (longs[idx] & mask1) << (remaining_bits_per_long - remaining_bits_per_value);
             idx += 1;
@@ -421,13 +428,14 @@ fn for_util_decode_primitive(
                 }
             } else {
                 let mask1 = primitive_mask(primitive, remaining_bits_per_value);
-                let mask2 =
-                    primitive_mask(primitive, remaining_bits_per_long - remaining_bits_per_value);
+                let mask2 = primitive_mask(
+                    primitive,
+                    remaining_bits_per_long - remaining_bits_per_value,
+                );
                 longs[idx] |=
                     (tmp[tmp_idx] >> (remaining_bits_per_long - remaining_bits_per_value)) & mask1;
                 idx += 1;
-                remaining_bits_per_value =
-                    bpv - remaining_bits_per_long + remaining_bits_per_value;
+                remaining_bits_per_value = bpv - remaining_bits_per_long + remaining_bits_per_value;
                 longs[idx] |= (tmp[tmp_idx] & mask2) << remaining_bits_per_value;
                 tmp_idx += 1;
             }
@@ -460,7 +468,13 @@ pub fn for_util_decode(
             format!("ForUtil packs at most 32 bits per value, got {bpv}"),
         ));
     }
-    let primitive = if bpv <= 8 { 8 } else if bpv <= 16 { 16 } else { 32 };
+    let primitive = if bpv <= 8 {
+        8
+    } else if bpv <= 16 {
+        16
+    } else {
+        32
+    };
     for_util_decode_primitive(input, values, bpv as u32, primitive)
 }
 
@@ -484,7 +498,13 @@ pub fn for_delta_util_decode(
             format!("ForDeltaUtil packs at most 32 bits per value, got {bpv}"),
         ));
     }
-    let primitive = if bpv <= 4 { 8 } else if bpv <= 11 { 16 } else { 32 };
+    let primitive = if bpv <= 4 {
+        8
+    } else if bpv <= 11 {
+        16
+    } else {
+        32
+    };
     for_util_decode_primitive(input, deltas, bpv as u32, primitive)
 }
 
@@ -599,9 +619,15 @@ mod tests {
             vec![
                 0b00_01_10_11, // sizes 1,2,3,4 -> 0,1,2,3 in 2-bit fields MSB first
                 0x12,
-                0x56, 0x34,
-                0xBC, 0x9A, 0x78,
-                0x2B, 0x1A, 0xDE, 0xF0,
+                0x56,
+                0x34,
+                0xBC,
+                0x9A,
+                0x78,
+                0x2B,
+                0x1A,
+                0xDE,
+                0xF0,
             ]
         );
     }
@@ -632,7 +658,9 @@ mod tests {
         let v = java_vector(|x, i| *x = (i as u64 * 37) % 8);
         assert_eq!(
             enc(|o| for_util_encode(o, &v, 3)),
-            unhex("1a1a1a1a1a1a1a1aacacacacacacacac4141414141414141f7f7f7f7f7f7f7f788888888888888883f3f3f3f3f3f3f3f")
+            unhex(
+                "1a1a1a1a1a1a1a1aacacacacacacacac4141414141414141f7f7f7f7f7f7f7f788888888888888883f3f3f3f3f3f3f3f"
+            )
         );
     }
 
@@ -641,7 +669,9 @@ mod tests {
         let v = java_vector(|x, i| *x = (i as u64 * 37) % 512);
         assert_eq!(
             enc(|o| for_util_encode(o, &v, 9)),
-            unhex("1ef076a04e502600c902dfb2d562cb127b1578c57e757b258827c8d78987c937743a24ea549a044ae14ccdfcf9ace55c695f640f6fbf6a6fce71cd21ccd1ce815884383418e47894df96b7468ff6e7a63aa9305926093cb997bb946b921b97cb0fce4f7e0e2e4edef6e0a690d64086f002f32ea31a53060391059cb59765921558185bc85a785828db2abbda9b8afb3a")
+            unhex(
+                "1ef076a04e502600c902dfb2d562cb127b1578c57e757b258827c8d78987c937743a24ea549a044ae14ccdfcf9ace55c695f640f6fbf6a6fce71cd21ccd1ce815884383418e47894df96b7468ff6e7a63aa9305926093cb997bb946b921b97cb0fce4f7e0e2e4edef6e0a690d64086f002f32ea31a53060391059cb59765921558185bc85a785828db2abbda9b8afb3a"
+            )
         );
     }
 
@@ -650,7 +680,9 @@ mod tests {
         let v = java_vector(|x, i| *x = (i as u64 * 37) % 65536);
         assert_eq!(
             enc(|o| for_util_encode(o, &v, 16)),
-            unhex("e00d4009a0040000050e6509c50425002a0e8a09ea044a004f0eaf090f056f00740ed40934059400990ef9095905b900be0e1e0a7e05de00e30e430aa3050301080f680ac80528012d0f8d0aed054d01520fb20a12067201770fd70a370697019c0ffc0a5c06bc01c10f210b8106e101e60f460ba60606020b106b0bcb062b023010900bf00650025510b50b150775027a10da0b3a079a029f10ff0b5f07bf02c410240c8407e402e910490ca90709030e116e0cce072e033311930cf30753035811b80c180878037d11dd0c3d089d03a211020d6208c203c711270d8708e703ec114c0dac080c041112710dd10831043612960df60856045b12bb0d1b097b04")
+            unhex(
+                "e00d4009a0040000050e6509c50425002a0e8a09ea044a004f0eaf090f056f00740ed40934059400990ef9095905b900be0e1e0a7e05de00e30e430aa3050301080f680ac80528012d0f8d0aed054d01520fb20a12067201770fd70a370697019c0ffc0a5c06bc01c10f210b8106e101e60f460ba60606020b106b0bcb062b023010900bf00650025510b50b150775027a10da0b3a079a029f10ff0b5f07bf02c410240c8407e402e910490ca90709030e116e0cce072e033311930cf30753035811b80c180878037d11dd0c3d089d03a211020d6208c203c711270d8708e703ec114c0dac080c041112710dd10831043612960df60856045b12bb0d1b097b04"
+            )
         );
     }
 
@@ -662,7 +694,9 @@ mod tests {
         let mixed = java_vector(|x, i| *x = (i as u64 * 37) % 50 + 1);
         assert_eq!(
             enc(|o| for_delta_util_encode(o, &mixed)),
-            unhex("06fa0ed14cd58dd90625a22e1b0c590d9a5c6d5cae3a243a65833887798bba6330dc06bd44be85b7c6029a0213e250e291396531a6151c195d6d30667164b24528bac69a3c987d98bee391e70acb48c289175d159e1617ff544228406940aa2020")
+            unhex(
+                "06fa0ed14cd58dd90625a22e1b0c590d9a5c6d5cae3a243a65833887798bba6330dc06bd44be85b7c6029a0213e250e291396531a6151c195d6d30667164b24528bac69a3c987d98bee391e70acb48c289175d159e1617ff544228406940aa2020"
+            )
         );
     }
 
@@ -671,7 +705,9 @@ mod tests {
         let freqs = java_vector(|x, i| *x = (i % 5 + 1) as u64);
         assert_eq!(
             enc(|o| pfor_util_encode(o, &freqs)),
-            unhex("03724e29a594724e2996714f28a696714fa595704f2aa5957029a496724d29a4964c2aa695734c2aa6734e29a594734e29")
+            unhex(
+                "03724e29a594724e2996714f28a696714fa595704f2aa5957029a496724d29a4964c2aa695734c2aa6734e29a594734e29"
+            )
         );
     }
 
@@ -683,7 +719,9 @@ mod tests {
         v[100] = 999;
         assert_eq!(
             enc(|o| pfor_util_encode(o, &v)),
-            unhex("6803020105040302010403020105040302050403020105040301050403020105b802e705040302010503020105040302010403020105040302050403020105040301050403020105040201050403020105030201050403020104030201050403020504030201050403010504ff0201050402010504030201050302010504030201030b4dff6403")
+            unhex(
+                "6803020105040302010403020105040302050403020105040301050403020105b802e705040302010503020105040302010403020105040302050403020105040301050403020105040201050403020105030201050403020104030201050403020504030201050403010504ff0201050402010504030201050302010504030201030b4dff6403"
+            )
         );
     }
 
@@ -695,7 +733,9 @@ mod tests {
         }
         assert_eq!(
             enc(|o| pfor_util_encode(o, &v)),
-            unhex("0d100028001800409c18000800200010002000100028001800290018000a00499c0c00240010002a001000280018000b00180008002000549c2100100029001c0028001c000a002200080020001000589c10002800180008001800080020001000250013002900649c28001800080020000800200010002800100028001800689c18000a00210012002400100028001c00280018000800709c080020001000280010002900180008001c000a0026007a9c20001000280018002800180008002000080020001000809c130029001c000a00")
+            unhex(
+                "0d100028001800409c18000800200010002000100028001800290018000a00499c0c00240010002a001000280018000b00180008002000549c2100100029001c0028001c000a002200080020001000589c10002800180008001800080020001000250013002900649c28001800080020000800200010002800100028001800689c18000a00210012002400100028001c00280018000800709c080020001000280010002900180008001c000a0026007a9c20001000280018002800180008002000080020001000809c130029001c000a00"
+            )
         );
     }
 
@@ -744,7 +784,11 @@ mod tests {
     #[test]
     fn for_util_decode_round_trip_all_bpv() {
         for bpv in [1u8, 2, 3, 4, 5, 7, 8, 9, 11, 12, 16, 17, 24, 25, 31, 32] {
-            let mask = if bpv == 64 { u64::MAX } else { (1u64 << bpv) - 1 };
+            let mask = if bpv == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bpv) - 1
+            };
             let v = java_vector(|x, i| *x = (i as u64 * 37 + 5) & mask);
             let bytes = enc(|o| for_util_encode(o, &v, bpv));
             let mut back = [0u64; BLOCK_SIZE];
@@ -757,12 +801,16 @@ mod tests {
     fn for_util_decode_matches_java_vectors() {
         // decode the reference vectors dumped from real Lucene (see encode tests)
         let v9 = java_vector(|x, i| *x = (i as u64 * 37) % 512);
-        let bytes = unhex("1ef076a04e502600c902dfb2d562cb127b1578c57e757b258827c8d78987c937743a24ea549a044ae14ccdfcf9ace55c695f640f6fbf6a6fce71cd21ccd1ce815884383418e47894df96b7468ff6e7a63aa9305926093cb997bb946b921b97cb0fce4f7e0e2e4edef6e0a690d64086f002f32ea31a53060391059cb59765921558185bc85a785828db2abbda9b8afb3a");
+        let bytes = unhex(
+            "1ef076a04e502600c902dfb2d562cb127b1578c57e757b258827c8d78987c937743a24ea549a044ae14ccdfcf9ace55c695f640f6fbf6a6fce71cd21ccd1ce815884383418e47894df96b7468ff6e7a63aa9305926093cb997bb946b921b97cb0fce4f7e0e2e4edef6e0a690d64086f002f32ea31a53060391059cb59765921558185bc85a785828db2abbda9b8afb3a",
+        );
         let mut back = [0u64; BLOCK_SIZE];
         dec(&bytes, |i| for_util_decode(i, &mut back, 9));
         assert_eq!(back, v9);
         let v16 = java_vector(|x, i| *x = (i as u64 * 37) % 65536);
-        let bytes = unhex("e00d4009a0040000050e6509c50425002a0e8a09ea044a004f0eaf090f056f00740ed40934059400990ef9095905b900be0e1e0a7e05de00e30e430aa3050301080f680ac80528012d0f8d0aed054d01520fb20a12067201770fd70a370697019c0ffc0a5c06bc01c10f210b8106e101e60f460ba60606020b106b0bcb062b023010900bf00650025510b50b150775027a10da0b3a079a029f10ff0b5f07bf02c410240c8407e402e910490ca90709030e116e0cce072e033311930cf30753035811b80c180878037d11dd0c3d089d03a211020d6208c203c711270d8708e703ec114c0dac080c041112710dd10831043612960df60856045b12bb0d1b097b04");
+        let bytes = unhex(
+            "e00d4009a0040000050e6509c50425002a0e8a09ea044a004f0eaf090f056f00740ed40934059400990ef9095905b900be0e1e0a7e05de00e30e430aa3050301080f680ac80528012d0f8d0aed054d01520fb20a12067201770fd70a370697019c0ffc0a5c06bc01c10f210b8106e101e60f460ba60606020b106b0bcb062b023010900bf00650025510b50b150775027a10da0b3a079a029f10ff0b5f07bf02c410240c8407e402e910490ca90709030e116e0cce072e033311930cf30753035811b80c180878037d11dd0c3d089d03a211020d6208c203c711270d8708e703ec114c0dac080c041112710dd10831043612960df60856045b12bb0d1b097b04",
+        );
         let mut back = [0u64; BLOCK_SIZE];
         dec(&bytes, |i| for_util_decode(i, &mut back, 16));
         assert_eq!(back, v16);
@@ -776,7 +824,9 @@ mod tests {
         assert_eq!(back, [1u64; BLOCK_SIZE]);
         // mixed deltas (Java reference vector from the encode test)
         let mixed = java_vector(|x, i| *x = (i as u64 * 37) % 50 + 1);
-        let bytes = unhex("06fa0ed14cd58dd90625a22e1b0c590d9a5c6d5cae3a243a65833887798bba6330dc06bd44be85b7c6029a0213e250e291396531a6151c195d6d30667164b24528bac69a3c987d98bee391e70acb48c289175d159e1617ff544228406940aa2020");
+        let bytes = unhex(
+            "06fa0ed14cd58dd90625a22e1b0c590d9a5c6d5cae3a243a65833887798bba6330dc06bd44be85b7c6029a0213e250e291396531a6151c195d6d30667164b24528bac69a3c987d98bee391e70acb48c289175d159e1617ff544228406940aa2020",
+        );
         dec(&bytes, |i| for_delta_util_decode(i, &mut back));
         assert_eq!(back, mixed);
     }
@@ -786,7 +836,9 @@ mod tests {
         let mut back = [0u64; BLOCK_SIZE];
         // plain
         let freqs = java_vector(|x, i| *x = (i % 5 + 1) as u64);
-        let bytes = unhex("03724e29a594724e2996714f28a696714fa595704f2aa5957029a496724d29a4964c2aa695734c2aa6734e29a594734e29");
+        let bytes = unhex(
+            "03724e29a594724e2996714f28a696714fa595704f2aa5957029a496724d29a4964c2aa695734c2aa6734e29a594734e29",
+        );
         dec(&bytes, |i| pfor_util_decode(i, &mut back));
         assert_eq!(back, freqs);
         // exceptions at 3, 77, 100
@@ -794,7 +846,9 @@ mod tests {
         v[3] = 3000;
         v[77] = 65535;
         v[100] = 999;
-        let bytes = unhex("6803020105040302010403020105040302050403020105040301050403020105b802e705040302010503020105040302010403020105040302050403020105040301050403020105040201050403020105030201050403020104030201050403020504030201050403010504ff0201050402010504030201050302010504030201030b4dff6403");
+        let bytes = unhex(
+            "6803020105040302010403020105040302050403020105040301050403020105b802e705040302010503020105040302010403020105040302050403020105040301050403020105040201050403020105030201050403020104030201050403020504030201050403010504ff0201050402010504030201050302010504030201030b4dff6403",
+        );
         dec(&bytes, |i| pfor_util_decode(i, &mut back));
         assert_eq!(back, v);
         // constant branch with one exception

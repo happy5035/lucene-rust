@@ -6,10 +6,12 @@ use std::io;
 use crate::codec_util::{check_footer, check_footer_structure, check_index_header, corrupt};
 use crate::directory::FSDirectory;
 use crate::io::{DataInput, IndexInput};
-use crate::postings::{file_name, DOC_CODEC, POS_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX};
+use crate::postings::{
+    DOC_CODEC, POS_CODEC, POSTINGS_VERSION, PSM_CODEC, SEGMENT_SUFFIX, file_name,
+};
 use crate::postings_ll::{
-    for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints, read_vint15,
-    read_vlong15, BLOCK_SIZE,
+    BLOCK_SIZE, for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints,
+    read_vint15, read_vlong15,
 };
 use crate::terms_read::TermEntry;
 
@@ -29,7 +31,11 @@ pub struct PostingsReader {
 impl PostingsReader {
     /// Opens .psm + .doc, validating headers and exact lengths
     /// (Lucene912PostingsReader constructor :83-185).
-    pub fn open(dir: &FSDirectory, segment: &str, segment_id: &[u8; 16]) -> io::Result<PostingsReader> {
+    pub fn open(
+        dir: &FSDirectory,
+        segment: &str,
+        segment_id: &[u8; 16],
+    ) -> io::Result<PostingsReader> {
         let mut psm = dir.open_checksum_input(&file_name(segment, "psm"))?;
         check_index_header(
             &mut psm,
@@ -241,11 +247,12 @@ impl EnumCore {
         }
         self.doc = self.doc_buffer[self.doc_buffer_upto] as i64;
         self.doc_buffer_upto += 1;
-        if self.pos.is_some() && self.doc != NO_MORE_DOCS as i64 {
+        if self.doc != NO_MORE_DOCS as i64 && self.pos.is_some() {
             let f = self.freq() as u64; // :948 — freq of the doc just returned
-            let pos = self.pos.as_mut().unwrap();
-            pos.pos_pending_count += f;
-            pos.position = 0; // :951
+            if let Some(pos) = &mut self.pos {
+                pos.pos_pending_count += f;
+                pos.position = 0; // :951
+            }
         }
         Ok(self.doc as i32)
     }
@@ -357,8 +364,7 @@ impl EnumCore {
                 break;
             }
             self.level1_last_doc += self.doc_in.read_vint()? as i64;
-            self.level1_doc_end_fp =
-                self.doc_in.read_vlong()? as u64 + self.doc_in.file_pointer();
+            self.level1_doc_end_fp = self.doc_in.read_vlong()? as u64 + self.doc_in.file_pointer();
             if self.has_freqs && self.has_positions {
                 // parse the numSkipBytes section EVERY record (:883-886):
                 // Short numSkipBytes, Short impactBytes + impacts,
@@ -707,7 +713,11 @@ impl PositionsEnum {
     pub fn next_position(&mut self) -> io::Result<u32> {
         let freq = self.freq() as u64;
         let total_term_freq = self.core.total_term_freq;
-        let pos = self.core.pos.as_mut().expect("PositionsEnum without pos state");
+        let pos = self
+            .core
+            .pos
+            .as_mut()
+            .expect("PositionsEnum without pos state");
         assert!(
             pos.pos_pending_count > 0,
             "next_position called more than freq() times in the current doc (:1157)"
@@ -768,7 +778,8 @@ mod tests {
         w.start_field(&kw, 6000).unwrap();
         let big: Vec<u32> = (0..200).collect();
         w.write_term(b"big", &big, &vec![1; 200], None).unwrap();
-        w.write_term(b"tail", &[10, 20, 30], &[1, 1, 1], None).unwrap();
+        w.write_term(b"tail", &[10, 20, 30], &[1, 1, 1], None)
+            .unwrap();
         w.finish_field().unwrap();
         w.start_field(&tx, 6000).unwrap();
         let hot: Vec<u32> = (0..5000).collect();
@@ -779,7 +790,8 @@ mod tests {
         warm_freqs[3] = 3000;
         warm_freqs[77] = 65535;
         warm_freqs[100] = 999;
-        w.write_term(b"warm", &warm_docs, &warm_freqs, None).unwrap();
+        w.write_term(b"warm", &warm_docs, &warm_freqs, None)
+            .unwrap();
         w.finish_field().unwrap();
         w.finish().unwrap();
         let fis = FieldInfos::new(vec![kw, tx]);
@@ -1126,7 +1138,8 @@ mod tests {
             .iter()
             .map(|&f| (0..f).map(|k| k * 2).collect())
             .collect();
-        w.write_term(b"hot", &hot_docs, &hot_freqs, Some(&hot_pos)).unwrap();
+        w.write_term(b"hot", &hot_docs, &hot_freqs, Some(&hot_pos))
+            .unwrap();
         let one_pos: Vec<Vec<u32>> = vec![(0..7).collect()];
         w.write_term(b"one", &[42], &[7], Some(&one_pos)).unwrap();
         let warm_docs: Vec<u32> = (0..200).map(|i| i * 3).collect();
@@ -1135,7 +1148,8 @@ mod tests {
             .iter()
             .map(|&f| (0..f).map(|k| k * 2 + 1).collect())
             .collect();
-        w.write_term(b"warm", &warm_docs, &warm_freqs, Some(&warm_pos)).unwrap();
+        w.write_term(b"warm", &warm_docs, &warm_freqs, Some(&warm_pos))
+            .unwrap();
         w.finish_field().unwrap();
         w.finish().unwrap();
         let fis = FieldInfos::new(vec![px]);
@@ -1214,17 +1228,25 @@ mod tests {
         let mut en = postings.positions(&e).unwrap();
         assert_eq!(en.advance(1300).unwrap(), 1300);
         assert_eq!(en.freq(), 2);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[1300]);
         // advance to the level-1 boundary doc and past it
         assert_eq!(en.advance(4095).unwrap(), 4095);
-        let _: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let _: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(en.advance(4096).unwrap(), 4096);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[4096]);
         // into the doc tail (df % 128 != 0 region)
         assert_eq!(en.advance(4999).unwrap(), 4999);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[4999]);
         assert_eq!(en.advance(5000).unwrap(), NO_MORE_DOCS);
         assert_eq!(en.advance(9999).unwrap(), NO_MORE_DOCS); // sticky
@@ -1232,13 +1254,17 @@ mod tests {
         let mut en = postings.positions(&e).unwrap();
         assert_eq!(en.advance(200).unwrap(), 200);
         assert_eq!(en.advance(200).unwrap(), 200);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[200]);
         // every target: advance == linear scan, positions of the landed doc
         for target in [0i32, 1, 127, 128, 4223, 4224, 4998] {
             let mut en = postings.positions(&e).unwrap();
             assert_eq!(en.advance(target).unwrap(), target, "target {target}");
-            let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+            let ps: Vec<u32> = (0..en.freq())
+                .map(|_| en.next_position().unwrap())
+                .collect();
             assert_eq!(ps, hot_pos[target as usize], "target {target}");
         }
         fs::remove_dir_all(&root).unwrap();
@@ -1259,15 +1285,21 @@ mod tests {
         }
         // now at doc 204, never read a single position
         assert_eq!(en.doc_id(), 204);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[204]);
         // move on to doc 205 and read it fully, then skip 206-209's
         // positions via advance (buffer-local catch-up)
         assert_eq!(en.next_doc().unwrap(), 205);
-        let ps205: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps205: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps205, hot_pos[205]);
         assert_eq!(en.advance(210).unwrap(), 210);
-        let ps: Vec<u32> = (0..en.freq()).map(|_| en.next_position().unwrap()).collect();
+        let ps: Vec<u32> = (0..en.freq())
+            .map(|_| en.next_position().unwrap())
+            .collect();
         assert_eq!(ps, hot_pos[210]);
         fs::remove_dir_all(&root).unwrap();
     }

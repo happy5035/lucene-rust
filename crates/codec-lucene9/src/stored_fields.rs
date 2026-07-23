@@ -11,9 +11,9 @@
 
 use std::io;
 
-use crate::codec_util::{write_footer, write_index_header};
 #[cfg(test)]
 use crate::codec_util::index_header_length;
+use crate::codec_util::{write_footer, write_index_header};
 use crate::directory::FSDirectory;
 use crate::io::ChecksumIndexOutput;
 use crate::packed::direct_monotonic_write;
@@ -121,7 +121,8 @@ pub fn write_zdouble(out: &mut Vec<u8>, d: f64) {
     let int_val = d as i32;
     let double_bits = d.to_bits() as i64;
     const NEGATIVE_ZERO_DOUBLE: i64 = (-0.0f64).to_bits() as i64;
-    if d == int_val as f64 && (-1..=0x7c).contains(&int_val) && double_bits != NEGATIVE_ZERO_DOUBLE {
+    if d == int_val as f64 && (-1..=0x7c).contains(&int_val) && double_bits != NEGATIVE_ZERO_DOUBLE
+    {
         // small integer value [-1..124]: single byte
         out.push(0x80 | (int_val + 1) as u8);
     } else if d == d as f32 as f64 {
@@ -324,7 +325,12 @@ pub struct StoredFieldsWriter {
 impl StoredFieldsWriter {
     /// Creates the writer, writing the .fdm header (+VInt chunkSize) and the
     /// .fdt header, like the Java constructor (:103-164).
-    pub fn new(dir: &FSDirectory, segment: &str, segment_id: [u8; 16], suffix: &str) -> io::Result<Self> {
+    pub fn new(
+        dir: &FSDirectory,
+        segment: &str,
+        segment_id: [u8; 16],
+        suffix: &str,
+    ) -> io::Result<Self> {
         let [fdt_name, fdx_name, fdm_name] = file_names(segment, suffix);
 
         let mut meta_stream = dir.create_output(&fdm_name)?;
@@ -337,7 +343,13 @@ impl StoredFieldsWriter {
         )?;
 
         let mut fields_stream = dir.create_output(&fdt_name)?;
-        write_index_header(&mut fields_stream, FDT_CODEC_NAME, FDT_VERSION, &segment_id, suffix)?;
+        write_index_header(
+            &mut fields_stream,
+            FDT_CODEC_NAME,
+            FDT_VERSION,
+            &segment_id,
+            suffix,
+        )?;
 
         meta_stream.write_vint(CHUNK_SIZE as i32)?;
 
@@ -474,7 +486,10 @@ impl StoredFieldsWriter {
         if self.doc_base != num_docs {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("wrote {} docs, finish called with numDocs={num_docs}", self.doc_base),
+                format!(
+                    "wrote {} docs, finish called with numDocs={num_docs}",
+                    self.doc_base
+                ),
             ));
         }
         let total_chunks = self.chunk_num_docs.len();
@@ -494,7 +509,8 @@ impl StoredFieldsWriter {
         self.meta_stream.write_int(num_docs)?;
         self.meta_stream.write_int(BLOCK_SHIFT as i32)?;
         self.meta_stream.write_int(total_chunks as i32 + 1)?;
-        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+        self.meta_stream
+            .write_long(data_out.file_pointer() as i64)?;
 
         // docs DirectMonotonic: 0, then cumulative doc counts (:128-136)
         let mut doc_values: Vec<u64> = Vec::with_capacity(total_chunks + 1);
@@ -505,10 +521,16 @@ impl StoredFieldsWriter {
             doc_values.push(doc);
         }
         debug_assert_eq!(doc, num_docs as u64);
-        direct_monotonic_write(&mut self.meta_stream, &mut data_out, &doc_values, BLOCK_SHIFT)?;
+        direct_monotonic_write(
+            &mut self.meta_stream,
+            &mut data_out,
+            &doc_values,
+            BLOCK_SHIFT,
+        )?;
 
         // .fdm step 6: startPointersStartPointer (:149)
-        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+        self.meta_stream
+            .write_long(data_out.file_pointer() as i64)?;
 
         // filePointers DirectMonotonic: chunk start pointers + maxPointer (:156-167)
         let mut fp_values: Vec<u64> = Vec::with_capacity(total_chunks + 1);
@@ -516,10 +538,16 @@ impl StoredFieldsWriter {
             fp_values.push(fp as u64);
         }
         fp_values.push(max_pointer as u64);
-        direct_monotonic_write(&mut self.meta_stream, &mut data_out, &fp_values, BLOCK_SHIFT)?;
+        direct_monotonic_write(
+            &mut self.meta_stream,
+            &mut data_out,
+            &fp_values,
+            BLOCK_SHIFT,
+        )?;
 
         // .fdm steps 8-9: startPointersEndPointer, maxPointer (:177-178)
-        self.meta_stream.write_long(data_out.file_pointer() as i64)?;
+        self.meta_stream
+            .write_long(data_out.file_pointer() as i64)?;
         self.meta_stream.write_long(max_pointer)?;
         write_footer(&mut data_out)?;
 
@@ -610,7 +638,7 @@ mod tests {
         let bytes = ints_bytes(&values);
         assert_eq!(bytes[0], 16);
         assert_eq!(bytes.len(), 1 + 256 + 2); // full 128-block + 1 LE short tail
-                                              // first long: v[0]<<48 | v[32]<<32 | v[64]<<16 | v[96], LE
+        // first long: v[0]<<48 | v[32]<<32 | v[64]<<16 | v[96], LE
         let first = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
         assert_eq!(first, 0x0001_1234_1234_1234);
         // tail short: values[128] = 0x1234 LE
@@ -699,7 +727,7 @@ mod tests {
             b,
             vec![
                 (bits >> 24) as u8,
-                (bits >> 8) as u8,        // LE short low byte: bits 8..16
+                (bits >> 8) as u8,           // LE short low byte: bits 8..16
                 ((bits >> 16) & 0xff) as u8, // LE short high byte: bits 16..24
                 bits as u8
             ]

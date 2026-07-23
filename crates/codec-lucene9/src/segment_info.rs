@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use crate::codec_util::{check_footer, check_index_header, corrupt, write_footer, write_index_header};
+use crate::codec_util::{
+    check_footer, check_index_header, corrupt, write_footer, write_index_header,
+};
 use crate::directory::FSDirectory;
 use crate::io::DataInput;
 

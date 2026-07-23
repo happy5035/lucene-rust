@@ -17,11 +17,11 @@ use std::time::Instant;
 
 use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
 use codec_lucene9::FSDirectory;
+use rustlucene_core::search::{CountCollector, Query, Searcher};
 use rustlucene_core::{
     commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
     JsonBinder, Schema, SegmentBuilder,
 };
-use rustlucene_core::search::{CountCollector, Query, Searcher};
 
 /// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
 struct XorShift {
@@ -178,7 +178,9 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
         let q = Query::term("message", w);
         let count = searcher.count(&q)?;
         let freqsum = searcher.freq_sum(&q)?;
-        out.push_str(&format!("term message={w} count={count} freqsum={freqsum}\n"));
+        out.push_str(&format!(
+            "term message={w} count={count} freqsum={freqsum}\n"
+        ));
     }
     let count = searcher.count(&Query::term("message", "nosuchterm42"))?;
     out.push_str(&format!("term message=nosuchterm42 count={count}\n"));
@@ -226,7 +228,10 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
     let terms17: Vec<String> = (0..17).map(|i| format!("connection{i}")).collect();
     let terms_battery: [(&str, Vec<String>); 4] = [
         ("level", vec!["INFO".into(), "WARN".into(), "DEBUG".into()]),
-        ("message", vec!["connection0".into(), "query23".into(), "queue39".into()]),
+        (
+            "message",
+            vec!["connection0".into(), "query23".into(), "queue39".into()],
+        ),
         ("message", vec!["connection0".into(), "nosuchterm42".into()]),
         ("message", terms17),
     ];
@@ -318,7 +323,10 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
         for terms in degenerate {
             let q = Query::phrase("message", terms);
             let count = searcher.count(&q)?;
-            out.push_str(&format!("phrase message={} count={count}\n", terms.join(",")));
+            out.push_str(&format!(
+                "phrase message={} count={count}\n",
+                terms.join(",")
+            ));
         }
     }
     print!("{out}");
@@ -373,7 +381,11 @@ fn searchbench(
         .filter_map(|l| {
             let parts: Vec<&str> = l.split('\t').collect();
             if parts.len() >= 4 {
-                Some((parts[1].to_string(), parts[2].to_string(), parts[3].parse::<u32>().unwrap_or(0)))
+                Some((
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].parse::<u32>().unwrap_or(0),
+                ))
             } else {
                 None
             }
@@ -409,7 +421,11 @@ fn searchbench(
         .filter(|l| l.starts_with("PREFIX\t"))
         .filter_map(|l| {
             let parts: Vec<&str> = l.split('\t').collect();
-            if parts.len() >= 3 { Some((parts[1].to_string(), parts[2].to_string())) } else { None }
+            if parts.len() >= 3 {
+                Some((parts[1].to_string(), parts[2].to_string()))
+            } else {
+                None
+            }
         })
         .collect();
     let wildcard_tasks: Vec<(String, String)> = content
@@ -417,7 +433,11 @@ fn searchbench(
         .filter(|l| l.starts_with("WILDCARD\t"))
         .filter_map(|l| {
             let parts: Vec<&str> = l.split('\t').collect();
-            if parts.len() >= 3 { Some((parts[1].to_string(), parts[2].to_string())) } else { None }
+            if parts.len() >= 3 {
+                Some((parts[1].to_string(), parts[2].to_string()))
+            } else {
+                None
+            }
         })
         .collect();
     let terms_tasks: Vec<(String, Vec<String>)> = content
@@ -426,7 +446,10 @@ fn searchbench(
         .filter_map(|l| {
             let parts: Vec<&str> = l.split('\t').collect();
             if parts.len() >= 3 {
-                Some((parts[1].to_string(), parts[2].split(',').map(str::to_string).collect()))
+                Some((
+                    parts[1].to_string(),
+                    parts[2].split(',').map(str::to_string).collect(),
+                ))
             } else {
                 None
             }
@@ -438,7 +461,11 @@ fn searchbench(
         .filter_map(|l| {
             let parts: Vec<&str> = l.split('\t').collect();
             if parts.len() >= 4 {
-                Some((parts[1].to_string(), parts[2].to_string(), parts[3].to_string()))
+                Some((
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                ))
             } else {
                 None
             }
@@ -449,9 +476,14 @@ fn searchbench(
     let low_limit = 10u32;
     let med_limit = (max_doc as u32 / 100).max(11);
 
-    let mut low_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 <= low_limit).collect();
-    let mut med_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 > low_limit && t.2 <= med_limit).collect();
-    let mut high_terms: Vec<&(String, String, u32)> = terms.iter().filter(|t| t.2 > med_limit).collect();
+    let mut low_terms: Vec<&(String, String, u32)> =
+        terms.iter().filter(|t| t.2 <= low_limit).collect();
+    let mut med_terms: Vec<&(String, String, u32)> = terms
+        .iter()
+        .filter(|t| t.2 > low_limit && t.2 <= med_limit)
+        .collect();
+    let mut high_terms: Vec<&(String, String, u32)> =
+        terms.iter().filter(|t| t.2 > med_limit).collect();
 
     // Shuffle and sample per bucket
     let mut rng = XorShift::new(seed);
@@ -479,9 +511,15 @@ fn searchbench(
         Phrase(String, String),
     }
     let mut work: Vec<(String, WorkItem)> = Vec::new();
-    for t in &low_terms { work.push(("term\tlow".to_string(), WorkItem::Term(t.1.clone()))); }
-    for t in &med_terms { work.push(("term\tmed".to_string(), WorkItem::Term(t.1.clone()))); }
-    for t in &high_terms { work.push(("term\thigh".to_string(), WorkItem::Term(t.1.clone()))); }
+    for t in &low_terms {
+        work.push(("term\tlow".to_string(), WorkItem::Term(t.1.clone())));
+    }
+    for t in &med_terms {
+        work.push(("term\tmed".to_string(), WorkItem::Term(t.1.clone())));
+    }
+    for t in &high_terms {
+        work.push(("term\thigh".to_string(), WorkItem::Term(t.1.clone())));
+    }
     // AND/OR items are used verbatim, in file order (no sampling), so they
     // line up one-to-one with the Java SearchBench --load-queries run.
     for (op, bucket, t1, t2) in &bool_tasks {
@@ -513,10 +551,16 @@ fn searchbench(
     }
     for (bucket, ts) in &terms_tasks {
         let type_label = if ts.len() > 16 { "termsbig" } else { "terms" };
-        work.push((format!("{type_label}\t{bucket}"), WorkItem::Terms(ts.clone())));
+        work.push((
+            format!("{type_label}\t{bucket}"),
+            WorkItem::Terms(ts.clone()),
+        ));
     }
     for (bucket, t1, t2) in &phrase_tasks {
-        work.push((format!("phrase\t{bucket}"), WorkItem::Phrase(t1.clone(), t2.clone())));
+        work.push((
+            format!("phrase\t{bucket}"),
+            WorkItem::Phrase(t1.clone(), t2.clone()),
+        ));
     }
 
     if work.is_empty() {
@@ -568,14 +612,20 @@ fn searchbench(
     };
 
     // Per-group aggregation
-    let mut group_qps: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
-    let mut group_p50: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
-    let mut group_p90: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
-    let mut group_p99: std::collections::BTreeMap<String, Vec<f64>> = std::collections::BTreeMap::new();
-    let mut group_counts: std::collections::BTreeMap<String, Vec<u64>> = std::collections::BTreeMap::new();
+    let mut group_qps: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut group_p50: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut group_p90: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut group_p99: std::collections::BTreeMap<String, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut group_counts: std::collections::BTreeMap<String, Vec<u64>> =
+        std::collections::BTreeMap::new();
     // Per-group logical file-read volume during measured iterations
     // (RL_IO_STATS-gated counters in the IndexInput layer).
-    let mut group_io: std::collections::BTreeMap<String, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut group_io: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
 
     // Global warmup: run each query once to prime page cache
     for (_, item) in &work {
@@ -623,7 +673,10 @@ fn searchbench(
         group_p50.entry(label.clone()).or_default().push(p50);
         group_p90.entry(label.clone()).or_default().push(p90);
         group_p99.entry(label.clone()).or_default().push(p99);
-        group_counts.entry(label.clone()).or_default().push(query_counts.last().unwrap().1);
+        group_counts
+            .entry(label.clone())
+            .or_default()
+            .push(query_counts.last().unwrap().1);
     }
 
     // Print results header
@@ -636,7 +689,8 @@ fn searchbench(
         let count_max = counts.iter().max().unwrap_or(&0);
         println!(
             "{}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{}\t{}",
-            parts[0], parts[1],
+            parts[0],
+            parts[1],
             avg(&group_qps[group]),
             avg(&group_p50[group]),
             avg(&group_p90[group]),
@@ -655,7 +709,9 @@ fn searchbench(
     // Logical file-read volume per group during measured iterations (IndexInput
     // refills; includes page-cache hits, like /proc rchar).
     if codec_lucene9::io::io_stats::enabled() {
-        eprintln!("\n# IO stats (RL_IO_STATS): logical bytes read from files, measured iterations only");
+        eprintln!(
+            "\n# IO stats (RL_IO_STATS): logical bytes read from files, measured iterations only"
+        );
         for (group, (bytes, calls)) in &group_io {
             eprintln!("io\t{group}\tread_bytes={bytes}\tread_calls={calls}");
         }
@@ -665,7 +721,9 @@ fn searchbench(
 }
 
 fn percentile(sorted: &[u64], pct: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = ((pct / 100.0 * sorted.len() as f64).ceil() as usize).saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)] as f64
 }
@@ -696,8 +754,14 @@ fn message_tokens_of_doc(seed: u64, n: u64, k: usize) -> Vec<String> {
     let mut toks = Vec::new();
     for doc_id in 0..=n {
         let doc = gen_log_document(&mut rng, &vocab, doc_id, false, false);
-        if let Some((_, FieldValue::Text(m))) = doc.fields.iter().find(|(name, _)| name == "message") {
-            toks = m.split_ascii_whitespace().take(k).map(str::to_string).collect();
+        if let Some((_, FieldValue::Text(m))) =
+            doc.fields.iter().find(|(name, _)| name == "message")
+        {
+            toks = m
+                .split_ascii_whitespace()
+                .take(k)
+                .map(str::to_string)
+                .collect();
         }
     }
     toks
@@ -1316,15 +1380,41 @@ fn main() -> std::io::Result<()> {
             let mut i = 4;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--warmup" => { warmup = args[i+1].parse().unwrap(); i += 2; }
-                    "--iter"   => { iter   = args[i+1].parse().unwrap(); i += 2; }
-                    "--tasks"  => { tasks  = args[i+1].parse().unwrap(); i += 2; }
-                    "--seed"   => { seed   = args[i+1].parse().unwrap(); i += 2; }
-                    "--load-queries" => { load_queries = Some(args[i+1].clone()); i += 2; }
-                    _ => { eprintln!("unknown arg: {}", args[i]); usage(); }
+                    "--warmup" => {
+                        warmup = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--iter" => {
+                        iter = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--tasks" => {
+                        tasks = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--seed" => {
+                        seed = args[i + 1].parse().unwrap();
+                        i += 2;
+                    }
+                    "--load-queries" => {
+                        load_queries = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => {
+                        eprintln!("unknown arg: {}", args[i]);
+                        usage();
+                    }
                 }
             }
-            searchbench(Path::new(&args[2]), &args[3], warmup, iter, tasks, seed, load_queries)
+            searchbench(
+                Path::new(&args[2]),
+                &args[3],
+                warmup,
+                iter,
+                tasks,
+                seed,
+                load_queries,
+            )
         }
         _ => usage(),
     }

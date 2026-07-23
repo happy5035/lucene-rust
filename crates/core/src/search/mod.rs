@@ -28,11 +28,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rustlucene-search-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rustlucene-search-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -61,8 +58,12 @@ mod tests {
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..10 {
             let level = if i % 2 == 0 { "INFO" } else { "WARN" };
-            w.add_document(doc(level, &format!("tid-{i}"), &format!("w{} common", i % 3)))
-                .unwrap();
+            w.add_document(doc(
+                level,
+                &format!("tid-{i}"),
+                &format!("w{} common", i % 3),
+            ))
+            .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -101,11 +102,13 @@ mod tests {
         let root = temp_dir("multiseg");
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..3 {
-            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha")).unwrap();
+            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha"))
+                .unwrap();
         }
         w.commit().unwrap();
         for i in 3..7 {
-            w.add_document(doc("WARN", &format!("tid-{i}"), "alpha")).unwrap();
+            w.add_document(doc("WARN", &format!("tid-{i}"), "alpha"))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -130,7 +133,8 @@ mod tests {
         let root = temp_dir("bigdf");
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..5000 {
-            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha")).unwrap();
+            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha"))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -148,12 +152,22 @@ mod tests {
         let root = temp_dir("andor");
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..20 {
-            let level = match i % 4 { 0 => "INFO", 1 => "WARN", 2 => "ERROR", _ => "DEBUG" };
+            let level = match i % 4 {
+                0 => "INFO",
+                1 => "WARN",
+                2 => "ERROR",
+                _ => "DEBUG",
+            };
             // Docs 0/8/16 carry a two-token message so message-field terms
             // co-occur and the conjunction match path is exercised; the rest
             // carry a single w{i%5} token.
-            let message = if i % 8 == 0 { "w0 w1".to_string() } else { format!("w{}", i % 5) };
-            w.add_document(doc(level, &format!("tid-{i}"), &message)).unwrap();
+            let message = if i % 8 == 0 {
+                "w0 w1".to_string()
+            } else {
+                format!("w{}", i % 5)
+            };
+            w.add_document(doc(level, &format!("tid-{i}"), &message))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -219,7 +233,8 @@ mod tests {
         let mut w = IndexWriter::create(root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..40 {
             let m = format!("t{:02} t{:02}", i % 20, (i + 7) % 20);
-            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -280,21 +295,32 @@ mod tests {
         let dir = FSDirectory::open(&root).unwrap();
         let mut s = Searcher::open(&dir).unwrap();
         // all terms missing -> 0
-        assert_eq!(s.count(&Query::terms("message", &["zz1", "zz2"])).unwrap(), 0);
+        assert_eq!(
+            s.count(&Query::terms("message", &["zz1", "zz2"])).unwrap(),
+            0
+        );
         // mixed present/missing
-        let (total, _) = s.top_docs(&Query::terms("message", &["t00", "zz1"]), 100).unwrap();
+        let (total, _) = s
+            .top_docs(&Query::terms("message", &["t00", "zz1"]), 100)
+            .unwrap();
         assert_eq!(total, 4); // df(t00) = 4
-        // empty term set -> 0
+                              // empty term set -> 0
         assert_eq!(s.count(&Query::terms("message", &[])).unwrap(), 0);
         // single term degenerates to a Term query
         assert_eq!(s.count(&Query::terms("message", &["t00"])).unwrap(), 4);
         // keyword field (DOCS layout)
-        assert_eq!(s.count(&Query::terms("level", &["INFO", "WARN"])).unwrap(), 40);
+        assert_eq!(
+            s.count(&Query::terms("level", &["INFO", "WARN"])).unwrap(),
+            40
+        );
         // unknown / stored-only fields -> empty
         assert_eq!(s.count(&Query::terms("nope", &["x"])).unwrap(), 0);
         assert_eq!(s.count(&Query::terms("title", &["stored"])).unwrap(), 0);
         // duplicated input terms are harmless
-        assert_eq!(s.count(&Query::terms("message", &["t00", "t00"])).unwrap(), 4);
+        assert_eq!(
+            s.count(&Query::terms("message", &["t00", "t00"])).unwrap(),
+            4
+        );
         // >16 on the keyword field too (bitset over DOCS postings)
         let tids: Vec<String> = (0..18).map(|i| format!("tid-{i}")).collect();
         let tids_ref: Vec<&str> = tids.iter().map(String::as_str).collect();
@@ -307,11 +333,13 @@ mod tests {
         let root = temp_dir("termsseg");
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..3 {
-            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha")).unwrap();
+            w.add_document(doc("INFO", &format!("tid-{i}"), "alpha"))
+                .unwrap();
         }
         w.commit().unwrap();
         for i in 3..7 {
-            w.add_document(doc("WARN", &format!("tid-{i}"), "beta")).unwrap();
+            w.add_document(doc("WARN", &format!("tid-{i}"), "beta"))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -369,7 +397,8 @@ mod tests {
         let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
         for i in 0..40 {
             let m = format!("t{:02} t{:02}", i % 20, (i + 7) % 20);
-            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m))
+                .unwrap();
         }
         w.add_document(doc("INFO", "tid-x", "héllo world")).unwrap();
         w.commit().unwrap();
@@ -387,7 +416,11 @@ mod tests {
         // prefix + wildcard filter: t?7 matches t07,t17 (and t27... but dict has t00..t19)
         let wq = Query::wildcard("message", "t?7");
         let t = t_terms(0..20);
-        let hits: Vec<&str> = t.iter().map(String::as_str).filter(|x| x.len() == 3 && x.ends_with('7')).collect();
+        let hits: Vec<&str> = t
+            .iter()
+            .map(String::as_str)
+            .filter(|x| x.len() == 3 && x.ends_with('7'))
+            .collect();
         let or_q = Query::or("message", &hits);
         assert_eq!(s.count(&wq).unwrap(), s.count(&or_q).unwrap());
         // no-prefix full scan: *7 same term set
@@ -429,17 +462,18 @@ mod tests {
     fn write_phrase_corpus(root: &std::path::Path) {
         let mut w = IndexWriter::create(root, schema_pos(), IndexWriterConfig::default()).unwrap();
         let docs = [
-            "quick brown fox",       // 0: "quick brown" hit
-            "quick fox brown",       // 1: not adjacent
-            "quick quick brown",     // 2: only the 2nd quick aligns
-            "foo foo bar",           // 3: "foo foo" hit
-            "foo bar foo",           // 4: "foo foo" miss
-            "a b c",                 // 5: 3-term phrase hit
-            "a b",                   // 6
-            "c a b",                 // 7: "a b" hit
+            "quick brown fox",   // 0: "quick brown" hit
+            "quick fox brown",   // 1: not adjacent
+            "quick quick brown", // 2: only the 2nd quick aligns
+            "foo foo bar",       // 3: "foo foo" hit
+            "foo bar foo",       // 4: "foo foo" miss
+            "a b c",             // 5: 3-term phrase hit
+            "a b",               // 6
+            "c a b",             // 7: "a b" hit
         ];
         for (i, m) in docs.iter().enumerate() {
-            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -476,12 +510,20 @@ mod tests {
         let (_, docs) = s.top_docs(&q, 10).unwrap();
         assert_eq!(docs, vec![5, 6, 7]);
         // reversed order misses
-        assert_eq!(s.count(&Query::phrase("message", &["brown", "quick"])).unwrap(), 0);
+        assert_eq!(
+            s.count(&Query::phrase("message", &["brown", "quick"]))
+                .unwrap(),
+            0
+        );
         // single term degenerates to a Term query
         let q = Query::phrase("message", &["quick"]);
         assert_eq!(s.count(&q).unwrap(), 3);
         // missing term -> no hits (not an error)
-        assert_eq!(s.count(&Query::phrase("message", &["quick", "nosuch"])).unwrap(), 0);
+        assert_eq!(
+            s.count(&Query::phrase("message", &["quick", "nosuch"]))
+                .unwrap(),
+            0
+        );
         // unknown field -> no hits (not an error)
         assert_eq!(s.count(&Query::phrase("message", &[])).unwrap(), 0);
         assert_eq!(s.count(&Query::phrase("nope", &["a", "b"])).unwrap(), 0);
@@ -499,11 +541,46 @@ mod tests {
         drop(w);
         let dir = FSDirectory::open(&root).unwrap();
         let mut s = Searcher::open(&dir).unwrap();
-        let err = s.count(&Query::phrase("message", &["quick", "brown"])).unwrap_err();
+        let err = s
+            .count(&Query::phrase("message", &["quick", "brown"]))
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         // keyword field (DOCS) also fails
-        let err = s.count(&Query::phrase("level", &["INFO", "WARN"])).unwrap_err();
+        let err = s
+            .count(&Query::phrase("level", &["INFO", "WARN"]))
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn freq_sum_rejects_multi_term_and_boolean_queries() {
+        let root = temp_dir("freqsumerr");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let all = t_terms(0..20);
+        let all_ref: Vec<&str> = all.iter().map(String::as_str).collect();
+        // Terms, <=16 (OR path) and >16 (bitset path)
+        let t16: Vec<&str> = all_ref[..16].to_vec();
+        let err = s.freq_sum(&Query::terms("message", &t16)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = s.freq_sum(&Query::terms("message", &all_ref)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Prefix / Wildcard (multi-term too)
+        assert!(s.freq_sum(&Query::prefix("message", "t")).is_err());
+        assert!(s.freq_sum(&Query::wildcard("message", "t*")).is_err());
+        // And / Or
+        let err = s
+            .freq_sum(&Query::or("message", &["t00", "t01"]))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = s
+            .freq_sum(&Query::and("message", &["t00", "t07"]))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Term still works
+        assert_eq!(s.freq_sum(&Query::term("message", "t00")).unwrap(), 4);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -511,10 +588,13 @@ mod tests {
     fn phrase_query_multi_segment() {
         let root = temp_dir("phraseseg");
         let mut w = IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
-        w.add_document(pos_doc("INFO", "tid-0", "quick brown")).unwrap();
+        w.add_document(pos_doc("INFO", "tid-0", "quick brown"))
+            .unwrap();
         w.commit().unwrap();
-        w.add_document(pos_doc("INFO", "tid-1", "brown quick")).unwrap();
-        w.add_document(pos_doc("INFO", "tid-2", "quick brown fox")).unwrap();
+        w.add_document(pos_doc("INFO", "tid-1", "brown quick"))
+            .unwrap();
+        w.add_document(pos_doc("INFO", "tid-2", "quick brown fox"))
+            .unwrap();
         w.commit().unwrap();
         drop(w);
         let dir = FSDirectory::open(&root).unwrap();

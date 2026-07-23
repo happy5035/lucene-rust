@@ -171,7 +171,11 @@ impl Schema {
             spec.name
         );
         if spec.is_indexed() {
-            assert!(spec.omit_norms, "field {}: norms are never written", spec.name);
+            assert!(
+                spec.omit_norms,
+                "field {}: norms are never written",
+                spec.name
+            );
             assert!(
                 spec.tokenized || !spec.has_positions(),
                 "field {}: keyword fields cannot carry positions",

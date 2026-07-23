@@ -19,9 +19,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObjectArray, JString};
 use jni::sys::{jint, jlong};
-use jni::JNIEnv;
 use rustlucene_core::{
     BindOutcome, Document, FieldValue, IndexWriter, IndexWriterConfig, JsonBinder, Schema,
 };
@@ -62,8 +62,16 @@ pub extern "system" fn Java_RustIndexWriter_nativeCreate(
     path: JString,
     schema_spec: JString,
 ) -> jlong {
-    let path: String = jni_try!(&mut env, env.get_string(&path).map(|s| s.to_string_lossy().into_owned()));
-    let spec: String = jni_try!(&mut env, env.get_string(&schema_spec).map(|s| s.to_string_lossy().into_owned()));
+    let path: String = jni_try!(
+        &mut env,
+        env.get_string(&path)
+            .map(|s| s.to_string_lossy().into_owned())
+    );
+    let spec: String = jni_try!(
+        &mut env,
+        env.get_string(&schema_spec)
+            .map(|s| s.to_string_lossy().into_owned())
+    );
     let (schema, aliases, policy) = jni_try!(&mut env, Schema::parse(&spec));
     let binder = JsonBinder::new(&schema, &aliases, policy);
     let writer = jni_try!(
@@ -79,7 +87,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeCreate(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_RustIndexWriter_nativeBeginDocument(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
+pub extern "system" fn Java_RustIndexWriter_nativeBeginDocument(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
     let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
     g.current = Some(Document::new());
@@ -87,7 +99,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeBeginDocument(mut env: JNIEnv,
 }
 
 fn add_field(env: &mut JNIEnv, ptr: jlong, field: JString, value: FieldValue) -> jlong {
-    let name: String = jni_try!(env, env.get_string(&field).map(|s| s.to_string_lossy().into_owned()));
+    let name: String = jni_try!(
+        env,
+        env.get_string(&field)
+            .map(|s| s.to_string_lossy().into_owned())
+    );
     let h = jni_try!(env, handle(ptr));
     let mut g = jni_try!(env, h.lock().map_err(|_| "poisoned lock".to_string()));
     match g.current.as_mut() {
@@ -96,7 +112,11 @@ fn add_field(env: &mut JNIEnv, ptr: jlong, field: JString, value: FieldValue) ->
             0
         }
         None => {
-            throw(env, "java/lang/IllegalStateException", "beginDocument not called");
+            throw(
+                env,
+                "java/lang/IllegalStateException",
+                "beginDocument not called",
+            );
             0
         }
     }
@@ -110,7 +130,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeAddText(
     field: JString,
     value: JString,
 ) -> jlong {
-    let v: String = jni_try!(&mut env, env.get_string(&value).map(|s| s.to_string_lossy().into_owned()));
+    let v: String = jni_try!(
+        &mut env,
+        env.get_string(&value)
+            .map(|s| s.to_string_lossy().into_owned())
+    );
     add_field(&mut env, ptr, field, FieldValue::Text(v))
 }
 
@@ -122,7 +146,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeAddKeyword(
     field: JString,
     value: JString,
 ) -> jlong {
-    let v: String = jni_try!(&mut env, env.get_string(&value).map(|s| s.to_string_lossy().into_owned()));
+    let v: String = jni_try!(
+        &mut env,
+        env.get_string(&value)
+            .map(|s| s.to_string_lossy().into_owned())
+    );
     add_field(&mut env, ptr, field, FieldValue::Keyword(v))
 }
 
@@ -149,16 +177,27 @@ pub extern "system" fn Java_RustIndexWriter_nativeAddInt(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_RustIndexWriter_nativeEndDocument(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
+pub extern "system" fn Java_RustIndexWriter_nativeEndDocument(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
     let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
     match g.current.take() {
         Some(doc) => {
-            jni_try!(&mut env, g.writer.add_document(doc).map_err(|e| e.to_string()));
+            jni_try!(
+                &mut env,
+                g.writer.add_document(doc).map_err(|e| e.to_string())
+            );
             0
         }
         None => {
-            throw(&mut env, "java/lang/IllegalStateException", "beginDocument not called");
+            throw(
+                &mut env,
+                "java/lang/IllegalStateException",
+                "beginDocument not called",
+            );
             0
         }
     }
@@ -178,7 +217,10 @@ pub extern "system" fn Java_RustIndexWriter_nativeAddJsonBatch(
     docs: JObjectArray,
 ) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
-    let len = jni_try!(&mut env, env.get_array_length(&docs).map_err(|e| e.to_string()));
+    let len = jni_try!(
+        &mut env,
+        env.get_array_length(&docs).map_err(|e| e.to_string())
+    );
     // one lock for the whole batch
     let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
     let WriterHandle { writer, binder, .. } = &mut *g;
@@ -212,7 +254,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeAddJsonBatch(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_RustIndexWriter_nativeFlush(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
+pub extern "system" fn Java_RustIndexWriter_nativeFlush(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
     let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
     jni_try!(&mut env, g.writer.flush().map_err(|e| e.to_string()));
@@ -220,7 +266,11 @@ pub extern "system" fn Java_RustIndexWriter_nativeFlush(mut env: JNIEnv, _class:
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_RustIndexWriter_nativeCommit(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
+pub extern "system" fn Java_RustIndexWriter_nativeCommit(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
     let h = jni_try!(&mut env, handle(ptr));
     let mut g = jni_try!(&mut env, h.lock().map_err(|_| "poisoned lock".to_string()));
     jni_try!(&mut env, g.writer.commit().map_err(|e| e.to_string()));
@@ -228,14 +278,22 @@ pub extern "system" fn Java_RustIndexWriter_nativeCommit(mut env: JNIEnv, _class
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_RustIndexWriter_nativeClose(mut env: JNIEnv, _class: JClass, ptr: jlong) -> jlong {
+pub extern "system" fn Java_RustIndexWriter_nativeClose(
+    mut env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jlong {
     if ptr == 0 {
         return 0;
     }
     let handle = unsafe { Box::from_raw(ptr as *mut Mutex<WriterHandle>) };
     if let Ok(mut g) = handle.lock() {
         if g.current.is_some() {
-            throw(&mut env, "java/lang/IllegalStateException", "uncommitted document discarded");
+            throw(
+                &mut env,
+                "java/lang/IllegalStateException",
+                "uncommitted document discarded",
+            );
         }
         g.current = None;
     }

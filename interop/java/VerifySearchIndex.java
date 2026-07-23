@@ -152,6 +152,23 @@ public class VerifySearchIndex {
                 out.append("prefix trace_id=").append(tid8)
                    .append(" count=").append(s.count(q)).append('\n');
             }
+
+            // M2 wildcard battery: same items/format as searchdump.
+            String[][] wildcardBattery = {
+                {"message", "connection*"},
+                {"message", "que?y3*"},
+                {"message", "*onnection1"},
+                {"message", "*zzz"},
+            };
+            for (String[] item : wildcardBattery) {
+                Query q = new ConstantScoreQuery(new WildcardQuery(new Term(item[0], item[1])));
+                TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                StringBuilder b = new StringBuilder();
+                for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                out.append("wildcard ").append(item[0]).append('=').append(item[1])
+                   .append(" count=").append(s.count(q))
+                   .append(" first20=").append(b).append('\n');
+            }
         }
         System.out.print(out);
     }

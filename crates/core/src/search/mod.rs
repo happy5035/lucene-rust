@@ -362,4 +362,51 @@ mod tests {
         assert!(docs.contains(&1) && docs.iter().all(|&d| d == 1 || (10..=19).contains(&d)));
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn wildcard_query_classes() {
+        let root = temp_dir("wildcards");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..40 {
+            let m = format!("t{:02} t{:02}", i % 20, (i + 7) % 20);
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+        }
+        w.add_document(doc("INFO", "tid-x", "héllo world")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+
+        // pure-prefix shape == the prefix query result (zero filtering)
+        let wq = Query::wildcard("message", "t1*");
+        let pq = Query::prefix("message", "t1");
+        assert_eq!(s.count(&wq).unwrap(), s.count(&pq).unwrap());
+        let (a, ad) = s.top_docs(&wq, 100).unwrap();
+        let (b, bd) = s.top_docs(&pq, 100).unwrap();
+        assert_eq!((a, ad), (b, bd));
+        // prefix + wildcard filter: t?7 matches t07,t17 (and t27... but dict has t00..t19)
+        let wq = Query::wildcard("message", "t?7");
+        let t = t_terms(0..20);
+        let hits: Vec<&str> = t.iter().map(String::as_str).filter(|x| x.len() == 3 && x.ends_with('7')).collect();
+        let or_q = Query::or("message", &hits);
+        assert_eq!(s.count(&wq).unwrap(), s.count(&or_q).unwrap());
+        // no-prefix full scan: *7 same term set
+        let wq = Query::wildcard("message", "*7");
+        assert_eq!(s.count(&wq).unwrap(), s.count(&or_q).unwrap());
+        // "*" matches every term in the field dictionary
+        let wq = Query::wildcard("message", "*");
+        assert_eq!(s.count(&wq).unwrap(), 41);
+        // exact degenerate
+        let wq = Query::wildcard("message", "t07");
+        assert_eq!(s.count(&wq).unwrap(), 4);
+        // '?' over a multi-byte char (héllo)
+        let wq = Query::wildcard("message", "h?llo");
+        assert_eq!(s.count(&wq).unwrap(), 1);
+        let wq = Query::wildcard("message", "h?ll");
+        assert_eq!(s.count(&wq).unwrap(), 0);
+        // zero hit / unknown field
+        assert_eq!(s.count(&Query::wildcard("message", "zzz*")).unwrap(), 0);
+        assert_eq!(s.count(&Query::wildcard("nope", "*")).unwrap(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

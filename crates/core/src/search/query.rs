@@ -15,6 +15,7 @@ pub enum Query {
     Or { field: String, terms: Vec<Vec<u8>> },
     Terms { field: String, terms: Vec<Vec<u8>> },
     Prefix { field: String, prefix: Vec<u8> },
+    Wildcard { field: String, pattern: Vec<u8> },
 }
 
 impl Query {
@@ -45,10 +46,18 @@ impl Query {
         }
     }
 
+    /// Wildcard query with '*' and '?' (spec M2 §5 classification).
+    pub fn wildcard(field: &str, pattern: &str) -> Query {
+        Query::Wildcard {
+            field: field.to_string(),
+            pattern: pattern.as_bytes().to_vec(),
+        }
+    }
+
     /// Multi-term queries (Terms/Prefix/Wildcard) share the Searcher::count
     /// dual path (popcount on the bitset path, iteration otherwise).
     pub(crate) fn is_multi_term(&self) -> bool {
-        matches!(self, Query::Terms { .. } | Query::Prefix { .. })
+        matches!(self, Query::Terms { .. } | Query::Prefix { .. } | Query::Wildcard { .. })
     }
 
     /// Per-segment count shortcut: `Some(popcount)` when this query takes
@@ -66,6 +75,13 @@ impl Query {
             }
             Query::Prefix { field, prefix } => {
                 let Some((has_freqs, collected)) = multi_term::collect_prefix(seg, field, prefix)? else {
+                    return Ok(Some(0));
+                };
+                multi_term::bitset_count(seg, has_freqs, &collected)
+            }
+            Query::Wildcard { field, pattern } => {
+                let pat = multi_term::WildcardPattern::parse(pattern);
+                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)? else {
                     return Ok(Some(0));
                 };
                 multi_term::bitset_count(seg, has_freqs, &collected)
@@ -132,6 +148,13 @@ impl Query {
             }
             Query::Prefix { field, prefix } => {
                 let Some((has_freqs, collected)) = multi_term::collect_prefix(seg, field, prefix)? else {
+                    return Ok(None);
+                };
+                multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)
+            }
+            Query::Wildcard { field, pattern } => {
+                let pat = multi_term::WildcardPattern::parse(pattern);
+                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)? else {
                     return Ok(None);
                 };
                 multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)

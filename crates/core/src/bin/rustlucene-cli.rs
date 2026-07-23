@@ -267,6 +267,27 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64) -> std::io::Result<()>
         let count = searcher.count(&q)?;
         out.push_str(&format!("prefix trace_id={tid8} count={count}\n"));
     }
+
+    // M2 wildcard battery (search spec M2 §5): "connection*" is the
+    // pure-prefix shape (>16 expansion -> bitset), "que?y3*" the
+    // prefix+filter shape (<=16 -> OR), "*onnection1" the no-prefix
+    // full-scan shape; "*zzz" is the zero-hit case. Mirrored in
+    // VerifySearchIndex.java.
+    let wildcard_battery: [(&str, &str); 4] = [
+        ("message", "connection*"),
+        ("message", "que?y3*"),
+        ("message", "*onnection1"),
+        ("message", "*zzz"),
+    ];
+    for (field, pattern) in wildcard_battery {
+        let q = Query::wildcard(field, pattern);
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "wildcard {field}={pattern} count={count} first20={}\n",
+            doc_csv(&docs)
+        ));
+    }
     print!("{out}");
     Ok(())
 }

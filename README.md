@@ -37,7 +37,7 @@
 
 ### 搜索读路径（`crates/core/src/search`，M2）
 
-- **查询能力**（由写入能力严格限定，全部 ConstantScore、无打分 / norms / impact）：Term、Phrase（slop=0）、Boolean must/should、Terms（IN 语义）、Prefix、Wildcard（`*`/`?`，前缀形走 FST 前缀扫）、1D PointRange（BKD）、MatchAll、Sort by NumericDV / SortedDV、stored 批量取回
+- **查询能力**（由写入能力严格限定，全部 ConstantScore、无打分 / norms / impact）：Term、Phrase（slop=0）、Boolean must/should（同字段平铺）、Terms（IN 语义）、Prefix、Wildcard（`*`/`?`，前缀形走 FST 前缀扫）、MatchAll、top-N（INDEXORDER）。嵌套 Boolean / Point 区间 / forceMerge 见 `docs/superpowers/specs/2026-07-24-rust-m6-bool-point-forcemerge-design.md`
 - **架构**：方案 C——执行语义逐行对照 Lucene 9.12.3 源码（advance 协议、position 合取、BKD 边界、MISSING 排序），对象结构 Rust 化：`enum Query` + `trait DocIter`，不做 Java 式 Query/Weight/Scorer 继承体系
 - **快照语义**：open 即快照，重开即刷新（无 NRT 原地 refresh）；单线程逐段执行
 - 只保证读**本系统写出的**索引（无 delete / `.liv` / norms）；Java 写的索引可读但不做删除语义

@@ -76,8 +76,9 @@ Bool），跨字段天然支持。新查询一律用 `Bool`；`And`/`Or` 作为�
 
 - `ConjOver(Vec<SegmentDocIter>)`：首个为 lead，候选对其余逐个 `advance` 对齐，全齐即命中
   （Lucene ConjunctionDISI 协议）。
-- `DisjOver(Vec<SegmentDocIter>)`：k 路归并——k 小（<8）用排序扫描，否则二叉堆；参照现有
-  `DisjunctionDocIter` 的堆实现。
+- `DisjOver(Vec<SegmentDocIter>)`：k 路归并，沿用现有 `DisjunctionDocIter` 的线性
+  min-scan 实现形态（`doc_iter.rs:255-312` 实际为线性扫描而非堆——2026-07-25 起草期
+  核实修正）。
 - `Excluding { main, prohibited }`：两指针——main 候选对 prohibited 做 `advance` 探测，
   撞上即弃（Lucene ReqExclScorer 协议）。多个 MUST_NOT 先 `DisjOver` 合成一个
   prohibited。
@@ -107,7 +108,8 @@ prohibited count（避免全量迭代，纯 MUST_NOT 的常规优化）。
 ### 2.6 验收
 
 - Java 对拍：`SearchBench` 查询文件扩展嵌套 bool 行（S 表达式风格单行，如
-  `BOOL (AND (TERM message error) (OR (TERM level INFO WARN)) (NOT (TERM source tmp)))`），
+  `BOOL (AND (TERM message error) (OR (TERM level INFO) (TERM level WARN)) (NOT (TERM source tmp)))`；
+  TERM 叶子 = 字段 + 单词，IN 语义用 OR 表达——多词写法不支持，2026-07-25 起草期定稿），
   Java 侧构造同形 BooleanQuery，hit counts 逐条 diff。
 - 形状覆盖：纯 MUST / 纯 SHOULD / MUST+SHOULD / MUST+MUST_NOT / 纯 MUST_NOT / 三层嵌套 /
   跨字段 / 含 Phrase·Prefix·Wildcard·PointRange 子句 / 拍平形命中 roaring 路径的 A/B
@@ -159,8 +161,10 @@ forceMerge 全量取点的现成通道。增量 merge-sort DocIdSet 的收益只
 ### 3.4 验收
 
 - 查询文件加 `RANGE field low high` 行；Java `LongPoint.newRangeQuery` 逐条 diff。
-- 边界四类：不相交区间（命中 0；`low>high` 与 Lucene 一致直接报错）、全区间（MIN..MAX）、
-  单边贴 MIN/MAX、IntPoint 字段。
+- 边界四类：不相交区间（命中 0）、全区间（MIN..MAX）、单边贴 MIN/MAX、IntPoint 字段。
+  `low>high`：Rust 侧返回 `Err(InvalidInput)` 并以单测锁定——注意 Java 9.12.3
+  `PointRangeQuery.checkArgs` 只查 null、low>high 返回 0 命中**不报错**（2026-07-25
+  起草期核实，本条为与 Java 的有意偏差），故该情形不进 diff 电池。
 - `make log-test` 电池接入（log schema 的 timestamp 为 LongPoint）。
 
 ## 4. T-C：forceMerge(1) —— 格式级段归并

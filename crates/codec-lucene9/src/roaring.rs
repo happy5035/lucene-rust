@@ -1,10 +1,14 @@
-//! Roaring bitmap containers (array / bitset / run) for the M3 inline
-//! per-term bitmap in the .doc stream (spec §3–§6): build from a sorted doc
-//! list with runOptimize, container-level boolean and/or, cardinality,
-//! forward-only cursor iteration, and the `[header+payload+crc32]` wire
-//! format written ahead of a term's postings. SIMD fast paths live in
-//! `roaring/simd.rs` (Task 2); this file carries the scalar reference every
-//! kernel is pinned against.
+//! Roaring bitmap containers (array / bitset / run) for the inline
+//! per-term bitmap in the .doc stream (M3 spec §3–§6, M4 spec §3 格式 v2):
+//! build from a sorted doc list with runOptimize, container-level boolean
+//! and/or, cardinality, forward-only cursor iteration, and the
+//! `[header+payload]` wire format written ahead of a term's postings.
+//! Format v2 (M4 §3): the per-bitmap crc32 is gone — validation is the
+//! cheap triple gate (len bound → magic/version → header df/card ==
+//! doc_freq) plus structural invariants; payload integrity stays with the
+//! .doc footer CRC. Zero-copy query-path views live in `roaring/view.rs`
+//! (M4 T2); SIMD fast paths live in `roaring/simd.rs`; this file carries
+//! the scalar reference every kernel is pinned against.
 
 use std::io;
 
@@ -709,26 +713,28 @@ impl RoaringBitmap {
 // ------------------------------------------------------------------
 
 pub const BITMAP_MAGIC: [u8; 4] = *b"RLBM";
-pub const BITMAP_VERSION: u8 = 1;
+/// Wire format version. v2 (M4 §3): no per-bitmap crc32. The version byte
+/// is the only migration gate: != 2 (including M3's v1) silently falls
+/// back to postings.
+pub const BITMAP_VERSION: u8 = 2;
 
 const TYPE_ARRAY: u8 = 0;
 const TYPE_BITSET: u8 = 1;
 const TYPE_RUN: u8 = 2;
 
-/// Upper bound of the bitmap region length (header+payload+crc32) for a
-/// segment with `max_doc` docs. Derivation (spec §4 len 有界校验; 关键设计
-/// 事实 3): runOptimize 后每 container data ≤ 8192B、头部开销 ≤ 9B，
-/// container 数 ≤ ceil(maxDoc/65536)，公共头 ≤ 15B + numContainers vInt
-/// ≤ 5B + crc 4B：
-///   max_bitmap_len = 24 + ceil(max_doc / 65536) * 8201
+/// Upper bound of the bitmap region length (header+payload, no crc since
+/// v2) for a segment with `max_doc` docs. Derivation (spec §3 len 有界校验;
+/// 关键设计事实 1): runOptimize 后每 container data ≤ 8192B、头部开销 ≤ 9B，
+/// container 数 ≤ ceil(maxDoc/65536)，公共头 ≤ 15B + numContainers vInt ≤ 5B：
+///   max_bitmap_len = 20 + ceil(max_doc / 65536) * 8201
 pub fn max_bitmap_len(max_doc: u32) -> u64 {
-    24 + (max_doc as u64).div_ceil(65536) * 8201
+    20 + (max_doc as u64).div_ceil(65536) * 8201
 }
 
 impl RoaringBitmap {
-    /// header+payload+crc32 (without the trailing len, which the writer
-    /// appends). `df` is the term's docFreq and must equal the cardinality
-    /// (docs-only bitmap, spec §4).
+    /// header+payload (without the trailing len, which the writer appends;
+    /// without the v1 crc32, M4 §3). `df` is the term's docFreq and must
+    /// equal the cardinality (docs-only bitmap).
     pub fn serialize(&self, df: u32) -> Vec<u8> {
         debug_assert_eq!(df as u64, self.card);
         let mut out = IndexOutput::in_memory();
@@ -766,27 +772,21 @@ impl RoaringBitmap {
                 }
             }
         }
-        let mut bytes = out.into_bytes();
-        let crc = crc32fast::hash(&bytes);
-        bytes.extend_from_slice(&crc.to_le_bytes());
-        bytes
+        out.into_bytes()
     }
 
     /// Parses + validates a bitmap region (the `len` bytes preceding
     /// docStartFP-4). Returns None on ANY deviation — magic/version
-    /// mismatch, df != expected_df, cardinality != df, structural
-    /// violation, trailing bytes, or crc32 mismatch — the read side's
-    /// silent-fallback signal (spec §4 四重校验).
+    /// mismatch (v1 included: the version gate is the whole migration
+    /// story, M4 §3), df != expected_df, cardinality != df, structural
+    /// violation, or trailing bytes — the read side's silent-fallback
+    /// signal. v2 drops the crc32 check (triple gate: len bound →
+    /// magic/version → header df/card; 关键设计事实 3).
     pub fn deserialize(bytes: &[u8], expected_df: u32) -> Option<RoaringBitmap> {
-        if bytes.len() < 16 {
+        if bytes.len() < 12 {
             return None;
         }
-        let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
-        let stored_crc = u32::from_le_bytes(crc_bytes.try_into().ok()?);
-        if crc32fast::hash(body) != stored_crc {
-            return None;
-        }
-        let mut input = IndexInput::in_memory(body.to_vec());
+        let mut input = IndexInput::in_memory(bytes.to_vec());
         let mut magic = [0u8; 4];
         input.read_bytes(&mut magic).ok()?;
         if magic != BITMAP_MAGIC {
@@ -891,7 +891,7 @@ impl RoaringBitmap {
         if card_sum != card as u64 {
             return None;
         }
-        if input.file_pointer() != body.len() as u64 {
+        if input.file_pointer() != bytes.len() as u64 {
             return None; // trailing bytes: not one of our bitmaps
         }
         Some(RoaringBitmap {
@@ -1106,6 +1106,40 @@ mod tests {
         }
     }
 
+    /// Test-only v1-layout writer (M3 format): the v2 image with the
+    /// version byte rewound to 1 and crc32fast(header+payload) appended —
+    /// byte-for-byte what M3's serialize produced (the crc only trailed,
+    /// so all header/payload offsets are unchanged).
+    /// pub(crate): T2 的 `roaring::view::tests` 经
+    /// `use super::super::tests::serialize_v1_for_test` 跨模块复用——
+    /// 非 `roaring::tests` 的后代模块，私有 fn 不可见。
+    pub(crate) fn serialize_v1_for_test(b: &RoaringBitmap, df: u32) -> Vec<u8> {
+        let mut bytes = b.serialize(df);
+        bytes[4] = 1; // BITMAP_VERSION v1
+        let crc = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn v2_serialize_has_no_crc_and_rejects_v1() {
+        let docs = shaped_docs(&mut Rng(5), &[(0, 100), (1, 5000)]);
+        let b = RoaringBitmap::from_sorted_docs(&docs);
+        let v2 = b.serialize(docs.len() as u32);
+        assert_eq!(&v2[..4], b"RLBM");
+        assert_eq!(v2[4], 2, "format v2");
+        // round-trips under v2
+        let back = RoaringBitmap::deserialize(&v2, docs.len() as u32).unwrap();
+        assert_eq!(to_vec(&back), docs);
+        // the M3 v1 image (valid crc!) must be rejected at the version gate
+        let v1 = serialize_v1_for_test(&b, docs.len() as u32);
+        assert_eq!(v1[4], 1);
+        assert!(
+            RoaringBitmap::deserialize(&v1, docs.len() as u32).is_none(),
+            "v1 layout must be rejected even with a valid v1 crc"
+        );
+    }
+
     #[test]
     fn serialize_deserialize_round_trip() {
         let mut rng = Rng(5);
@@ -1123,13 +1157,10 @@ mod tests {
             assert_eq!(back.cardinality(), docs.len() as u64, "case {ci}");
             // wrong expected df -> None
             assert!(RoaringBitmap::deserialize(&bytes, docs.len() as u32 + 1).is_none());
-            // corrupted magic / version / crc / payload -> None
-            for (pos, tag) in [
-                (0usize, "magic"),
-                (4, "version"),
-                (bytes.len() - 1, "crc"),
-                (bytes.len() / 2, "payload"),
-            ] {
+            // corrupted magic / version -> None (v2: payload integrity is
+            // the .doc footer CRC's job; structural violations are covered
+            // by deserialize_rejects_structural_violations)
+            for (pos, tag) in [(0usize, "magic"), (4, "version")] {
                 let mut bad = bytes.clone();
                 bad[pos] ^= 0xFF;
                 assert!(
@@ -1146,8 +1177,8 @@ mod tests {
 
     #[test]
     fn max_bitmap_len_bound_holds() {
-        assert_eq!(max_bitmap_len(200_000), 24 + 4 * 8201);
-        assert_eq!(max_bitmap_len(1), 24 + 8201);
+        assert_eq!(max_bitmap_len(200_000), 20 + 4 * 8201);
+        assert_eq!(max_bitmap_len(1), 20 + 8201);
         let mut rng = Rng(31);
         // 3 containers of scattered dense values (all stay bitsets): bound
         // must hold for every max_doc >= the bitmap's doc space (3*65536)
@@ -1266,15 +1297,6 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_structural_violations() {
-        /// Recomputes the trailing crc32 so ONLY a structural check can
-        /// reject the bytes (a plain bit-flip is always caught by the crc).
-        fn with_fresh_crc(mut bytes: Vec<u8>) -> Vec<u8> {
-            let n = bytes.len();
-            let crc = crc32fast::hash(&bytes[..n - 4]);
-            bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
-            bytes
-        }
-
         // array with non-ascending elements (sole guard: the ascending
         // check) — layout: magic[0..4] ver[4] df[5] card[6] ncont[7]
         // key[8..10] type[10] card[11] elems[12..]
@@ -1283,7 +1305,6 @@ mod tests {
         assert_eq!(bytes[10], TYPE_ARRAY);
         let mut bad = bytes.clone();
         bad[14] = 5; // second element 20 -> 5: sequence 10,5,30
-        let bad = with_fresh_crc(bad);
         assert!(RoaringBitmap::deserialize(&bad, 3).is_none());
 
         // overlapping runs with the cardinality sum preserved (sole guard:
@@ -1298,7 +1319,6 @@ mod tests {
         // second run (200,300) -> (50,150): overlaps the first, sum == 202
         bad[20..22].copy_from_slice(&50u16.to_le_bytes());
         bad[22..24].copy_from_slice(&150u16.to_le_bytes());
-        let bad = with_fresh_crc(bad);
         assert!(RoaringBitmap::deserialize(&bad, 202).is_none());
 
         // bitset with a flipped word (sole guard: popcount == card)
@@ -1309,7 +1329,6 @@ mod tests {
         assert_eq!(bytes[12], TYPE_BITSET);
         let mut bad = bytes.clone();
         bad[16] ^= 0xFF; // inside the first word of the bitset image
-        let bad = with_fresh_crc(bad);
         assert!(RoaringBitmap::deserialize(&bad, n as u32).is_none());
     }
 }

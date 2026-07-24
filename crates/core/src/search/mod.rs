@@ -734,6 +734,84 @@ mod tests {
         fs::remove_dir_all(&root_on).unwrap();
     }
 
+    /// M4 v1 落档测试的 doctor helper：经 terms dict 定位 `term` 的
+    /// bitmap region（docStartFP-4 读 len 回退），把 version 字节改写为
+    /// `version`（codec 的 `postings::file_name` 是 pub(crate)，core 侧
+    /// 按 `{segment}_Lucene912_0.doc` 拼名——SEGMENT_SUFFIX 即
+    /// "Lucene912_0"，见 postings.rs:45-47）。
+    fn doctor_bitmap_version(root: &std::path::Path, field: &str, term: &[u8], version: u8) {
+        use codec_lucene9::field_infos::FieldInfos;
+        use codec_lucene9::segment_infos::SegmentInfos;
+        use codec_lucene9::terms_read::TermsDict;
+        let dir = FSDirectory::open(root).unwrap();
+        let (infos, _) = SegmentInfos::read_latest(&dir).unwrap();
+        let sci = &infos.segments[0];
+        let fis = FieldInfos::read(&dir, &sci.info.name, &sci.info.id, "").unwrap();
+        let mut dict = TermsDict::open(&dir, &sci.info.name, &sci.info.id, &fis).unwrap();
+        let fi = fis.by_name(field).unwrap();
+        let entry = dict.seek_exact(fi, term).unwrap().expect("term exists");
+        let fp = entry.state.doc_start_fp;
+        let doc_path = root.join(format!("{}_Lucene912_0.doc", sci.info.name));
+        let mut bytes = std::fs::read(&doc_path).unwrap();
+        let len =
+            u32::from_le_bytes(bytes[(fp - 4) as usize..fp as usize].try_into().unwrap()) as u64;
+        let start = (fp - 4 - len) as usize;
+        assert_eq!(&bytes[start..start + 4], b"RLBM");
+        bytes[start + 4] = version;
+        std::fs::write(&doc_path, &bytes).unwrap();
+    }
+
+    /// M4 §3/§7 v1 落档：bitmap 索引 doctor 回 v1（version 字节）后，v2
+    /// 读侧静默落 postings——路径断言不再是 Roaring 变体，全部查询结果
+    /// 与 bitmap-off 索引逐位一致。
+    #[test]
+    fn bitmap_v1_index_falls_back_to_postings() {
+        let root_off = temp_dir("v1off");
+        let root_on = temp_dir("v1on");
+        write_bitmap_corpus(&root_off, false);
+        write_bitmap_corpus(&root_on, true);
+        doctor_bitmap_version(&root_on, "message", b"hot", 1);
+
+        // 路径断言：hot 不再走 roaring（v1 region 被拒）
+        let dir = FSDirectory::open(&root_on).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        let it = Query::term("message", "hot")
+            .segment_iterator(seg, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(it, SegmentDocIter::Roaring(_)),
+            "v1 region must fall back to postings"
+        );
+        drop(reader);
+
+        // 全量等价：与 bitmap-off 索引逐位一致（PFOR 结果）
+        let mut s_off = Searcher::open(&FSDirectory::open(&root_off).unwrap()).unwrap();
+        let mut s_on = Searcher::open(&FSDirectory::open(&root_on).unwrap()).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::term("message", "hot"),
+            Query::term("message", "t3"),
+            Query::and("message", &["hot", "t3"]),
+            Query::or("message", &["hot", "t3"]),
+            Query::terms("message", &["hot", "t3", "nosuch"]),
+            Query::prefix("message", "ho"),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        assert_eq!(s_on.count(&Query::term("message", "hot")).unwrap(), 5000);
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
+
     /// M3 三档语料：hot 全量、scorching 覆盖 d>=500、warmN 每 7 个一轮。
     /// 每段固定 5000 doc → 多段时各段 df 仍 ≥ 4096（per-segment 判定）。
     fn write_tier_corpus(root: &std::path::Path, bitmap: bool, segments: u32) {

@@ -167,11 +167,14 @@ impl PostingsReader {
     }
 
     /// Reads + fully validates the inline roaring bitmap preceding this
-    /// term's postings (M3 §4): len bound → magic/version → header df ==
-    /// termState.doc_freq (+ cardinality == df) → crc32. ANY failure
-    /// yields `Ok(None)`, the caller's silent-fallback signal (spec §4:
-    /// 静默落档 postings，查询永不报错). Uses its own positioned slice of
-    /// the .doc stream (fresh_input pattern, postings_read.rs:135).
+    /// term's postings (M4 §3 格式 v2): len bound → magic/version (v1
+    /// rejected at the gate) → header df == termState.doc_freq (+
+    /// cardinality == df) → structural invariants. ANY failure yields
+    /// `Ok(None)`, the caller's silent-fallback signal (查询永不报错).
+    /// Uses its own positioned slice of the .doc stream (fresh_input
+    /// pattern, postings_read.rs:135). The query path switches to the
+    /// zero-copy view in T2; this stays until T4, which deletes it
+    /// together with the header path (T4 删除集合，关键设计事实 16).
     pub fn read_term_bitmap(
         &self,
         entry: &TermEntry,
@@ -1564,5 +1567,41 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&root2).unwrap();
+    }
+
+    /// M4 §3 版本即迁移：把盘上 bitmap region 的 version 字节改回 1（v1
+    /// 布局的判定点；v2 region 无 crc 可补，也无需补——version 检查先于
+    /// 一切），v2 读侧必须静默落档且 postings 本身逐 doc 不变。
+    #[test]
+    fn read_term_bitmap_falls_back_on_v1_layout() {
+        let root = temp_dir("bitmap-v1");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        let e = seek(&dir, &fis, "tx", b"hot");
+        // doctor the on-disk version byte 2 -> 1 (in place; the doctored
+        // index never goes through CheckIndex — footer CRC mismatch is
+        // expected and irrelevant here)
+        let fp = e.state.doc_start_fp;
+        let doc_file = root.join(crate::postings::file_name("_0", "doc"));
+        let mut bytes = fs::read(&doc_file).unwrap();
+        let len =
+            u32::from_le_bytes(bytes[(fp - 4) as usize..fp as usize].try_into().unwrap()) as u64;
+        let region_start = (fp - 4 - len) as usize;
+        assert_eq!(&bytes[region_start..region_start + 4], b"RLBM");
+        assert_eq!(bytes[region_start + 4], 2, "write side must emit v2");
+        bytes[region_start + 4] = 1;
+        fs::write(&doc_file, &bytes).unwrap();
+        // v2 reader: full + header paths both reject at the version gate
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        assert!(postings.read_term_bitmap(&e, 6000).unwrap().is_none());
+        assert_eq!(postings.read_term_bitmap_header(&e, 6000).unwrap(), None);
+        // fallback correctness: the postings themselves are untouched
+        let mut en = postings.docs_and_freqs(&e).unwrap();
+        for expected in 0..5000 {
+            assert_eq!(en.next_doc().unwrap(), expected);
+            assert_eq!(en.freq(), 1);
+        }
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

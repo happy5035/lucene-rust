@@ -215,6 +215,9 @@ pub struct PostingsWriter {
     max_num_impacts_level1: i32,
     max_impact_bytes_level1: i32,
     files: Vec<String>,
+    /// M3 §4: Some(t) → 对 df >= t 的 term 在 postings 之前内联写 roaring
+    /// bitmap；None（默认）→ .doc 字节与 M2 完全一致。
+    bitmap_threshold: Option<u32>,
 }
 
 impl PostingsWriter {
@@ -291,7 +294,15 @@ impl PostingsWriter {
                 file_name(segment, "tmd"),
                 file_name(segment, "psm"),
             ],
+            bitmap_threshold: None,
         })
+    }
+
+    /// Enables inline roaring bitmaps for terms with df >= threshold
+    /// (M3 §4, experimental; off by default). Chain right after `new`.
+    pub fn with_bitmap_threshold(mut self, threshold: Option<u32>) -> Self {
+        self.bitmap_threshold = threshold;
+        self
     }
 
     pub fn start_field(&mut self, field: &FieldInfo, doc_count: u32) -> io::Result<()> {
@@ -349,6 +360,16 @@ impl PostingsWriter {
         // --- .pos: full pfor chunks + tail (before .doc so skip fps are known)
         let (pos_start_fp, last_pos_block_offset, pos_block_index) =
             self.write_positions(docs, freqs, positions)?;
+
+        // --- inline roaring bitmap (M3 §4): written BEFORE docStartFP is
+        // captured, through the same ChecksumIndexOutput as the rest of
+        // .doc, so the footer CRC covers it (spec §4a.2). df==1 singletons
+        // have no .doc postings (finishTerm:518-525) and get no bitmap.
+        if let Some(t) = self.bitmap_threshold {
+            if doc_freq >= t && doc_freq > 1 {
+                crate::roaring::write_term_bitmap(&mut self.doc_out, docs)?;
+            }
+        }
 
         // --- .doc
         let doc_start_fp = self.doc_out.file_pointer();

@@ -1315,4 +1315,119 @@ mod tests {
         assert!(postings.positions(&e).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// 与 write_segment 同形，但开 bitmap（threshold=4096）：hot df=5000 命中，
+    /// warm df=200 与 big/tail/one 不命中。
+    fn write_segment_bitmap(dir: &FSDirectory) -> FieldInfos {
+        let id = [4u8; 16];
+        let kw = indexed("kw", 0, IndexOptions::Docs);
+        let tx = indexed("tx", 1, IndexOptions::DocsAndFreqs);
+        let mut w = PostingsWriter::new(dir, "_0", &id)
+            .unwrap()
+            .with_bitmap_threshold(Some(4096));
+        w.start_field(&kw, 6000).unwrap();
+        let big: Vec<u32> = (0..200).collect();
+        w.write_term(b"big", &big, &vec![1; 200], None).unwrap();
+        w.write_term(b"tail", &[10, 20, 30], &[1, 1, 1], None)
+            .unwrap();
+        w.finish_field().unwrap();
+        w.start_field(&tx, 6000).unwrap();
+        let hot: Vec<u32> = (0..5000).collect();
+        w.write_term(b"hot", &hot, &vec![1; 5000], None).unwrap();
+        w.write_term(b"one", &[42], &[7], None).unwrap();
+        let warm_docs: Vec<u32> = (0..200).map(|i| i * 3).collect();
+        let warm_freqs: Vec<u32> = (0..200).map(|i| (i % 5) + 1).collect();
+        w.write_term(b"warm", &warm_docs, &warm_freqs, None)
+            .unwrap();
+        w.finish_field().unwrap();
+        w.finish().unwrap();
+        let fis = FieldInfos::new(vec![kw, tx]);
+        fis.write(dir, "_0", &id, "").unwrap();
+        fis
+    }
+
+    /// 不经任何 M3 helper，手工按布局从 .doc 原始字节定位 bitmap region：
+    /// fp-4 读 len，region = [fp-4-len, fp-4)。
+    fn raw_bitmap_region(dir: &FSDirectory, doc_start_fp: u64) -> Option<Vec<u8>> {
+        let mut input = dir
+            .open_input(&crate::postings::file_name("_0", "doc"))
+            .unwrap();
+        if doc_start_fp < 4 {
+            return None;
+        }
+        input.seek(doc_start_fp - 4).unwrap();
+        let len = input.read_int().unwrap() as u32;
+        if len == 0 || len as u64 > crate::roaring::max_bitmap_len(6000) {
+            return None;
+        }
+        if doc_start_fp - 4 < len as u64 {
+            return None;
+        }
+        input.seek(doc_start_fp - 4 - len as u64).unwrap();
+        let mut buf = vec![0u8; len as usize];
+        input.read_bytes(&mut buf).unwrap();
+        Some(buf)
+    }
+
+    #[test]
+    fn inline_bitmap_region_round_trip() {
+        let root = temp_dir("bitmap");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        // postings 读侧零感知：open 的头/长度/footer 结构校验照常通过，
+        // 命中 term 的 postings 逐 doc 不变（缝隙字节不可见，spec §4a.1）。
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let mut en = postings.docs_and_freqs(&e).unwrap();
+        for expected in 0..5000 {
+            assert_eq!(en.next_doc().unwrap(), expected);
+            assert_eq!(en.freq(), 1);
+        }
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+
+        // 命中 term：docStartFP-4 处有合法 bitmap，内容 == postings
+        let region = raw_bitmap_region(&dir, e.state.doc_start_fp).expect("hot has a bitmap");
+        let bitmap = crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq)
+            .expect("hot bitmap must validate");
+        assert_eq!(bitmap.cardinality(), 5000);
+        let mut cur = bitmap.cursor();
+        for expected in 0..5000u32 {
+            assert_eq!(bitmap.cursor_next(&mut cur), Some(expected));
+        }
+        assert_eq!(bitmap.cursor_next(&mut cur), None);
+
+        // 未命中 term（df=200 < 4096）：同一手工定位流程必须校验失败
+        let e = seek(&dir, &fis, "tx", b"warm");
+        if let Some(region) = raw_bitmap_region(&dir, e.state.doc_start_fp) {
+            assert!(
+                crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none(),
+                "random postings bytes must not validate as a bitmap"
+            );
+        }
+
+        // .doc 全流 CRC（含 bitmap 字节）与 footer 记录一致：
+        // ChecksumIndexInput 顺序读完整个文件后 check_footer 通过
+        // （CodecUtil.writeCRC :643-650，正确性硬性要求 (d)）。
+        let raw = dir
+            .open_input(&crate::postings::file_name("_0", "doc"))
+            .unwrap();
+        let len = raw.length();
+        let mut input = crate::io::ChecksumIndexInput::new(raw);
+        input.skip_bytes(len - 16).unwrap();
+        crate::codec_util::check_footer(&mut input).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn no_bitmap_written_below_threshold_or_by_default() {
+        // 默认构造（不开 bitmap）：hot 的 docStartFP-4 处校验必失败
+        let root = temp_dir("bitmap-off");
+        let dir = FSDirectory::open(&root).unwrap();
+        let (fis, _, _) = write_segment(&dir);
+        let e = seek(&dir, &fis, "tx", b"hot");
+        if let Some(region) = raw_bitmap_region(&dir, e.state.doc_start_fp) {
+            assert!(crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none());
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

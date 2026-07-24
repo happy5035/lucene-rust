@@ -18,9 +18,9 @@
 //!
 //! ## Safety argument (module-level `allow(unsafe_code)`)
 //!
-//! The crate is `#![deny(unsafe_code)]`; this module is the third narrow
-//! exception (postings_ll/simd.rs, roaring/simd.rs — the latter deleted in
-//! T4). The single unsafe operation is `FrozenBitmap::view`'s
+//! The crate is `#![deny(unsafe_code)]`; this module and
+//! `postings_ll/simd.rs` are the two narrow exceptions. The single unsafe
+//! operation is `FrozenBitmap::view`'s
 //! `BitmapView::deserialize::<Frozen>`, whose contract (32B-aligned start,
 //! exact frozen length, valid frozen bytes — croaring-2.7.0
 //! src/bitmap/serialization.rs `impl ViewDeserializer for Frozen`) is

@@ -22,7 +22,7 @@
 //!
 //! ## Safety argument (module-level `allow(unsafe_code)`)
 //!
-//! The crate is `#![deny(unsafe_code)]`; this module and `roaring/simd.rs`
+//! The crate is `#![deny(unsafe_code)]`; this module and `roaring/frozen.rs`
 //! are the two narrow exceptions, and every unsafe operation is an AVX2/SSE
 //! intrinsic inside a
 //! `#[target_feature(enable = "avx2")]` function. Those functions are only

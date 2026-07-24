@@ -1453,7 +1453,7 @@ mod tests {
         let e = seek(&dir, &fis, "tx", b"warm");
         if let Some(region) = raw_bitmap_region(&dir, e.state.doc_start_fp) {
             assert!(
-                crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none(),
+                crate::roaring::parse_region(&region, e.doc_freq).is_none(),
                 "random postings bytes must not validate as a bitmap"
             );
         }
@@ -1479,7 +1479,7 @@ mod tests {
         let (fis, _, _) = write_segment(&dir);
         let e = seek(&dir, &fis, "tx", b"hot");
         if let Some(region) = raw_bitmap_region(&dir, e.state.doc_start_fp) {
-            assert!(crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none());
+            assert!(crate::roaring::parse_region(&region, e.doc_freq).is_none());
         }
         fs::remove_dir_all(&root).unwrap();
     }

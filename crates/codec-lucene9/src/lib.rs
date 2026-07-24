@@ -7,9 +7,10 @@
 //! `FSDirectory::open_input`) for the search read path.
 //! All format details follow the 9.12.3 sources, cited per item.
 
-// `deny` rather than `forbid` so the single AVX2 kernel module can opt back
-// in with a module-level `allow` — see postings_ll/simd.rs for the safety
-// argument and the exact boundary of the unsafe code.
+// `deny` rather than `forbid` so the two module-level exceptions —
+// postings_ll/simd.rs and roaring/frozen.rs — can opt back in with a
+// module-level `allow`; see each module for the safety argument and the
+// exact boundary of the unsafe code.
 #![deny(unsafe_code)]
 
 pub mod codec_util;
@@ -33,7 +34,6 @@ pub use directory::FSDirectory;
 pub use field_infos::{DocValuesType, FieldInfo, FieldInfos, IndexOptions};
 pub use io::{ChecksumIndexInput, ChecksumIndexOutput, DataInput, IndexInput, IndexOutput};
 pub use postings_read::{DocsEnum, DocsFreqsEnum, NO_MORE_DOCS, PostingsReader};
-pub use roaring::RoaringBitmap;
 pub use segment_info::SegmentInfo;
 pub use segment_infos::{SegmentCommitInfo, SegmentInfos};
 pub use stored_fields::{StoredField, StoredFieldsWriter};

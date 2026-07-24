@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, NO_MORE_DOCS};
-use codec_lucene9::roaring::{RoaringBitmap, RoaringCursor};
+use codec_lucene9::roaring::{RoaringBitmap, RoaringCursor, RoaringView, ViewCursor};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
@@ -567,6 +567,185 @@ impl DocIter for RoaringDocIter {
     }
 }
 
+// ── AND over views (M4 §5) ─────────────────────────────────────────────
+
+/// One merge-intersect / merge-union source (M4 §5): a full-mode bitmap
+/// view byte cursor, or a materialized low-df clause (df<4096, bounded).
+/// Both yield ascending docs with a forward-only advance.
+pub enum DocSource {
+    View {
+        view: Box<RoaringView>,
+        cur: ViewCursor,
+        doc: Option<u32>,
+    },
+    Slice {
+        docs: Vec<u32>,
+        pos: usize,
+    },
+}
+
+impl DocSource {
+    /// Full-mode view source, primed to its first doc. The view is boxed —
+    /// a probe/full view owns an IndexInput with an 8KB inline buffer
+    /// (关键设计事实 6).
+    pub fn view(view: RoaringView) -> DocSource {
+        let mut cur = view.cursor(); // full-mode contract (open_term_bitmap)
+        let doc = view.cursor_next(&mut cur);
+        DocSource::View {
+            view: Box::new(view),
+            cur,
+            doc,
+        }
+    }
+
+    /// Materialized low-df clause source (spec §5 档 2: df<4096 → ≤4095
+    /// docs, ascending by enum construction).
+    pub fn slice(docs: Vec<u32>) -> DocSource {
+        DocSource::Slice { docs, pos: 0 }
+    }
+
+    fn current(&self) -> Option<u32> {
+        match self {
+            DocSource::View { doc, .. } => *doc,
+            DocSource::Slice { docs, pos } => docs.get(*pos).copied(),
+        }
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            DocSource::View { view, cur, doc } => {
+                *doc = view.cursor_next(cur);
+                *doc
+            }
+            DocSource::Slice { docs, pos } => {
+                if *pos < docs.len() {
+                    *pos += 1;
+                }
+                docs.get(*pos).copied()
+            }
+        }
+    }
+
+    /// First doc >= target. Forward-only; idempotent when the current doc
+    /// is already at/past target (the merge dance re-syncs on agreement).
+    fn advance(&mut self, target: u32) -> Option<u32> {
+        match self {
+            DocSource::View { view, cur, doc } => {
+                // guard: cursor_advance requires target > last returned
+                if doc.is_some_and(|d| d >= target) {
+                    return *doc;
+                }
+                *doc = view.cursor_advance(cur, target);
+                *doc
+            }
+            DocSource::Slice { docs, pos } => {
+                *pos += docs[*pos..].partition_point(|&d| d < target);
+                docs.get(*pos).copied()
+            }
+        }
+    }
+}
+
+/// AND execution over views (M4 §5): merge-intersect over `sources`
+/// (full views + materialized slices); every agreed candidate is
+/// point-probed against each `probes` view (contains). Tier shapes:
+/// 档 1 偏斜 → sources=[最小侧 full], probes=其余；档 1 非偏斜 →
+/// sources=全部 full, probes=[]；档 2 → sources=物化 slices,
+/// probes=bitmap 子句. freq() is 1 (ConstantScore, trait default).
+pub struct RoaringAndDocIter {
+    sources: Vec<DocSource>,
+    probes: Vec<Box<RoaringView>>,
+    doc: i32,
+}
+
+impl RoaringAndDocIter {
+    pub fn new(sources: Vec<DocSource>, probes: Vec<RoaringView>) -> RoaringAndDocIter {
+        debug_assert!(!sources.is_empty());
+        RoaringAndDocIter {
+            sources,
+            probes: probes.into_iter().map(Box::new).collect(),
+            doc: -1,
+        }
+    }
+}
+
+impl DocIter for RoaringAndDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 {
+            // move every source sitting on the last emitted doc past it
+            let last = self.doc as u32;
+            for s in &mut self.sources {
+                if s.current() == Some(last) && s.next().is_none() {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+            }
+        }
+        'outer: loop {
+            // conjunction: agree on the max current doc
+            let mut target = 0u32;
+            for s in &self.sources {
+                let Some(d) = s.current() else {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                };
+                target = target.max(d);
+            }
+            let mut agreed = true;
+            for s in &mut self.sources {
+                if s.current() < Some(target) {
+                    match s.advance(target) {
+                        Some(d) if d == target => {}
+                        Some(_) => agreed = false, // overshot: new candidate, re-sync
+                        None => {
+                            self.doc = NO_MORE_DOCS;
+                            return Ok(NO_MORE_DOCS);
+                        }
+                    }
+                }
+            }
+            if !agreed {
+                continue 'outer;
+            }
+            // point-probe the agreed candidate against every bitmap clause
+            let mut pass = true;
+            for p in &mut self.probes {
+                if !p.contains(target)? {
+                    pass = false;
+                    break;
+                }
+            }
+            if pass {
+                self.doc = target as i32;
+                return Ok(self.doc);
+            }
+            // rejected: move the first (cheapest) source past the candidate
+            if self.sources[0].next().is_none() {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+        }
+    }
+
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target || self.doc == NO_MORE_DOCS {
+            return Ok(self.doc);
+        }
+        for s in &mut self.sources {
+            s.advance(target.max(0) as u32);
+        }
+        self.doc = -1;
+        self.next_doc()
+    }
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
@@ -578,6 +757,7 @@ pub enum SegmentDocIter {
     Bitset(BitsetDocIter),
     Phrase(PhraseDocIter),
     Roaring(RoaringDocIter),
+    RoaringAnd(RoaringAndDocIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -591,6 +771,7 @@ impl DocIter for SegmentDocIter {
             Self::Bitset(b) => b.doc_id(),
             Self::Phrase(p) => p.doc_id(),
             Self::Roaring(r) => r.doc_id(),
+            Self::RoaringAnd(a) => a.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -603,6 +784,7 @@ impl DocIter for SegmentDocIter {
             Self::Bitset(b) => b.next_doc(),
             Self::Phrase(p) => p.next_doc(),
             Self::Roaring(r) => r.next_doc(),
+            Self::RoaringAnd(a) => a.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -615,6 +797,7 @@ impl DocIter for SegmentDocIter {
             Self::Bitset(b) => b.advance(t),
             Self::Phrase(p) => p.advance(t),
             Self::Roaring(r) => r.advance(t),
+            Self::RoaringAnd(a) => a.advance(t),
         }
     }
     fn freq(&self) -> u32 {

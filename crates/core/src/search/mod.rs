@@ -846,11 +846,11 @@ mod tests {
         let dir_on = FSDirectory::open(&root_on).unwrap();
         let mut reader = Reader::open(&dir_on).unwrap();
         let (_base, seg) = reader.leaves().next().unwrap();
-        // 档 1：两个子句都有 bitmap
+        // 档 1：两个子句都有 bitmap（M4：RoaringAnd = 字节游标 + probe）
         let q = Query::and("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
             "tier-1 AND must be roaring"
         );
         let q = Query::or("message", &["hot", "scorching"]);
@@ -863,7 +863,7 @@ mod tests {
         let q = Query::and("message", &["hot", "warm3"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
             "tier-2 mixed AND must be roaring"
         );
         let q = Query::or("message", &["scorching", "warm3"]);
@@ -940,6 +940,77 @@ mod tests {
         assert_eq!(
             s.count(&Query::and("message", &["hot", "warm3"])).unwrap(),
             714
+        );
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
+
+    /// M4 §5 skew 语料：20000 doc；rare df=4500（doc 0..4500）、common
+    /// df=20000（全量）——都 ≥4096 有 bitmap，df 比 4.44 ≥ SKEW_RATIO →
+    /// 档 1 偏斜：小侧全量模式迭代 + 大侧 contains probe。
+    fn write_skew_corpus(root: &std::path::Path, bitmap: bool) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema(), cfg).unwrap();
+        for d in 0..20000u32 {
+            let msg = if d < 4500 { "common rare" } else { "common" };
+            w.add_document(doc("INFO", &format!("tid-{d}"), msg))
+                .unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    /// 偏斜 probe（RoaringAnd 路径）与 bitmap-off PFOR 结果逐位一致，
+    /// 锚点 count 钉死语义（交集 = rare 全集 4500，并集 = common 全集 20000）。
+    #[test]
+    fn and_skew_probe_matches_pfor() {
+        let root_off = temp_dir("skewoff");
+        let root_on = temp_dir("skewon");
+        write_skew_corpus(&root_off, false);
+        write_skew_corpus(&root_on, true);
+
+        // 路径断言：skew AND 走 RoaringAnd（probe 形态由 T5 bench 标定）
+        let dir = FSDirectory::open(&root_on).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        let it = Query::and("message", &["rare", "common"])
+            .segment_iterator(seg, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
+            "skew AND must be roaring"
+        );
+        drop(reader);
+
+        let mut s_off = Searcher::open(&FSDirectory::open(&root_off).unwrap()).unwrap();
+        let mut s_on = Searcher::open(&FSDirectory::open(&root_on).unwrap()).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::and("message", &["rare", "common"]), // skew probe
+            Query::and("message", &["common", "rare"]), // 子句顺序无关
+            Query::or("message", &["rare", "common"]),  // OR（本任务仍折叠引擎）
+            Query::term("message", "rare"),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 25000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 25000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        assert_eq!(
+            s_on.count(&Query::and("message", &["rare", "common"]))
+                .unwrap(),
+            4500
+        );
+        assert_eq!(
+            s_on.count(&Query::or("message", &["rare", "common"]))
+                .unwrap(),
+            20000
         );
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();

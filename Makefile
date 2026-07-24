@@ -19,6 +19,7 @@ log-test: build java-classes
 	interop/verify-log.sh 200000 43 --positions
 	interop/verify-log.sh 200000 44 --sparse
 	interop/verify-log.sh 200000 45 --bigdict
+	interop/verify-log.sh 200000 46 --bitmap
 
 # M4 log-scenario benchmark: same corpus on both sides
 LOGDOCS ?= 1000000

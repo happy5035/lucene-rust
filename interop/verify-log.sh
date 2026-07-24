@@ -2,7 +2,7 @@
 # M2 interop: Rust writes a log-schema index -> Java CheckIndex + query dump;
 # Java writes the same corpus with stock Lucene -> CheckIndex + query dump;
 # the two dumps must be identical.
-# Usage: interop/verify-log.sh [numDocs] [seed] [--positions]
+# Usage: interop/verify-log.sh [numDocs] [seed] [--positions|--sparse|--bigdict|--bitmap]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,5 +39,24 @@ cat /tmp/rl-log-rust.out
 
 echo "== Search diff: searchdump vs VerifySearchIndex"
 "$ROOT/interop/verify-search.sh" "$RUST_DIR" "$JAVA_DIR" "$NUM_DOCS" "$SEED" "$POSITIONS"
+
+if [ "$POSITIONS" = "--bitmap" ]; then
+  echo "== Bitmap A/B: Rust searchdump bitmap on vs off (RL_BITMAP=0)"
+  cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
+    searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" > /tmp/rl-search-bitmap-on.out
+  RL_BITMAP=0 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
+    searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" > /tmp/rl-search-bitmap-off.out
+  diff -u /tmp/rl-search-bitmap-on.out /tmp/rl-search-bitmap-off.out
+
+  echo "== Java forceMerge on the Rust --bitmap index"
+  java -cp "$CP" ForceMergeIndex "$RUST_DIR"
+  echo "== CheckIndex post-merge $RUST_DIR"
+  java -cp "$CP" org.apache.lucene.index.CheckIndex "$RUST_DIR" 2>&1 \
+    | grep -E "No problems|FAILED|error" || true
+  java -cp "$CP" org.apache.lucene.index.CheckIndex "$RUST_DIR" > /dev/null 2>&1
+
+  echo "== Post-merge search diff (merged index carries no bitmaps)"
+  "$ROOT/interop/verify-search.sh" "$RUST_DIR" "$JAVA_DIR" "$NUM_DOCS" "$SEED" ""
+fi
 
 echo "LOG_INTEROP_OK"

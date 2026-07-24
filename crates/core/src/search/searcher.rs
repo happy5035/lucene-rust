@@ -11,6 +11,7 @@ use super::collector::{Collector, CountCollector, FreqSumCollector, TopDocCollec
 use super::doc_iter::DocIter;
 use super::query::Query;
 use super::reader::Reader;
+use super::roaring_exec;
 
 pub struct Searcher {
     reader: Reader,
@@ -93,6 +94,35 @@ impl Searcher {
                 }
             }
             return Ok(total);
+        }
+        // M3 §5: And/Or count 与迭代共用一套三档引擎——任一子句有 bitmap
+        // 即折出 cardinality（档 1/2），否则按段迭代（档 3，既有行为）。
+        if let Query::And { field, terms } | Query::Or { field, terms } = query {
+            if terms.len() >= 2 {
+                let is_and = matches!(query, Query::And { .. });
+                let mut total = 0u64;
+                for (_doc_base, seg) in self.reader.leaves() {
+                    let Some((has_freqs, entries)) =
+                        roaring_exec::collect_bool_entries(seg, field, terms, is_and)?
+                    else {
+                        continue; // 空段结果（未知字段 / AND 缺子句 / OR 全缺）
+                    };
+                    if let Some(c) = roaring_exec::count(seg, &entries, has_freqs, is_and)? {
+                        total += c;
+                        continue;
+                    }
+                    if let Some(mut iter) = query.segment_iterator(seg, false)? {
+                        loop {
+                            let doc = iter.next_doc()?;
+                            if doc == NO_MORE_DOCS {
+                                break;
+                            }
+                            total += 1;
+                        }
+                    }
+                }
+                return Ok(total);
+            }
         }
         let mut c = CountCollector::default();
         self.search(query, &mut c)?;

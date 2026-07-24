@@ -269,9 +269,40 @@ pub(crate) fn bitset_count(
     ))
 }
 
+/// Per-term postings doc scan shared by the M2 bitset materialization and
+/// the M3 tier-2 roaring materialization: feeds every doc of `entry`'s
+/// postings to `f` in ascending order. Uses no-freq enums on freqs fields —
+/// the materialized sets carry no per-doc freq (ConstantScore).
+pub(crate) fn for_each_doc(
+    seg: &SegmentReader,
+    entry: &TermEntry,
+    has_freqs: bool,
+    f: &mut impl FnMut(u32),
+) -> io::Result<()> {
+    if has_freqs {
+        let mut en = seg.docs_freqs_enum(entry, false)?;
+        loop {
+            let d = en.next_doc()?;
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            f(d as u32);
+        }
+    } else {
+        let mut en = seg.docs_enum(entry)?;
+        loop {
+            let d = en.next_doc()?;
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            f(d as u32);
+        }
+    }
+    Ok(())
+}
+
 /// Bitset materialization (spec §4): per-term full postings scan, one bit
-/// per hit doc. Uses no-freq enums on freqs fields — the bitset carries no
-/// per-doc freq (ConstantScore).
+/// per hit doc.
 pub(crate) fn materialize(
     seg: &SegmentReader,
     entries: &[(u32, TermEntry)],
@@ -279,25 +310,7 @@ pub(crate) fn materialize(
 ) -> io::Result<FixedBitSet> {
     let mut bits = FixedBitSet::new(seg.max_doc() as usize);
     for (_, entry) in entries {
-        if has_freqs {
-            let mut en = seg.docs_freqs_enum(entry, false)?;
-            loop {
-                let d = en.next_doc()?;
-                if d == NO_MORE_DOCS {
-                    break;
-                }
-                bits.set(d as usize);
-            }
-        } else {
-            let mut en = seg.docs_enum(entry)?;
-            loop {
-                let d = en.next_doc()?;
-                if d == NO_MORE_DOCS {
-                    break;
-                }
-                bits.set(d as usize);
-            }
-        }
+        for_each_doc(seg, entry, has_freqs, &mut |d| bits.set(d as usize))?;
     }
     Ok(bits)
 }

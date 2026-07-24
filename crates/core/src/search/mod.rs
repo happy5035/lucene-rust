@@ -8,6 +8,7 @@ pub mod doc_iter;
 pub mod multi_term;
 pub mod query;
 pub mod reader;
+pub(crate) mod roaring_exec;
 pub mod searcher;
 pub mod segment_reader;
 
@@ -729,6 +730,171 @@ mod tests {
             s_off.count(&Query::term("message", "t3")).unwrap()
         );
         assert_eq!(s_on.count(&Query::term("message", "nosuch")).unwrap(), 0);
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
+
+    /// M3 三档语料：hot 全量、scorching 覆盖 d>=500、warmN 每 7 个一轮。
+    /// 每段固定 5000 doc → 多段时各段 df 仍 ≥ 4096（per-segment 判定）。
+    fn write_tier_corpus(root: &std::path::Path, bitmap: bool, segments: u32) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema(), cfg).unwrap();
+        for seg_i in 0..segments {
+            for i in 0..5000u32 {
+                let d = seg_i * 5000 + i;
+                let mut msg = String::from("hot");
+                if d >= 500 {
+                    msg.push_str(" scorching");
+                }
+                msg.push_str(&format!(" warm{}", d % 7));
+                w.add_document(doc("INFO", &format!("tid-{d}"), &msg))
+                    .unwrap();
+            }
+            w.commit().unwrap(); // 每段独立 flush → per-segment 三档判定
+        }
+        drop(w);
+    }
+
+    /// 三档路径 + on/off 全量等价（spec §8 Rust 对拍的单测形态）。
+    #[test]
+    fn bool_query_three_tier_roaring() {
+        let root_off = temp_dir("tieroff");
+        let root_on = temp_dir("tieron");
+        write_tier_corpus(&root_off, false, 1);
+        write_tier_corpus(&root_on, true, 1);
+
+        // —— 路径断言（bitmap 索引）——
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut reader = Reader::open(&dir_on).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        // 档 1：两个子句都有 bitmap
+        let q = Query::and("message", &["hot", "scorching"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "tier-1 AND must be roaring"
+        );
+        let q = Query::or("message", &["hot", "scorching"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "tier-1 OR must be roaring"
+        );
+        // 档 2：hot 有 bitmap、warm3 无（df≈714）→ 物化后统一 roaring
+        let q = Query::and("message", &["hot", "warm3"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "tier-2 mixed AND must be roaring"
+        );
+        let q = Query::or("message", &["scorching", "warm3"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "tier-2 mixed OR must be roaring"
+        );
+        // 档 3：两个子句都无 bitmap → 既有 PFOR 路径（非 Roaring 变体）
+        let q = Query::and("message", &["warm1", "warm3"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            !matches!(it, SegmentDocIter::Roaring(_)),
+            "tier-3 stays PFOR conjunction"
+        );
+        // needs_freq=true：永不走 roaring（bitmap 无 freq）
+        let q = Query::and("message", &["hot", "scorching"]);
+        let it = q.segment_iterator(seg, true).unwrap().unwrap();
+        assert!(
+            !matches!(it, SegmentDocIter::Roaring(_)),
+            "needs_freq stays postings"
+        );
+        // 缺失子句：AND → None（空结果）；OR → 跳过缺失项后档 1
+        let q = Query::and("message", &["hot", "nosuch"]);
+        assert!(q.segment_iterator(seg, false).unwrap().is_none());
+        let q = Query::or("message", &["scorching", "nosuch"]);
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "OR with one present bitmap clause"
+        );
+        drop(reader);
+
+        // —— on/off 全量等价（count + 完整 doc 序列）——
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let dir_on2 = FSDirectory::open(&root_on).unwrap();
+        let mut s_on = Searcher::open(&dir_on2).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::and("message", &["hot", "scorching"]), // 档 1 AND
+            Query::or("message", &["hot", "scorching"]),  // 档 1 OR
+            Query::and("message", &["hot", "warm3"]),     // 档 2 AND
+            Query::or("message", &["scorching", "warm3"]), // 档 2 OR
+            Query::or("message", &["hot", "warm0", "warm1"]), // 档 2 三子句
+            Query::and("message", &["hot", "scorching", "warm5"]), // 档 2 三子句
+            Query::and("message", &["warm1", "warm3"]),   // 档 3 AND
+            Query::or("message", &["warm1", "warm3"]),    // 档 3 OR
+            Query::and("message", &["hot", "nosuch"]),    // 空
+            Query::or("message", &["scorching", "nosuch"]), // 单子句有效
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        // 数值锚点（独立推演的期望，防 on/off 同错）：
+        let dir_on3 = FSDirectory::open(&root_on).unwrap();
+        let mut s = Searcher::open(&dir_on3).unwrap();
+        assert_eq!(
+            s.count(&Query::and("message", &["hot", "scorching"]))
+                .unwrap(),
+            4500
+        );
+        assert_eq!(
+            s.count(&Query::or("message", &["hot", "scorching"]))
+                .unwrap(),
+            5000
+        );
+        assert_eq!(
+            s.count(&Query::and("message", &["hot", "warm3"])).unwrap(),
+            714
+        );
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
+
+    /// 多段：三档判定按段独立（spec §5），docBase 映射不变。
+    #[test]
+    fn bool_query_roaring_multi_segment() {
+        let root_off = temp_dir("tiermsoff");
+        let root_on = temp_dir("tiermson");
+        // 两段各 5000 doc → 每段 hot df=5000、scorching df=4500，两段都有 bitmap
+        write_tier_corpus(&root_off, false, 2);
+        write_tier_corpus(&root_on, true, 2);
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut s_on = Searcher::open(&dir_on).unwrap();
+        assert_eq!(s_on.segment_count(), 2);
+        let battery: Vec<Query> = vec![
+            Query::and("message", &["hot", "scorching"]),
+            Query::or("message", &["hot", "warm3"]),
+            Query::and("message", &["hot", "warm3"]),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 12000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 12000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }

@@ -8,6 +8,7 @@ use super::doc_iter::{
     SegmentDocIter,
 };
 use super::multi_term;
+use super::roaring_exec;
 use super::segment_reader::SegmentReader;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,56 +145,8 @@ impl Query {
                     Ok(Some(SegmentDocIter::Docs(seg.docs_enum(&entry)?)))
                 }
             }
-            Query::And { field, terms } => {
-                if terms.len() < 2 {
-                    return if let Some(t) = terms.first() {
-                        Query::Term {
-                            field: field.clone(),
-                            term: t.clone(),
-                        }
-                        .segment_iterator(seg, needs_freq)
-                    } else {
-                        Ok(None)
-                    };
-                }
-                let mut entries: Vec<(u32, codec_lucene9::terms_read::TermEntry)> = Vec::new();
-                for t in terms {
-                    let Some((_, entry)) = seg.seek_term(field, t)? else {
-                        return Ok(None);
-                    };
-                    entries.push((entry.doc_freq, entry));
-                }
-                entries.sort_by_key(|(df, _)| *df);
-                Ok(Some(SegmentDocIter::And(ConjunctionDocIter::new(
-                    seg, field, &entries, needs_freq,
-                )?)))
-            }
-            Query::Or { field, terms } => {
-                if terms.len() < 2 {
-                    return if let Some(t) = terms.first() {
-                        Query::Term {
-                            field: field.clone(),
-                            term: t.clone(),
-                        }
-                        .segment_iterator(seg, needs_freq)
-                    } else {
-                        Ok(None)
-                    };
-                }
-                let mut entries: Vec<(u32, codec_lucene9::terms_read::TermEntry)> = Vec::new();
-                for t in terms {
-                    if let Some((_, entry)) = seg.seek_term(field, t)? {
-                        entries.push((entry.doc_freq, entry));
-                    }
-                }
-                if entries.is_empty() {
-                    return Ok(None);
-                }
-                entries.sort_by_key(|(df, _)| *df);
-                Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(
-                    seg, field, &entries, needs_freq,
-                )?)))
-            }
+            Query::And { field, terms } => and_segment_iterator(seg, field, terms, needs_freq),
+            Query::Or { field, terms } => or_segment_iterator(seg, field, terms, needs_freq),
             Query::Terms { field, terms } => {
                 if terms.is_empty() {
                     return Ok(None);
@@ -241,4 +194,76 @@ impl Query {
             }
         }
     }
+}
+
+/// And/Or arm bodies of `Query::segment_iterator`, outlined into their own
+/// frames: `SegmentDocIter` is 18.7KB (every postings enum owns an
+/// `IndexInput` with an 8KB inline buffer) and a debug build gives each
+/// arm's temporaries disjoint slots in the one dispatcher frame, so inlining
+/// the M3 roaring temporaries into both arms pushed the
+/// Terms/Prefix/Wildcard → Or → Term rewrite chain over the 2MiB default
+/// test-thread stack. The bodies are the spec §5 three-tier rule, per arm.
+fn and_segment_iterator(
+    seg: &mut SegmentReader,
+    field: &String,
+    terms: &[Vec<u8>],
+    needs_freq: bool,
+) -> io::Result<Option<SegmentDocIter>> {
+    if terms.len() < 2 {
+        return if let Some(t) = terms.first() {
+            Query::Term {
+                field: field.clone(),
+                term: t.clone(),
+            }
+            .segment_iterator(seg, needs_freq)
+        } else {
+            Ok(None)
+        };
+    }
+    let Some((has_freqs, entries)) = roaring_exec::collect_bool_entries(seg, field, terms, true)?
+    else {
+        return Ok(None);
+    };
+    // M3 §5 档 1/2（bitmap 无 freq：needs_freq 永远档 3）
+    if !needs_freq {
+        if let Some(it) = roaring_exec::segment_iterator(seg, &entries, has_freqs, true)? {
+            return Ok(Some(it));
+        }
+    }
+    Ok(Some(SegmentDocIter::And(ConjunctionDocIter::new(
+        seg, field, &entries, needs_freq,
+    )?)))
+}
+
+/// See `and_segment_iterator` — the Or half of the same rule.
+fn or_segment_iterator(
+    seg: &mut SegmentReader,
+    field: &String,
+    terms: &[Vec<u8>],
+    needs_freq: bool,
+) -> io::Result<Option<SegmentDocIter>> {
+    if terms.len() < 2 {
+        return if let Some(t) = terms.first() {
+            Query::Term {
+                field: field.clone(),
+                term: t.clone(),
+            }
+            .segment_iterator(seg, needs_freq)
+        } else {
+            Ok(None)
+        };
+    }
+    let Some((has_freqs, entries)) = roaring_exec::collect_bool_entries(seg, field, terms, false)?
+    else {
+        return Ok(None);
+    };
+    // M3 §5 档 1/2
+    if !needs_freq {
+        if let Some(it) = roaring_exec::segment_iterator(seg, &entries, has_freqs, false)? {
+            return Ok(Some(it));
+        }
+    }
+    Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(
+        seg, field, &entries, needs_freq,
+    )?)))
 }

@@ -5,7 +5,8 @@
 //! builds `Bitmap::of` → `run_optimize` → `shrink_to_fit` → Frozen
 //! serialize; the read side opens zero-copy frozen views over a 32B-aligned
 //! buffer copy (`roaring/frozen.rs`, the crate's third module-level
-//! `#[allow(unsafe_code)]`). The self-built container library below
+//! `#[allow(unsafe_code)]`). Frozen view read side lives in
+//! `roaring/frozen.rs` (M5 T2). The self-built container library below
 //! (Container/RoaringBitmap/RoaringCursor, wire v2 pinned at
 //! SELF_BUILT_WIRE_VERSION) is transitional — it only serves its own
 //! tests until T4 deletes it together with roaring/simd.rs and
@@ -15,9 +16,11 @@ use std::io;
 
 use crate::io::{DataInput, DataOutput, IndexInput, IndexOutput};
 
+mod frozen;
 mod simd;
 pub mod view;
 
+pub use frozen::FrozenBitmap;
 pub use view::{RoaringView, ViewCursor};
 
 /// Bitmap-source read gate (spec §5): only terms with df >= this threshold
@@ -944,6 +947,36 @@ pub fn write_term_bitmap(out: &mut impl DataOutput, docs: &[u32]) -> io::Result<
     out.write_bytes(&bytes)?;
     out.write_int(bytes.len() as i32)?;
     Ok(())
+}
+
+/// Parses + validates a v3 bitmap region (the `len` bytes preceding
+/// docStartFP-4; M5 §3): magic → version (!= 3, v1/v2 included → None,
+/// the whole migration story) → df == expected_df → card == df → frozen
+/// payload open (structural pre-validation + cardinality recheck,
+/// frozen.rs). None = the read side's silent-fallback signal.
+pub fn parse_region(region: &[u8], expected_df: u32) -> Option<FrozenBitmap> {
+    // magic 4 + version 1 + df/card ≥ 1B each + frozen header 4
+    if region.len() < 11 {
+        return None;
+    }
+    let mut input = IndexInput::in_memory(region.to_vec());
+    let mut magic = [0u8; 4];
+    input.read_bytes(&mut magic).ok()?;
+    if magic != BITMAP_MAGIC {
+        return None;
+    }
+    if input.read_byte().ok()? != BITMAP_VERSION {
+        return None;
+    }
+    let df = input.read_vint().ok()? as u32;
+    if df != expected_df {
+        return None;
+    }
+    let card = input.read_vint().ok()? as u32;
+    if card != df {
+        return None; // docs-only bitmap: cardinality == df
+    }
+    FrozenBitmap::open(&region[input.file_pointer() as usize..], expected_df)
 }
 
 #[cfg(test)]

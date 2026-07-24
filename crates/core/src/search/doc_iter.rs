@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, NO_MORE_DOCS};
-use codec_lucene9::roaring::{RoaringView, ViewCursor};
+use codec_lucene9::roaring::FrozenBitmap;
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
@@ -513,27 +513,81 @@ impl DocIter for PhraseDocIter {
     // calls next_doc; freq: 1 (ConstantScore, trait default).
 }
 
-// ── Roaring (inline term bitmap view, M4 §6) ─────────────────────────
+// ── Roaring (inline term bitmap, M5 §2 croaring frozen view) ─────────
 
-/// DocIter over a term's inline bitmap (M4 §6): wraps the zero-copy
-/// full-mode view's byte cursor — next_doc/advance delegate to the
-/// view's `cursor_next`/`cursor_advance` (the M3 `RoaringCursor`
-/// contract, 关键设计事实 8). The view is boxed: `SegmentDocIter` size
-/// discipline (关键设计事实 6). freq() is 1 — the bitmap carries no
-/// freqs, and needs_freq paths never get this iterator (correctness
+/// Batch-refill cursor over a `FrozenBitmap` (M5 T2, 关键设计事实 5):
+/// the ~60ns frozen-view create is amortized over a 512-doc batch; each
+/// refill is a container-level `reset_at_or_after` seek + bulk
+/// `next_many`. docs are < max_doc <= i32::MAX, so `d + 1` never
+/// overflows u32.
+pub struct BitmapCursor {
+    bitmap: FrozenBitmap,
+    buf: Vec<u32>,
+    pos: usize,
+    end: usize,
+    next_from: u32,
+    exhausted: bool,
+}
+
+const BITMAP_ITER_BATCH: usize = 512;
+
+impl BitmapCursor {
+    fn new(bitmap: FrozenBitmap) -> BitmapCursor {
+        BitmapCursor {
+            bitmap,
+            buf: vec![0; BITMAP_ITER_BATCH],
+            pos: 0,
+            end: 0,
+            next_from: 0,
+            exhausted: false,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.end = self.bitmap.docs_from(self.next_from, &mut self.buf);
+        self.pos = 0;
+        if self.end == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        true
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        if self.pos >= self.end && !self.refill() {
+            return None;
+        }
+        let d = self.buf[self.pos];
+        self.pos += 1;
+        self.next_from = d + 1;
+        Some(d)
+    }
+
+    /// First doc >= target. Forward-only: discards the buffered tail and
+    /// re-seeks (the merge dance's resync pattern, M4 关键设计事实 8).
+    fn advance(&mut self, target: u32) -> Option<u32> {
+        self.pos = self.end;
+        self.next_from = target;
+        self.next()
+    }
+}
+
+/// DocIter over a term's inline bitmap (M5 §2 Term 路径): wraps the
+/// frozen view's batch cursor. freq() is 1 — the bitmap carries no freqs,
+/// and needs_freq paths never get this iterator (correctness
 /// requirement (e)).
 pub struct RoaringDocIter {
-    view: Box<RoaringView>,
-    cursor: ViewCursor,
+    cur: BitmapCursor,
     doc: i32,
 }
 
 impl RoaringDocIter {
-    pub fn new(view: RoaringView) -> RoaringDocIter {
-        let cursor = view.cursor(); // full-mode contract (open_term_bitmap)
+    pub fn new(bitmap: FrozenBitmap) -> RoaringDocIter {
         RoaringDocIter {
-            view: Box::new(view),
-            cursor,
+            cur: BitmapCursor::new(bitmap),
             doc: -1,
         }
     }
@@ -548,7 +602,7 @@ impl DocIter for RoaringDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
-        self.doc = match self.view.cursor_next(&mut self.cursor) {
+        self.doc = match self.cur.next() {
             Some(d) => d as i32,
             None => NO_MORE_DOCS,
         };
@@ -557,10 +611,7 @@ impl DocIter for RoaringDocIter {
 
     fn advance(&mut self, target: i32) -> io::Result<i32> {
         if target > self.doc {
-            self.doc = match self
-                .view
-                .cursor_advance(&mut self.cursor, target.max(0) as u32)
-            {
+            self.doc = match self.cur.advance(target.max(0) as u32) {
                 Some(d) => d as i32,
                 None => NO_MORE_DOCS,
             };
@@ -571,33 +622,20 @@ impl DocIter for RoaringDocIter {
 
 // ── AND over views (M4 §5) ─────────────────────────────────────────────
 
-/// One merge-intersect / merge-union source (M4 §5): a full-mode bitmap
-/// view byte cursor, or a materialized low-df clause (df<4096, bounded).
-/// Both yield ascending docs with a forward-only advance.
+/// One merge-intersect / merge-union source (M5 §2): a frozen-view batch
+/// cursor, or a materialized low-df clause (df<4096, bounded). Both yield
+/// ascending docs with a forward-only advance.
 pub enum DocSource {
-    View {
-        view: Box<RoaringView>,
-        cur: ViewCursor,
-        doc: Option<u32>,
-    },
-    Slice {
-        docs: Vec<u32>,
-        pos: usize,
-    },
+    Bitmap { cur: BitmapCursor, doc: Option<u32> },
+    Slice { docs: Vec<u32>, pos: usize },
 }
 
 impl DocSource {
-    /// Full-mode view source, primed to its first doc. The view is boxed —
-    /// a probe/full view owns an IndexInput with an 8KB inline buffer
-    /// (关键设计事实 6).
-    pub fn view(view: RoaringView) -> DocSource {
-        let mut cur = view.cursor(); // full-mode contract (open_term_bitmap)
-        let doc = view.cursor_next(&mut cur);
-        DocSource::View {
-            view: Box::new(view),
-            cur,
-            doc,
-        }
+    /// Frozen-view source, primed to its first doc.
+    pub fn bitmap(bitmap: FrozenBitmap) -> DocSource {
+        let mut cur = BitmapCursor::new(bitmap);
+        let doc = cur.next();
+        DocSource::Bitmap { cur, doc }
     }
 
     /// Materialized low-df clause source (spec §5 档 2: df<4096 → ≤4095
@@ -608,15 +646,15 @@ impl DocSource {
 
     fn current(&self) -> Option<u32> {
         match self {
-            DocSource::View { doc, .. } => *doc,
+            DocSource::Bitmap { doc, .. } => *doc,
             DocSource::Slice { docs, pos } => docs.get(*pos).copied(),
         }
     }
 
     fn next(&mut self) -> Option<u32> {
         match self {
-            DocSource::View { view, cur, doc } => {
-                *doc = view.cursor_next(cur);
+            DocSource::Bitmap { cur, doc } => {
+                *doc = cur.next();
                 *doc
             }
             DocSource::Slice { docs, pos } => {
@@ -632,12 +670,11 @@ impl DocSource {
     /// is already at/past target (the merge dance re-syncs on agreement).
     fn advance(&mut self, target: u32) -> Option<u32> {
         match self {
-            DocSource::View { view, cur, doc } => {
-                // guard: cursor_advance requires target > last returned
+            DocSource::Bitmap { cur, doc } => {
                 if doc.is_some_and(|d| d >= target) {
                     return *doc;
                 }
-                *doc = view.cursor_advance(cur, target);
+                *doc = cur.advance(target);
                 *doc
             }
             DocSource::Slice { docs, pos } => {
@@ -656,16 +693,16 @@ impl DocSource {
 /// probes=bitmap 子句. freq() is 1 (ConstantScore, trait default).
 pub struct RoaringAndDocIter {
     sources: Vec<DocSource>,
-    probes: Vec<Box<RoaringView>>,
+    probes: Vec<FrozenBitmap>,
     doc: i32,
 }
 
 impl RoaringAndDocIter {
-    pub fn new(sources: Vec<DocSource>, probes: Vec<RoaringView>) -> RoaringAndDocIter {
+    pub fn new(sources: Vec<DocSource>, probes: Vec<FrozenBitmap>) -> RoaringAndDocIter {
         debug_assert!(!sources.is_empty());
         RoaringAndDocIter {
             sources,
-            probes: probes.into_iter().map(Box::new).collect(),
+            probes,
             doc: -1,
         }
     }
@@ -717,9 +754,10 @@ impl DocIter for RoaringAndDocIter {
                 continue 'outer;
             }
             // point-probe the agreed candidate against every bitmap clause
+            // (croaring contains: direct memory probe, 8.5–28.7 ns)
             let mut pass = true;
-            for p in &mut self.probes {
-                if !p.contains(target)? {
+            for p in &self.probes {
+                if !p.contains(target) {
                     pass = false;
                     break;
                 }

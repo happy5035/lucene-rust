@@ -694,9 +694,8 @@ mod tests {
         let (_base, seg) = reader.leaves().next().unwrap();
         let q = Query::term("message", "hot");
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
-        // M5 T1: 读侧钉死落档，T2 恢复 roaring 断言
         assert!(
-            !matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::Roaring(_)),
             "hot on bitmap index must take the roaring path"
         );
         let it = q.segment_iterator(seg, true).unwrap().unwrap();
@@ -848,31 +847,29 @@ mod tests {
         let mut reader = Reader::open(&dir_on).unwrap();
         let (_base, seg) = reader.leaves().next().unwrap();
         // 档 1：两个子句都有 bitmap（M4：RoaringAnd = 字节游标 + probe）
-        // M5 T1: 读侧钉死落档，T2 恢复 roaring 断言
         let q = Query::and("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::And(_)),
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
             "tier-1 AND must be roaring"
         );
         let q = Query::or("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Or(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "tier-1 OR must be roaring"
         );
         // 档 2：hot 有 bitmap、warm3 无（df≈714）→ 物化后统一 roaring
-        // M5 T1: 读侧钉死落档，T2 恢复 roaring 断言
         let q = Query::and("message", &["hot", "warm3"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::And(_)),
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
             "tier-2 mixed AND must be roaring"
         );
         let q = Query::or("message", &["scorching", "warm3"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Or(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "tier-2 mixed OR must be roaring"
         );
         // 档 3：两个子句都无 bitmap → 既有 PFOR 路径
@@ -890,13 +887,12 @@ mod tests {
             "needs_freq stays postings"
         );
         // 缺失子句：AND → None（空结果）；OR → 跳过缺失项后档 1
-        // M5 T1: 读侧钉死落档，T2 恢复 roaring 断言
         let q = Query::and("message", &["hot", "nosuch"]);
         assert!(q.segment_iterator(seg, false).unwrap().is_none());
         let q = Query::or("message", &["scorching", "nosuch"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Or(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "OR with one present bitmap clause"
         );
         drop(reader);
@@ -982,7 +978,6 @@ mod tests {
         write_skew_corpus(&root_on, true);
 
         // 路径断言：skew AND 走 RoaringAnd（probe 形态由 T5 bench 标定）
-        // M5 T1: 读侧钉死落档，T2 恢复 roaring 断言
         let dir = FSDirectory::open(&root_on).unwrap();
         let mut reader = Reader::open(&dir).unwrap();
         let (_base, seg) = reader.leaves().next().unwrap();
@@ -991,7 +986,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            matches!(it, SegmentDocIter::And(_)),
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
             "skew AND must be roaring"
         );
         drop(reader);

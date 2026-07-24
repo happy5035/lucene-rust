@@ -13,7 +13,7 @@ use crate::postings_ll::{
     BLOCK_SIZE, for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints,
     read_vint15, read_vlong15,
 };
-use crate::roaring::{self, RoaringView};
+use crate::roaring::{self, FrozenBitmap};
 use crate::terms_read::TermEntry;
 
 /// DocIdSetIterator.NO_MORE_DOCS.
@@ -166,32 +166,25 @@ impl PostingsReader {
         Ok(Some((fp - 4 - len as u64, len)))
     }
 
-    /// M5 T1: 写侧已切 v3（croaring Frozen payload），M4 的 v2 容器目录
-    /// 解析器不得见到 v3 字节（版本门之后即是解析，关键设计事实 10）——
-    /// 读侧钉死落档直到 T2 接入 frozen view（T2 重写本函数返回
-    /// FrozenBitmap；probe 模式随之取消，关键设计事实 6）。
+    /// Frozen-view open of the term's inline bitmap (M5 §2/§3): v3 triple
+    /// validation + one sequential region read into a 32B-aligned buffer
+    /// + zero-copy croaring views (single unsafe site, roaring/frozen.rs).
+    /// None → postings fallback. The query path's only bitmap entry point
+    /// (probe mode is gone — frozen contains is a direct memory probe,
+    /// 关键设计事实 6).
     pub fn open_term_bitmap(
         &self,
         entry: &TermEntry,
         max_doc: u32,
-    ) -> io::Result<Option<RoaringView>> {
+    ) -> io::Result<Option<FrozenBitmap>> {
         let mut input = self.fresh_input()?;
-        // T1 钉死：locate 照跑（校验① len 有界），但永不打开（T2 重写）
-        let _ = Self::locate_bitmap_region(&mut input, entry, max_doc)?;
-        Ok(None)
-    }
-
-    /// M5 T1: 与 `open_term_bitmap` 同款钉死（见上条注释；T2 删除本函数，
-    /// probe 模式取消）。
-    pub fn probe_term_bitmap(
-        &self,
-        entry: &TermEntry,
-        max_doc: u32,
-    ) -> io::Result<Option<RoaringView>> {
-        let mut input = self.fresh_input()?;
-        // T1 钉死：locate 照跑（校验① len 有界），但永不打开（T2 删除）
-        let _ = Self::locate_bitmap_region(&mut input, entry, max_doc)?;
-        Ok(None)
+        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
+            return Ok(None);
+        };
+        input.seek(start)?;
+        let mut region = vec![0u8; len as usize];
+        input.read_bytes(&mut region)?;
+        Ok(roaring::parse_region(&region, entry.doc_freq))
     }
 }
 
@@ -1487,6 +1480,44 @@ mod tests {
         let e = seek(&dir, &fis, "tx", b"hot");
         if let Some(region) = raw_bitmap_region(&dir, e.state.doc_start_fp) {
             assert!(crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none());
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M5 §2/§3 frozen view 打开：view 迭代与 postings 逐 doc 一致，
+    /// contains 抽样一致，cardinality == doc_freq（write_segment_bitmap
+    /// 语料：tx "hot" df=5000，docs = 0..5000）。
+    #[test]
+    fn open_term_bitmap_matches_postings() {
+        let root = temp_dir("bitmap-open");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let bm = postings
+            .open_term_bitmap(&e, 6000)
+            .unwrap()
+            .expect("v3 bitmap opens");
+        assert_eq!(bm.cardinality(), 5000);
+        // batched iteration == postings enumeration (tx 有 freqs：docs()
+        // 是 DOCS 字段布局，freq 字段须走 no-freq 枚举——doc 序列相同)
+        let mut en = postings.docs_and_freqs_no_freq(&e).unwrap();
+        let mut buf = [0u32; 1024];
+        let mut from = 0u32;
+        loop {
+            let n = bm.docs_from(from, &mut buf);
+            if n == 0 {
+                break;
+            }
+            for &d in &buf[..n] {
+                assert_eq!(en.next_doc().unwrap(), d as i32);
+            }
+            from = buf[n - 1] + 1;
+        }
+        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
+        // contains sampling
+        for d in (0..6000u32).step_by(7) {
+            assert_eq!(bm.contains(d), d < 5000, "doc {d}");
         }
         fs::remove_dir_all(&root).unwrap();
     }

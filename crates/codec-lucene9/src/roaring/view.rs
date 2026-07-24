@@ -22,7 +22,8 @@ use std::io;
 use crate::io::{DataInput, IndexInput};
 
 use super::{
-    BITMAP_MAGIC, BITMAP_VERSION, BITSET_BITS, BITSET_WORDS, TYPE_ARRAY, TYPE_BITSET, TYPE_RUN,
+    BITMAP_MAGIC, BITSET_BITS, BITSET_WORDS, SELF_BUILT_WIRE_VERSION, TYPE_ARRAY, TYPE_BITSET,
+    TYPE_RUN,
 };
 
 /// One container-directory entry. `data_off`/`data_len` are relative to
@@ -159,7 +160,7 @@ impl RoaringView {
         if magic != BITMAP_MAGIC {
             return Ok(None);
         }
-        if input.read_byte()? != BITMAP_VERSION {
+        if input.read_byte()? != SELF_BUILT_WIRE_VERSION {
             return Ok(None); // v1 (or anything else): version is the migration gate
         }
         if input.read_vint()? as u32 != expected_df {

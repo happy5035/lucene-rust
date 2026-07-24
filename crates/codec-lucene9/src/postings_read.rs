@@ -166,36 +166,32 @@ impl PostingsReader {
         Ok(Some((fp - 4 - len as u64, len)))
     }
 
-    /// Zero-copy full-mode view over the term's inline bitmap (M4 §4):
-    /// v2 triple validation + one sequential region read; None →
-    /// postings fallback. The query path's Term/OR/AND-small-side entry
-    /// point (replaced the M3 deserialize-rebuild `read_term_bitmap`
-    /// (deleted in T4, 事实 16)).
+    /// M5 T1: 写侧已切 v3（croaring Frozen payload），M4 的 v2 容器目录
+    /// 解析器不得见到 v3 字节（版本门之后即是解析，关键设计事实 10）——
+    /// 读侧钉死落档直到 T2 接入 frozen view（T2 重写本函数返回
+    /// FrozenBitmap；probe 模式随之取消，关键设计事实 6）。
     pub fn open_term_bitmap(
         &self,
         entry: &TermEntry,
         max_doc: u32,
     ) -> io::Result<Option<RoaringView>> {
         let mut input = self.fresh_input()?;
-        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
-            return Ok(None);
-        };
-        RoaringView::open_full(input, start, len, entry.doc_freq)
+        // T1 钉死：locate 照跑（校验① len 有界），但永不打开（T2 重写）
+        let _ = Self::locate_bitmap_region(&mut input, entry, max_doc)?;
+        Ok(None)
     }
 
-    /// Zero-copy probe-mode view (M4 §4, AND 大侧专用): container-
-    /// directory header scan only — data sections are read per-probe by
-    /// `RoaringView::contains`, never wholesale (用户指令②).
+    /// M5 T1: 与 `open_term_bitmap` 同款钉死（见上条注释；T2 删除本函数，
+    /// probe 模式取消）。
     pub fn probe_term_bitmap(
         &self,
         entry: &TermEntry,
         max_doc: u32,
     ) -> io::Result<Option<RoaringView>> {
         let mut input = self.fresh_input()?;
-        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
-            return Ok(None);
-        };
-        RoaringView::open_probe(input, start, len, entry.doc_freq)
+        // T1 钉死：locate 照跑（校验① len 有界），但永不打开（T2 删除）
+        let _ = Self::locate_bitmap_region(&mut input, entry, max_doc)?;
+        Ok(None)
     }
 }
 
@@ -1447,16 +1443,18 @@ mod tests {
         }
         assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
 
-        // 命中 term：docStartFP-4 处有合法 bitmap，内容 == postings
+        // 命中 term：docStartFP-4 处有合法 v3 bitmap region（v3 头 + cookie
+        // 断言：magic/version==3/df/card、尾部 FROZEN_COOKIE、len ≤ 上界）
         let region = raw_bitmap_region(&dir, e.state.doc_start_fp).expect("hot has a bitmap");
-        let bitmap = crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq)
-            .expect("hot bitmap must validate");
-        assert_eq!(bitmap.cardinality(), 5000);
-        let mut cur = bitmap.cursor();
-        for expected in 0..5000u32 {
-            assert_eq!(bitmap.cursor_next(&mut cur), Some(expected));
-        }
-        assert_eq!(bitmap.cursor_next(&mut cur), None);
+        assert_eq!(&region[..4], b"RLBM");
+        assert_eq!(region[4], 3, "format v3");
+        let mut input = IndexInput::in_memory(region[5..].to_vec());
+        assert_eq!(input.read_vint().unwrap(), 5000);
+        assert_eq!(input.read_vint().unwrap(), 5000);
+        let header = u32::from_le_bytes(region[region.len() - 4..].try_into().unwrap());
+        assert_eq!(header & 0x7FFF, 13766, "FROZEN_COOKIE");
+        assert!((header >> 15) >= 1, "num_containers");
+        assert!(region.len() as u64 <= crate::roaring::max_bitmap_len(6000));
 
         // 未命中 term（df=200 < 4096）：同一手工定位流程必须校验失败
         let e = seek(&dir, &fis, "tx", b"warm");
@@ -1493,98 +1491,40 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// M4 §4 两种打开模式：full 视图游标迭代 == postings；probe contains
-    /// 与之一致；未命中 / df 不符 / 无 bitmap 索引全部 None。
+    /// M5 §3 版本即迁移：v3 写侧产出的 region doctor 回 v2/v1 版本字节后，
+    /// 读侧必须静默落档且 postings 逐 doc 不变（T1 期间读侧钉死落档——
+    /// 本测试在 T1 确定性通过，T2 起走真实版本门，断言一字不改）。
     #[test]
-    fn open_and_probe_term_bitmap_match_postings() {
-        let root = temp_dir("bitmap-view");
-        let dir = FSDirectory::open(&root).unwrap();
-        let fis = write_segment_bitmap(&dir);
-        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
-        let e = seek(&dir, &fis, "tx", b"hot"); // docs 0..5000 → single run container
-
-        // full mode: cardinality + byte-cursor iteration == postings
-        let v = postings
-            .open_term_bitmap(&e, 6000)
-            .unwrap()
-            .expect("hot has a full view");
-        assert_eq!(v.cardinality(), 5000);
-        let mut cur = v.cursor();
-        for expected in 0..5000u32 {
-            assert_eq!(v.cursor_next(&mut cur), Some(expected));
-        }
-        assert_eq!(v.cursor_next(&mut cur), None);
-
-        // probe mode: contains agrees on both sides of the boundary
-        let mut p = postings
-            .probe_term_bitmap(&e, 6000)
-            .unwrap()
-            .expect("hot has a probe view");
-        for d in [0u32, 1, 42, 4999] {
-            assert!(p.contains(d).unwrap(), "probe {d}");
-        }
-        for d in [5000u32, 5001, 6000, 9 << 16] {
-            assert!(!p.contains(d).unwrap(), "probe miss {d}");
-        }
-
-        // below the df read gate: None (and no read attempted)
-        let e = seek(&dir, &fis, "tx", b"warm");
-        assert!(postings.open_term_bitmap(&e, 6000).unwrap().is_none());
-        assert!(postings.probe_term_bitmap(&e, 6000).unwrap().is_none());
-
-        // df mismatch (>= gate, so the header check fires): None
-        let e = seek(&dir, &fis, "tx", b"hot");
-        let mut bad = e;
-        bad.doc_freq = 4096; // real df is 5000; 4096 >= BITMAP_MIN_DF
-        assert!(postings.open_term_bitmap(&bad, 6000).unwrap().is_none());
-        assert!(postings.probe_term_bitmap(&bad, 6000).unwrap().is_none());
-
-        // index written without bitmaps: natural None
-        let root2 = temp_dir("bitmap-view-off");
-        let dir2 = FSDirectory::open(&root2).unwrap();
-        let (fis2, _, _) = write_segment(&dir2);
-        let postings2 = PostingsReader::open(&dir2, "_0", &[4u8; 16]).unwrap();
-        let e2 = seek(&dir2, &fis2, "tx", b"hot");
-        assert!(postings2.open_term_bitmap(&e2, 6000).unwrap().is_none());
-        assert!(postings2.probe_term_bitmap(&e2, 6000).unwrap().is_none());
-
-        fs::remove_dir_all(&root).unwrap();
-        fs::remove_dir_all(&root2).unwrap();
-    }
-
-    /// M4 §3 版本即迁移：把盘上 bitmap region 的 version 字节改回 1（v1
-    /// 布局的判定点；v2 region 无 crc 可补，也无需补——version 检查先于
-    /// 一切），v2 读侧必须静默落档且 postings 本身逐 doc 不变。
-    #[test]
-    fn read_term_bitmap_falls_back_on_v1_layout() {
-        let root = temp_dir("bitmap-v1");
+    fn open_term_bitmap_falls_back_on_legacy_version() {
+        let root = temp_dir("bitmap-legacy");
         let dir = FSDirectory::open(&root).unwrap();
         let fis = write_segment_bitmap(&dir);
         let e = seek(&dir, &fis, "tx", b"hot");
-        // doctor the on-disk version byte 2 -> 1 (in place; the doctored
-        // index never goes through CheckIndex — footer CRC mismatch is
-        // expected and irrelevant here)
         let fp = e.state.doc_start_fp;
         let doc_file = root.join(crate::postings::file_name("_0", "doc"));
-        let mut bytes = fs::read(&doc_file).unwrap();
+        let orig = fs::read(&doc_file).unwrap();
         let len =
-            u32::from_le_bytes(bytes[(fp - 4) as usize..fp as usize].try_into().unwrap()) as u64;
+            u32::from_le_bytes(orig[(fp - 4) as usize..fp as usize].try_into().unwrap()) as u64;
         let region_start = (fp - 4 - len) as usize;
-        assert_eq!(&bytes[region_start..region_start + 4], b"RLBM");
-        assert_eq!(bytes[region_start + 4], 2, "write side must emit v2");
-        bytes[region_start + 4] = 1;
-        fs::write(&doc_file, &bytes).unwrap();
-        // v2 reader: both view open modes reject at the version gate
-        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
-        assert!(postings.open_term_bitmap(&e, 6000).unwrap().is_none());
-        assert!(postings.probe_term_bitmap(&e, 6000).unwrap().is_none());
-        // fallback correctness: the postings themselves are untouched
-        let mut en = postings.docs_and_freqs(&e).unwrap();
-        for expected in 0..5000 {
-            assert_eq!(en.next_doc().unwrap(), expected);
-            assert_eq!(en.freq(), 1);
+        assert_eq!(&orig[region_start..region_start + 4], b"RLBM");
+        assert_eq!(orig[region_start + 4], 3, "write side must emit v3");
+        for legacy in [2u8, 1] {
+            let mut bytes = orig.clone();
+            bytes[region_start + 4] = legacy;
+            fs::write(&doc_file, &bytes).unwrap();
+            let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+            assert!(
+                postings.open_term_bitmap(&e, 6000).unwrap().is_none(),
+                "v{legacy} region must fall back"
+            );
+            // fallback correctness: the postings themselves are untouched
+            let mut en = postings.docs_and_freqs(&e).unwrap();
+            for expected in 0..5000 {
+                assert_eq!(en.next_doc().unwrap(), expected);
+                assert_eq!(en.freq(), 1);
+            }
+            assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
         }
-        assert_eq!(en.next_doc().unwrap(), NO_MORE_DOCS);
         fs::remove_dir_all(&root).unwrap();
     }
 }

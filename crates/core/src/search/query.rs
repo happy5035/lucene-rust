@@ -129,12 +129,12 @@ impl Query {
                 let Some((has_freqs, entry)) = seg.seek_term(field, term)? else {
                     return Ok(None);
                 };
-                // M3 §5 档 1 term 路径：校验通过的内联 bitmap → roaring
+                // M4 §6 Term 路径：校验通过的零拷贝 full 视图 → 字节游标
                 // 迭代；needs_freq（bitmap 无 freq）与任何校验失败保持
                 // postings 枚举。
                 if !needs_freq {
-                    if let Some(b) = seg.read_term_bitmap(&entry)? {
-                        return Ok(Some(SegmentDocIter::Roaring(RoaringDocIter::new(b))));
+                    if let Some(v) = seg.open_term_bitmap(&entry)? {
+                        return Ok(Some(SegmentDocIter::Roaring(RoaringDocIter::new(v))));
                     }
                 }
                 if has_freqs {

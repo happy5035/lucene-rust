@@ -55,23 +55,17 @@ impl Searcher {
 
     /// ConstantScore TermQuery: count = sum of per-segment doc_freq (no
     /// postings iteration needed — doc_freq is in the TermEntry after
-    /// seek_exact; a validated inline bitmap supplies its header cardinality
-    /// instead, equal to doc_freq by validation ③, M3 §5). Fallback to
-    /// iteration for MatchAll and unknown terms.
-    /// Multi-term queries count per segment: popcount on the bitset path
-    /// (spec §4), plain iteration on the OR path.
+    /// seek_exact; M4 §6 用户指令③: the bitmap header read is gone —
+    /// validation ③ guarantees cardinality == doc_freq, so the two
+    /// values could never differ). Fallback to iteration for MatchAll
+    /// and unknown terms. Multi-term queries count per segment: popcount
+    /// on the bitset path (spec §4), plain iteration on the OR path.
     pub fn count(&mut self, query: &Query) -> io::Result<u64> {
         if let Query::Term { field, term } = query {
             let mut total = 0u64;
             for (_doc_base, seg) in self.reader.leaves() {
                 if let Some((_, entry)) = seg.seek_term(field, term)? {
-                    // M3 §5: count = bitmap cardinality（只读头）；校验保证
-                    // cardinality == df，校验失败回落 doc_freq 短路——两种
-                    // 路径的值必然相同，bitmap 路径同时充当线上校验。
-                    total += match seg.read_term_bitmap_header(&entry)? {
-                        Some(card) => card,
-                        None => entry.doc_freq as u64,
-                    };
+                    total += entry.doc_freq as u64;
                 }
             }
             return Ok(total);
@@ -95,8 +89,8 @@ impl Searcher {
             }
             return Ok(total);
         }
-        // M3 §5: And/Or count 与迭代共用一套三档引擎——任一子句有 bitmap
-        // 即折出 cardinality（档 1/2），否则按段迭代（档 3，既有行为）。
+        // M4 §5: And/Or count 与迭代共用同一视图引擎——任一子句有 bitmap
+        // 即驱动同一迭代器计数（档 1/2），否则按段迭代（档 3，既有行为）。
         if let Query::And { field, terms } | Query::Or { field, terms } = query {
             if terms.len() >= 2 {
                 let is_and = matches!(query, Query::And { .. });

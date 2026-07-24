@@ -856,7 +856,7 @@ mod tests {
         let q = Query::or("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "tier-1 OR must be roaring"
         );
         // 档 2：hot 有 bitmap、warm3 无（df≈714）→ 物化后统一 roaring
@@ -869,21 +869,21 @@ mod tests {
         let q = Query::or("message", &["scorching", "warm3"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "tier-2 mixed OR must be roaring"
         );
-        // 档 3：两个子句都无 bitmap → 既有 PFOR 路径（非 Roaring 变体）
+        // 档 3：两个子句都无 bitmap → 既有 PFOR 路径
         let q = Query::and("message", &["warm1", "warm3"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            !matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::And(_)),
             "tier-3 stays PFOR conjunction"
         );
         // needs_freq=true：永不走 roaring（bitmap 无 freq）
         let q = Query::and("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, true).unwrap().unwrap();
         assert!(
-            !matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::And(_)),
             "needs_freq stays postings"
         );
         // 缺失子句：AND → None（空结果）；OR → 跳过缺失项后档 1
@@ -892,7 +892,7 @@ mod tests {
         let q = Query::or("message", &["scorching", "nosuch"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Roaring(_)),
+            matches!(it, SegmentDocIter::RoaringOr(_)),
             "OR with one present bitmap clause"
         );
         drop(reader);
@@ -940,6 +940,11 @@ mod tests {
         assert_eq!(
             s.count(&Query::and("message", &["hot", "warm3"])).unwrap(),
             714
+        );
+        assert_eq!(
+            s.count(&Query::or("message", &["scorching", "warm3"]))
+                .unwrap(),
+            4571
         );
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();

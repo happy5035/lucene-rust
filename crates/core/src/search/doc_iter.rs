@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, NO_MORE_DOCS};
-use codec_lucene9::roaring::{RoaringBitmap, RoaringCursor, RoaringView, ViewCursor};
+use codec_lucene9::roaring::{RoaringView, ViewCursor};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
@@ -513,24 +513,26 @@ impl DocIter for PhraseDocIter {
     // calls next_doc; freq: 1 (ConstantScore, trait default).
 }
 
-// ── Roaring (inline term bitmap, M3 §5) ───────────────────────────────
+// ── Roaring (inline term bitmap view, M4 §6) ─────────────────────────
 
-/// DocIter over a validated inline roaring bitmap (M3 §5): next_doc walks
-/// the container cursor; advance hops containers by high-16-bit key and
-/// seeks inside (array partition_point / bitset next_set_bit / run range
-/// skip). freq() is 1 — the bitmap carries no freqs, and needs_freq paths
-/// never get this iterator (correctness requirement (e)).
+/// DocIter over a term's inline bitmap (M4 §6): wraps the zero-copy
+/// full-mode view's byte cursor — next_doc/advance delegate to the
+/// view's `cursor_next`/`cursor_advance` (the M3 `RoaringCursor`
+/// contract, 关键设计事实 8). The view is boxed: `SegmentDocIter` size
+/// discipline (关键设计事实 6). freq() is 1 — the bitmap carries no
+/// freqs, and needs_freq paths never get this iterator (correctness
+/// requirement (e)).
 pub struct RoaringDocIter {
-    bitmap: RoaringBitmap,
-    cursor: RoaringCursor,
+    view: Box<RoaringView>,
+    cursor: ViewCursor,
     doc: i32,
 }
 
 impl RoaringDocIter {
-    pub fn new(bitmap: RoaringBitmap) -> Self {
-        let cursor = bitmap.cursor();
+    pub fn new(view: RoaringView) -> RoaringDocIter {
+        let cursor = view.cursor(); // full-mode contract (open_term_bitmap)
         RoaringDocIter {
-            bitmap,
+            view: Box::new(view),
             cursor,
             doc: -1,
         }
@@ -546,7 +548,7 @@ impl DocIter for RoaringDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
-        self.doc = match self.bitmap.cursor_next(&mut self.cursor) {
+        self.doc = match self.view.cursor_next(&mut self.cursor) {
             Some(d) => d as i32,
             None => NO_MORE_DOCS,
         };
@@ -556,7 +558,7 @@ impl DocIter for RoaringDocIter {
     fn advance(&mut self, target: i32) -> io::Result<i32> {
         if target > self.doc {
             self.doc = match self
-                .bitmap
+                .view
                 .cursor_advance(&mut self.cursor, target.max(0) as u32)
             {
                 Some(d) => d as i32,
@@ -746,6 +748,68 @@ impl DocIter for RoaringAndDocIter {
     }
 }
 
+/// OR execution over views (M4 §6): k-way merge-union over `sources`
+/// (full-mode bitmap byte cursors + materialized low-df slices) with
+/// min-current dedup — zero container rebuilds. The full byte read is
+/// unavoidable (spec §2 明确不做); the rebuild tax is gone. freq() is 1
+/// (ConstantScore, trait default).
+pub struct RoaringOrDocIter {
+    sources: Vec<DocSource>,
+    doc: i32,
+}
+
+impl RoaringOrDocIter {
+    pub fn new(sources: Vec<DocSource>) -> RoaringOrDocIter {
+        debug_assert!(!sources.is_empty());
+        RoaringOrDocIter { sources, doc: -1 }
+    }
+}
+
+impl DocIter for RoaringOrDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 {
+            // union dedup: move every source sitting on the last emitted doc
+            let last = self.doc as u32;
+            for s in &mut self.sources {
+                if s.current() == Some(last) {
+                    s.next();
+                }
+            }
+        }
+        let mut best: Option<u32> = None;
+        for s in &self.sources {
+            if let Some(d) = s.current() {
+                if best.is_none_or(|b| d < b) {
+                    best = Some(d);
+                }
+            }
+        }
+        self.doc = match best {
+            Some(d) => d as i32,
+            None => NO_MORE_DOCS,
+        };
+        Ok(self.doc)
+    }
+
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target || self.doc == NO_MORE_DOCS {
+            return Ok(self.doc);
+        }
+        for s in &mut self.sources {
+            s.advance(target.max(0) as u32);
+        }
+        self.doc = -1;
+        self.next_doc()
+    }
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
@@ -758,6 +822,7 @@ pub enum SegmentDocIter {
     Phrase(PhraseDocIter),
     Roaring(RoaringDocIter),
     RoaringAnd(RoaringAndDocIter),
+    RoaringOr(RoaringOrDocIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -772,6 +837,7 @@ impl DocIter for SegmentDocIter {
             Self::Phrase(p) => p.doc_id(),
             Self::Roaring(r) => r.doc_id(),
             Self::RoaringAnd(a) => a.doc_id(),
+            Self::RoaringOr(o) => o.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -785,6 +851,7 @@ impl DocIter for SegmentDocIter {
             Self::Phrase(p) => p.next_doc(),
             Self::Roaring(r) => r.next_doc(),
             Self::RoaringAnd(a) => a.next_doc(),
+            Self::RoaringOr(o) => o.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -798,6 +865,7 @@ impl DocIter for SegmentDocIter {
             Self::Phrase(p) => p.advance(t),
             Self::Roaring(r) => r.advance(t),
             Self::RoaringAnd(a) => a.advance(t),
+            Self::RoaringOr(o) => o.advance(t),
         }
     }
     fn freq(&self) -> u32 {

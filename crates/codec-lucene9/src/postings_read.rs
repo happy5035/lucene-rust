@@ -13,7 +13,7 @@ use crate::postings_ll::{
     BLOCK_SIZE, for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints,
     read_vint15, read_vlong15,
 };
-use crate::roaring::{self, RoaringBitmap, RoaringView};
+use crate::roaring::{self, RoaringView};
 use crate::terms_read::TermEntry;
 
 /// DocIdSetIterator.NO_MORE_DOCS.
@@ -166,69 +166,11 @@ impl PostingsReader {
         Ok(Some((fp - 4 - len as u64, len)))
     }
 
-    /// Reads + fully validates the inline roaring bitmap preceding this
-    /// term's postings (M4 §3 格式 v2): len bound → magic/version (v1
-    /// rejected at the gate) → header df == termState.doc_freq (+
-    /// cardinality == df) → structural invariants. ANY failure yields
-    /// `Ok(None)`, the caller's silent-fallback signal (查询永不报错).
-    /// Uses its own positioned slice of the .doc stream (fresh_input
-    /// pattern, postings_read.rs:135). The query path switches to the
-    /// zero-copy view in T2; this stays until T4, which deletes it
-    /// together with the header path (T4 删除集合，关键设计事实 16).
-    pub fn read_term_bitmap(
-        &self,
-        entry: &TermEntry,
-        max_doc: u32,
-    ) -> io::Result<Option<RoaringBitmap>> {
-        let mut input = self.fresh_input()?;
-        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
-            return Ok(None);
-        };
-        input.seek(start)?;
-        let mut buf = vec![0u8; len as usize];
-        input.read_bytes(&mut buf)?;
-        Ok(RoaringBitmap::deserialize(&buf, entry.doc_freq))
-    }
-
-    /// Header-only read for count queries (M3 §5: count 查询只读头):
-    /// locate (len bound) + magic + version + header df, then return the
-    /// header cardinality. The payload crc32 is unreachable without
-    /// reading the payload; the combined false-positive probability of the
-    /// three applicable checks is ~2^-40 (spec §4 误判概率实际为零), and a
-    /// failed check falls back to the caller's doc_freq path.
-    pub fn read_term_bitmap_header(
-        &self,
-        entry: &TermEntry,
-        max_doc: u32,
-    ) -> io::Result<Option<u64>> {
-        let mut input = self.fresh_input()?;
-        let Some((start, _len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
-            return Ok(None);
-        };
-        input.seek(start)?;
-        let mut magic = [0u8; 4];
-        input.read_bytes(&mut magic)?;
-        if magic != roaring::BITMAP_MAGIC {
-            return Ok(None);
-        }
-        if input.read_byte()? != roaring::BITMAP_VERSION {
-            return Ok(None);
-        }
-        if input.read_vint()? as u32 != entry.doc_freq {
-            return Ok(None);
-        }
-        let card = input.read_vint()? as u32;
-        if card != entry.doc_freq {
-            return Ok(None);
-        }
-        Ok(Some(card as u64))
-    }
-
     /// Zero-copy full-mode view over the term's inline bitmap (M4 §4):
     /// v2 triple validation + one sequential region read; None →
     /// postings fallback. The query path's Term/OR/AND-small-side entry
-    /// point (replaces the M3 deserialize-rebuild `read_term_bitmap`,
-    /// which stays until T4 for the write-side round-trip tests).
+    /// point (replaced the M3 deserialize-rebuild `read_term_bitmap`
+    /// (deleted in T4, 事实 16)).
     pub fn open_term_bitmap(
         &self,
         entry: &TermEntry,
@@ -1551,56 +1493,6 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn read_term_bitmap_validates_and_reads() {
-        let root = temp_dir("bitmap-read");
-        let dir = FSDirectory::open(&root).unwrap();
-        let fis = write_segment_bitmap(&dir);
-        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
-
-        // 命中 term：全量读 + 四重校验通过，内容 == postings
-        let e = seek(&dir, &fis, "tx", b"hot");
-        let bitmap = postings
-            .read_term_bitmap(&e, 6000)
-            .unwrap()
-            .expect("hot has a valid bitmap");
-        assert_eq!(bitmap.cardinality(), 5000);
-        let mut cur = bitmap.cursor();
-        for expected in 0..5000u32 {
-            assert_eq!(bitmap.cursor_next(&mut cur), Some(expected));
-        }
-        // count 专用只读头：cardinality == df
-        assert_eq!(
-            postings.read_term_bitmap_header(&e, 6000).unwrap(),
-            Some(5000)
-        );
-
-        // 未命中 term（df < 4096 读侧门槛）：None，且不做任何读
-        let e = seek(&dir, &fis, "tx", b"warm");
-        assert!(postings.read_term_bitmap(&e, 6000).unwrap().is_none());
-        assert_eq!(postings.read_term_bitmap_header(&e, 6000).unwrap(), None);
-
-        // df 不符（entry 的 df 与 bitmap 头内 df 不同，但 ≥ 门槛以越过
-        // 读侧 gate）：校验③失败 → None
-        let e = seek(&dir, &fis, "tx", b"hot");
-        let mut bad = e;
-        bad.doc_freq = 4096; // 真实 df 是 5000；4096 ≥ BITMAP_MIN_DF 故会走到校验③
-        assert!(postings.read_term_bitmap(&bad, 6000).unwrap().is_none());
-        assert_eq!(postings.read_term_bitmap_header(&bad, 6000).unwrap(), None);
-
-        // 不开 bitmap 写的索引：自然 None（校验①/②失败）
-        let root2 = temp_dir("bitmap-read-off");
-        let dir2 = FSDirectory::open(&root2).unwrap();
-        let (fis2, _, _) = write_segment(&dir2);
-        let postings2 = PostingsReader::open(&dir2, "_0", &[4u8; 16]).unwrap();
-        let e2 = seek(&dir2, &fis2, "tx", b"hot");
-        assert!(postings2.read_term_bitmap(&e2, 6000).unwrap().is_none());
-        assert_eq!(postings2.read_term_bitmap_header(&e2, 6000).unwrap(), None);
-
-        fs::remove_dir_all(&root).unwrap();
-        fs::remove_dir_all(&root2).unwrap();
-    }
-
     /// M4 §4 两种打开模式：full 视图游标迭代 == postings；probe contains
     /// 与之一致；未命中 / df 不符 / 无 bitmap 索引全部 None。
     #[test]
@@ -1682,10 +1574,10 @@ mod tests {
         assert_eq!(bytes[region_start + 4], 2, "write side must emit v2");
         bytes[region_start + 4] = 1;
         fs::write(&doc_file, &bytes).unwrap();
-        // v2 reader: full + header paths both reject at the version gate
+        // v2 reader: both view open modes reject at the version gate
         let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
-        assert!(postings.read_term_bitmap(&e, 6000).unwrap().is_none());
-        assert_eq!(postings.read_term_bitmap_header(&e, 6000).unwrap(), None);
+        assert!(postings.open_term_bitmap(&e, 6000).unwrap().is_none());
+        assert!(postings.probe_term_bitmap(&e, 6000).unwrap().is_none());
         // fallback correctness: the postings themselves are untouched
         let mut en = postings.docs_and_freqs(&e).unwrap();
         for expected in 0..5000 {

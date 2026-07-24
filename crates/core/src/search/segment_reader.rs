@@ -7,7 +7,7 @@ use std::io;
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
-use codec_lucene9::roaring::{RoaringBitmap, RoaringView};
+use codec_lucene9::roaring::RoaringView;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
@@ -78,26 +78,6 @@ impl SegmentReader {
     /// EverythingEnum over a positions field (PhraseDocIter construction).
     pub(crate) fn positions_enum(&self, entry: &TermEntry) -> io::Result<PositionsEnum> {
         self.postings.positions(entry)
-    }
-
-    /// Inline-bitmap read for the roaring execution paths (M3 §5): full
-    /// four-way validation, None → postings fallback. &self: the bitmap
-    /// read uses its own positioned slice of the .doc stream.
-    pub(crate) fn read_term_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringBitmap>> {
-        if !bitmap_enabled() {
-            return Ok(None);
-        }
-        self.postings.read_term_bitmap(entry, self.max_doc as u32)
-    }
-
-    /// Header-only bitmap cardinality for Term count (M3 §5: count 查询
-    /// 只读头). None → caller falls back to entry.doc_freq.
-    pub(crate) fn read_term_bitmap_header(&self, entry: &TermEntry) -> io::Result<Option<u64>> {
-        if !bitmap_enabled() {
-            return Ok(None);
-        }
-        self.postings
-            .read_term_bitmap_header(entry, self.max_doc as u32)
     }
 
     /// Zero-copy full-mode bitmap view (M4 §4) for Term iteration / OR /

@@ -4,7 +4,8 @@
 use std::io;
 
 use super::doc_iter::{
-    ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, SegmentDocIter,
+    ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, RoaringDocIter,
+    SegmentDocIter,
 };
 use super::multi_term;
 use super::segment_reader::SegmentReader;
@@ -127,6 +128,14 @@ impl Query {
                 let Some((has_freqs, entry)) = seg.seek_term(field, term)? else {
                     return Ok(None);
                 };
+                // M3 §5 档 1 term 路径：校验通过的内联 bitmap → roaring
+                // 迭代；needs_freq（bitmap 无 freq）与任何校验失败保持
+                // postings 枚举。
+                if !needs_freq {
+                    if let Some(b) = seg.read_term_bitmap(&entry)? {
+                        return Ok(Some(SegmentDocIter::Roaring(RoaringDocIter::new(b))));
+                    }
+                }
                 if has_freqs {
                     Ok(Some(SegmentDocIter::Freqs(
                         seg.docs_freqs_enum(&entry, needs_freq)?,

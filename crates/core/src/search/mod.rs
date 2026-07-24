@@ -675,4 +675,61 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
+
+    /// M3 档 1 Term 接入：bitmap 索引上 Term 的迭代/count 走 roaring
+    /// （迭代器变体断言钉死路径选择），结果与 bitmap off 索引逐位一致；
+    /// needs_freq（freq_sum）与未命中 term 永远走 postings。
+    #[test]
+    fn term_query_uses_roaring_when_bitmap_present() {
+        let root_off = temp_dir("bmtoff");
+        let root_on = temp_dir("bmton");
+        write_bitmap_corpus(&root_off, false);
+        write_bitmap_corpus(&root_on, true);
+
+        // 路径断言：bitmap 索引上 hot 的 segment iterator 是 Roaring 变体，
+        // needs_freq=true 时回落 postings 变体；off 索引上永远不是 Roaring。
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut reader = Reader::open(&dir_on).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        let q = Query::term("message", "hot");
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Roaring(_)),
+            "hot on bitmap index must take the roaring path"
+        );
+        let it = q.segment_iterator(seg, true).unwrap().unwrap();
+        assert!(
+            !matches!(it, SegmentDocIter::Roaring(_)),
+            "needs_freq must stay on postings (bitmap carries no freq)"
+        );
+        let q_low = Query::term("message", "t3");
+        let it = q_low.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            !matches!(it, SegmentDocIter::Roaring(_)),
+            "df<4096 term has no bitmap: postings path"
+        );
+        drop(reader);
+
+        // 全量结果等价（迭代序列、count、freq_sum）
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let dir_on2 = FSDirectory::open(&root_on).unwrap();
+        let mut s_on = Searcher::open(&dir_on2).unwrap();
+        let q = Query::term("message", "hot");
+        let (a_total, a_docs) = s_off.top_docs(&q, 6000).unwrap();
+        let (b_total, b_docs) = s_on.top_docs(&q, 6000).unwrap();
+        assert_eq!((a_total, a_docs), (b_total, b_docs));
+        assert_eq!(b_total, 5000);
+        assert_eq!(s_on.count(&q).unwrap(), 5000); // roaring cardinality 路径
+        assert_eq!(s_off.count(&q).unwrap(), s_on.count(&q).unwrap());
+        assert_eq!(s_on.freq_sum(&q).unwrap(), 5000); // postings，不经 bitmap
+                                                      // 未命中 term 与未知 term 不受影响
+        assert_eq!(
+            s_on.count(&Query::term("message", "t3")).unwrap(),
+            s_off.count(&Query::term("message", "t3")).unwrap()
+        );
+        assert_eq!(s_on.count(&Query::term("message", "nosuch")).unwrap(), 0);
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
 }

@@ -54,7 +54,9 @@ impl Searcher {
 
     /// ConstantScore TermQuery: count = sum of per-segment doc_freq (no
     /// postings iteration needed — doc_freq is in the TermEntry after
-    /// seek_exact). Fallback to iteration for MatchAll and unknown terms.
+    /// seek_exact; a validated inline bitmap supplies its header cardinality
+    /// instead, equal to doc_freq by validation ③, M3 §5). Fallback to
+    /// iteration for MatchAll and unknown terms.
     /// Multi-term queries count per segment: popcount on the bitset path
     /// (spec §4), plain iteration on the OR path.
     pub fn count(&mut self, query: &Query) -> io::Result<u64> {
@@ -62,7 +64,13 @@ impl Searcher {
             let mut total = 0u64;
             for (_doc_base, seg) in self.reader.leaves() {
                 if let Some((_, entry)) = seg.seek_term(field, term)? {
-                    total += entry.doc_freq as u64;
+                    // M3 §5: count = bitmap cardinality（只读头）；校验保证
+                    // cardinality == df，校验失败回落 doc_freq 短路——两种
+                    // 路径的值必然相同，bitmap 路径同时充当线上校验。
+                    total += match seg.read_term_bitmap_header(&entry)? {
+                        Some(card) => card,
+                        None => entry.doc_freq as u64,
+                    };
                 }
             }
             return Ok(total);

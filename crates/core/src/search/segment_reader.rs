@@ -7,6 +7,7 @@ use std::io;
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
+use codec_lucene9::roaring::RoaringBitmap;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
@@ -79,6 +80,26 @@ impl SegmentReader {
         self.postings.positions(entry)
     }
 
+    /// Inline-bitmap read for the roaring execution paths (M3 §5): full
+    /// four-way validation, None → postings fallback. &self: the bitmap
+    /// read uses its own positioned slice of the .doc stream.
+    pub(crate) fn read_term_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringBitmap>> {
+        if !bitmap_enabled() {
+            return Ok(None);
+        }
+        self.postings.read_term_bitmap(entry, self.max_doc as u32)
+    }
+
+    /// Header-only bitmap cardinality for Term count (M3 §5: count 查询
+    /// 只读头). None → caller falls back to entry.doc_freq.
+    pub(crate) fn read_term_bitmap_header(&self, entry: &TermEntry) -> io::Result<Option<u64>> {
+        if !bitmap_enabled() {
+            return Ok(None);
+        }
+        self.postings
+            .read_term_bitmap_header(entry, self.max_doc as u32)
+    }
+
     /// Look up a field info by name (for Boolean query construction).
     pub(crate) fn field_info(&self, name: &str) -> Option<&FieldInfo> {
         self.field_infos.by_name(name)
@@ -99,4 +120,13 @@ impl SegmentReader {
         let fi = self.field_infos.by_name(field)?;
         Some(self.terms.terms_iter(fi))
     }
+}
+
+/// Process-wide kill switch for the roaring read path (M3 §6 A/B
+/// discipline; mirrors RL_SIMD=0 in postings_ll/simd.rs:56-62):
+/// `RL_BITMAP=0` forces the postings fallback everywhere with the same
+/// binary and index.
+pub(crate) fn bitmap_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RL_BITMAP").map_or(true, |v| v != "0"))
 }

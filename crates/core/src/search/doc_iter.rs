@@ -6,6 +6,7 @@ use std::io;
 
 use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, NO_MORE_DOCS};
+use codec_lucene9::roaring::{RoaringBitmap, RoaringCursor};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
@@ -512,6 +513,60 @@ impl DocIter for PhraseDocIter {
     // calls next_doc; freq: 1 (ConstantScore, trait default).
 }
 
+// ── Roaring (inline term bitmap, M3 §5) ───────────────────────────────
+
+/// DocIter over a validated inline roaring bitmap (M3 §5): next_doc walks
+/// the container cursor; advance hops containers by high-16-bit key and
+/// seeks inside (array partition_point / bitset next_set_bit / run range
+/// skip). freq() is 1 — the bitmap carries no freqs, and needs_freq paths
+/// never get this iterator (correctness requirement (e)).
+pub struct RoaringDocIter {
+    bitmap: RoaringBitmap,
+    cursor: RoaringCursor,
+    doc: i32,
+}
+
+impl RoaringDocIter {
+    pub fn new(bitmap: RoaringBitmap) -> Self {
+        let cursor = bitmap.cursor();
+        RoaringDocIter {
+            bitmap,
+            cursor,
+            doc: -1,
+        }
+    }
+}
+
+impl DocIter for RoaringDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = match self.bitmap.cursor_next(&mut self.cursor) {
+            Some(d) => d as i32,
+            None => NO_MORE_DOCS,
+        };
+        Ok(self.doc)
+    }
+
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if target > self.doc {
+            self.doc = match self
+                .bitmap
+                .cursor_advance(&mut self.cursor, target.max(0) as u32)
+            {
+                Some(d) => d as i32,
+                None => NO_MORE_DOCS,
+            };
+        }
+        Ok(self.doc)
+    }
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
@@ -522,6 +577,7 @@ pub enum SegmentDocIter {
     Or(DisjunctionDocIter),
     Bitset(BitsetDocIter),
     Phrase(PhraseDocIter),
+    Roaring(RoaringDocIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -534,6 +590,7 @@ impl DocIter for SegmentDocIter {
             Self::Or(o) => o.doc_id(),
             Self::Bitset(b) => b.doc_id(),
             Self::Phrase(p) => p.doc_id(),
+            Self::Roaring(r) => r.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -545,6 +602,7 @@ impl DocIter for SegmentDocIter {
             Self::Or(o) => o.next_doc(),
             Self::Bitset(b) => b.next_doc(),
             Self::Phrase(p) => p.next_doc(),
+            Self::Roaring(r) => r.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -556,6 +614,7 @@ impl DocIter for SegmentDocIter {
             Self::Or(o) => o.advance(t),
             Self::Bitset(b) => b.advance(t),
             Self::Phrase(p) => p.advance(t),
+            Self::Roaring(r) => r.advance(t),
         }
     }
     fn freq(&self) -> u32 {

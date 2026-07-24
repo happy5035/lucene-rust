@@ -20,7 +20,7 @@ mod frozen;
 mod simd;
 pub mod view;
 
-pub use frozen::FrozenBitmap;
+pub use frozen::{FrozenBitmap, and_cardinality, intersect_docs, or_cardinality, union_docs};
 pub use view::{RoaringView, ViewCursor};
 
 /// Bitmap-source read gate (spec §5): only terms with df >= this threshold

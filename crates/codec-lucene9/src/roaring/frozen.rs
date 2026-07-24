@@ -166,6 +166,65 @@ impl FrozenBitmap {
     }
 }
 
+/// Materialized pairwise intersection fold + collect (M5 §2: croaring
+/// 物化 and + 结果迭代; strategy rationale 关键设计事实 8). Set ops on
+/// views always allocate a new owned Bitmap (probe REPORT §API surface);
+/// all croaring-typed values stay inside the codec — core has no croaring
+/// dependency (关键设计事实 7).
+pub fn intersect_docs(bitmaps: &[&FrozenBitmap]) -> Vec<u32> {
+    debug_assert!(!bitmaps.is_empty());
+    let mut acc = bitmaps[0].view().to_bitmap();
+    for b in &bitmaps[1..] {
+        acc = acc.and(&b.view());
+    }
+    acc.iter().collect()
+}
+
+/// Materialized pairwise union fold + collect (M5 §2).
+pub fn union_docs(bitmaps: &[&FrozenBitmap]) -> Vec<u32> {
+    debug_assert!(!bitmaps.is_empty());
+    let mut acc = bitmaps[0].view().to_bitmap();
+    for b in &bitmaps[1..] {
+        acc = acc.or(&b.view());
+    }
+    acc.iter().collect()
+}
+
+/// Intersection cardinality fold (M5 §2 count 快路径): k=2 never
+/// materializes (SIMD cardinality-only C path, µs级); k>2 materializes
+/// intermediates (the C API is pairwise).
+pub fn and_cardinality(bitmaps: &[&FrozenBitmap]) -> u64 {
+    match bitmaps {
+        [] => 0,
+        [a] => a.cardinality(),
+        [a, b] => a.and_cardinality(b),
+        [first, rest @ ..] => {
+            let mut acc = first.view().to_bitmap();
+            for b in rest {
+                acc = acc.and(&b.view());
+            }
+            acc.cardinality()
+        }
+    }
+}
+
+/// Union cardinality fold (M5 §2 count 快路径), same shape as
+/// `and_cardinality`.
+pub fn or_cardinality(bitmaps: &[&FrozenBitmap]) -> u64 {
+    match bitmaps {
+        [] => 0,
+        [a] => a.cardinality(),
+        [a, b] => a.or_cardinality(b),
+        [first, rest @ ..] => {
+            let mut acc = first.view().to_bitmap();
+            for b in rest {
+                acc = acc.or(&b.view());
+            }
+            acc.cardinality()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +306,39 @@ mod tests {
         let (a, b) = (Bitmap::of(&docs), Bitmap::of(&docs2));
         assert_eq!(bm.and_cardinality(&bm2), a.and_cardinality(&b));
         assert_eq!(bm.or_cardinality(&bm2), a.or_cardinality(&b));
+    }
+
+    #[test]
+    fn fold_ops_match_reference() {
+        let d1 = shaped(3, &[(0, 5000), (2, 3000)]);
+        let d2 = shaped(4, &[(0, 4000), (2, 6000)]);
+        let d3 = shaped(5, &[(1, 7000)]);
+        let mk = |d: &Vec<u32>| FrozenBitmap::open(&frozen_payload(d), d.len() as u32).unwrap();
+        let (b1, b2, b3) = (mk(&d1), mk(&d2), mk(&d3));
+        let (r1, r2, r3) = (Bitmap::of(&d1), Bitmap::of(&d2), Bitmap::of(&d3));
+        // k=2: pure cardinality fast path + materialized fold
+        assert_eq!(and_cardinality(&[&b1, &b2]), r1.and_cardinality(&r2));
+        assert_eq!(or_cardinality(&[&b1, &b2]), r1.or_cardinality(&r2));
+        assert_eq!(
+            intersect_docs(&[&b1, &b2]),
+            r1.and(&r2).iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            union_docs(&[&b1, &b2]),
+            r1.or(&r2).iter().collect::<Vec<_>>()
+        );
+        // k=3: materialized intermediates (C API is pairwise)
+        let r12 = r1.and(&r2);
+        assert_eq!(and_cardinality(&[&b1, &b2, &b3]), r12.and_cardinality(&r3));
+        let r123 = r1.or(&r2);
+        assert_eq!(or_cardinality(&[&b1, &b2, &b3]), r123.or_cardinality(&r3));
+        assert_eq!(
+            intersect_docs(&[&b1, &b2, &b3]),
+            r12.and(&r3).iter().collect::<Vec<_>>()
+        );
+        // edges
+        assert_eq!(and_cardinality(&[&b1]), d1.len() as u64);
+        assert_eq!(or_cardinality(&[]), 0);
     }
 
     #[test]

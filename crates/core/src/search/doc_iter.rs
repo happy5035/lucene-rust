@@ -623,8 +623,8 @@ impl DocIter for RoaringDocIter {
 // ── AND over views (M4 §5) ─────────────────────────────────────────────
 
 /// One merge-intersect / merge-union source (M5 §2): a frozen-view batch
-/// cursor, or a materialized low-df clause (df<4096, bounded). Both yield
-/// ascending docs with a forward-only advance.
+/// cursor, or a materialized doc slice (low-df clause or tier-1 fold
+/// result). Both yield ascending docs with a forward-only advance.
 pub enum DocSource {
     Bitmap { cur: BitmapCursor, doc: Option<u32> },
     Slice { docs: Vec<u32>, pos: usize },
@@ -638,8 +638,10 @@ impl DocSource {
         DocSource::Bitmap { cur, doc }
     }
 
-    /// Materialized low-df clause source (spec §5 档 2: df<4096 → ≤4095
-    /// docs, ascending by enum construction).
+    /// Materialized ascending-doc source: a low-df clause (spec §5 档 2:
+    /// df<4096 → ≤4095 docs, ascending by enum construction) or a tier-1
+    /// fold result (M5 §2 物化 and/or fold, ascending by croaring
+    /// iteration).
     pub fn slice(docs: Vec<u32>) -> DocSource {
         DocSource::Slice { docs, pos: 0 }
     }
@@ -685,12 +687,13 @@ impl DocSource {
     }
 }
 
-/// AND execution over views (M4 §5): merge-intersect over `sources`
-/// (full views + materialized slices); every agreed candidate is
-/// point-probed against each `probes` view (contains). Tier shapes:
-/// 档 1 偏斜 → sources=[最小侧 full], probes=其余；档 1 非偏斜 →
-/// sources=全部 full, probes=[]；档 2 → sources=物化 slices,
-/// probes=bitmap 子句. freq() is 1 (ConstantScore, trait default).
+/// AND execution (M5 §2): merge-intersect over `sources`; every agreed
+/// candidate is point-probed against each `probes` view (contains).
+/// Tier shapes: 档 1 偏斜 → sources=[最小侧 bitmap], probes=其余；档 1
+/// 非偏斜 → sources=[物化 `and` fold 结果 slice], probes=[]（croaring
+/// materialized fold, 关键设计事实 8）；档 2 → sources=物化 low-df
+/// slices, probes=bitmap 子句. freq() is 1 (ConstantScore, trait
+/// default).
 pub struct RoaringAndDocIter {
     sources: Vec<DocSource>,
     probes: Vec<FrozenBitmap>,
@@ -786,11 +789,11 @@ impl DocIter for RoaringAndDocIter {
     }
 }
 
-/// OR execution over views (M4 §6): k-way merge-union over `sources`
-/// (full-mode bitmap byte cursors + materialized low-df slices) with
-/// min-current dedup — zero container rebuilds. The full byte read is
-/// unavoidable (spec §2 明确不做); the rebuild tax is gone. freq() is 1
-/// (ConstantScore, trait default).
+/// OR execution (M5 §2): k-way merge-union over `sources` with
+/// min-current dedup. 全 bitmap → sources=[物化 `or` fold 结果 slice]
+/// （croaring materialized fold, 关键设计事实 8）；混合 → bitmap batch
+/// cursors + 物化 low-df slices. freq() is 1 (ConstantScore, trait
+/// default).
 pub struct RoaringOrDocIter {
     sources: Vec<DocSource>,
     doc: i32,

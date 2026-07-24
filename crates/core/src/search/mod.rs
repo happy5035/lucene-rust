@@ -1054,4 +1054,69 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
+
+    /// M5 T3 k=3 全 bitmap fold 语料：fa=[0,6000)、fb=[2000,9000)、
+    /// fc=[4000,12000)（df 都 ≥4096 有 bitmap）；交集 = [4000,6000) = 2000，
+    /// 并集 = [0,12000) = 12000。
+    fn write_fold_corpus(root: &std::path::Path, bitmap: bool) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema(), cfg).unwrap();
+        for d in 0..12000u32 {
+            let mut msg = String::new();
+            if d < 6000 {
+                msg.push_str("fa ");
+            }
+            if (2000..9000).contains(&d) {
+                msg.push_str("fb ");
+            }
+            if d >= 4000 {
+                msg.push_str("fc");
+            }
+            w.add_document(doc("INFO", &format!("tid-{d}"), msg.trim()))
+                .unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    /// k=3 全 bitmap 子句的物化 fold 迭代 + cardinality 快路径（spec §2），
+    /// 与 bitmap-off PFOR 逐位一致；锚点钉死交集/并集数值。
+    #[test]
+    fn and_or_three_clause_fold_matches_pfor() {
+        let root_off = temp_dir("foldoff");
+        let root_on = temp_dir("foldon");
+        write_fold_corpus(&root_off, false);
+        write_fold_corpus(&root_on, true);
+        let mut s_off = Searcher::open(&FSDirectory::open(&root_off).unwrap()).unwrap();
+        let mut s_on = Searcher::open(&FSDirectory::open(&root_on).unwrap()).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::and("message", &["fa", "fb", "fc"]),
+            Query::or("message", &["fa", "fb", "fc"]),
+            Query::and("message", &["fa", "fb"]),
+            Query::or("message", &["fa", "fb"]),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 15000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 15000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        assert_eq!(
+            s_on.count(&Query::and("message", &["fa", "fb", "fc"]))
+                .unwrap(),
+            2000
+        );
+        assert_eq!(
+            s_on.count(&Query::or("message", &["fa", "fb", "fc"]))
+                .unwrap(),
+            12000
+        );
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
 }

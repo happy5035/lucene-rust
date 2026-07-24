@@ -1,13 +1,15 @@
 //! Roaring execution for Boolean queries (M3 §5 three-tier rule per
-//! segment, M5 §2 croaring engine): each AND/OR clause's doc source is its
-//! validated inline bitmap — a frozen-view batch cursor — or, for clauses
-//! under the bitmap threshold, a query-time materialized doc vec (df<4096,
-//! bounded). AND tier-1: skewed → smallest-side iteration + contains
-//! probes (8.5–28.7 ns direct memory probes), non-skewed → k-way
-//! merge-intersect (T2 keeps the M4 shape; T3 swaps in the croaring
-//! materialized fold). OR: k-way merge-union over batch cursors +
-//! materialized slices. When NO clause has a bitmap the callers fall back
-//! to the existing PFOR conjunction/disjunction untouched (tier 3).
+//! segment, M5 §2 croaring engine): each clause's doc source is its
+//! validated inline bitmap — a frozen view — or, for clauses under the
+//! bitmap threshold, a query-time materialized doc vec (df<4096, bounded).
+//! AND tier-1: skewed → smallest-side iteration + contains probes
+//! (8.5–28.7 ns direct memory probes), non-skewed → croaring
+//! materialized `and` fold + result iteration (关键设计事实 8). OR
+//! tier-1: materialized `or` fold; tier-2 mixed: k-way merge-union over
+//! batch cursors + slices. Count over all-bitmap clauses is the
+//! and/or_cardinality fold (µs级, spec §2 — no per-doc driving). When NO
+//! clause has a bitmap the callers fall back to the existing PFOR
+//! conjunction/disjunction untouched (tier 3).
 
 use std::io;
 
@@ -20,11 +22,14 @@ use super::multi_term::for_each_doc;
 use super::segment_reader::SegmentReader;
 
 /// Tier-1 skew gate: when max/min df reaches this ratio the AND runs
-/// lead-cursor + contains() probes; below it, k-way merge-intersect. The
-/// M4 calibration (256) is carried over mechanically — T3 swaps the
-/// non-skewed strategy to the croaring materialized fold and resets the
-/// initial value, T5 recalibrates with croaring costs (关键设计事实 8).
-pub(crate) const SKEW_RATIO: u64 = 256;
+/// smallest-side iteration + contains() probes; below it, the croaring
+/// materialized `and` fold. Initial 4 pending T5 recalibration with
+/// croaring costs (contains 8.5–28.7 ns/probe, and_cardinality 7.7µs
+/// sparse / 4.2µs dense / 0.27µs run, materialized and 10.2µs sparse /
+/// 157µs dense — probe REPORT §Bench; method 关键设计事实 15). Both
+/// strategies pay both region reads under frozen (关键设计事实 6), so
+/// the crossover can only be measured.
+pub(crate) const SKEW_RATIO: u64 = 4; // bench-calibrated (T5)
 
 /// Collects the (df, entry) pairs of an And/Or's term clauses, df-sorted
 /// (conjunction cost order, same as the existing query.rs inline code).
@@ -118,11 +123,11 @@ fn and_iterator(
         sources.push(DocSource::bitmap(lead));
         probe_bitmaps.extend(it.map(|o| o.expect("tier 1: all present")));
     } else {
-        // tier 1 non-skewed (T2: M4 merge-intersect 形态; T3 换 croaring
-        // 物化 fold, 关键设计事实 8)
-        for opened in opened {
-            sources.push(DocSource::bitmap(opened.expect("tier 1: all present")));
-        }
+        // tier 1 non-skewed (spec §2): croaring materialized `and` fold
+        // + result iteration (关键设计事实 8)
+        let views: Vec<&FrozenBitmap> = opened.iter().map(|o| o.as_ref().unwrap()).collect();
+        let docs = codec_lucene9::roaring::intersect_docs(&views);
+        sources.push(DocSource::slice(docs));
     }
     Ok(Some(SegmentDocIter::RoaringAnd(RoaringAndDocIter::new(
         sources,
@@ -130,10 +135,9 @@ fn and_iterator(
     ))))
 }
 
-/// Tier-1/2 OR over frozen views (M5 §2): k-way merge-union — one open
-/// per clause (the open doubles as the bitmap-presence probe), batch
-/// cursors + materialized low-df slices. All-None = tier 3. (T3: 全
-/// bitmap 时换 croaring 物化 or fold.)
+/// Tier-1/2 OR (M5 §2): all-bitmap → croaring materialized `or` fold +
+/// result iteration; mixed → k-way merge-union over batch cursors +
+/// materialized low-df slices. All-None = tier 3.
 fn or_iterator(
     seg: &SegmentReader,
     entries: &[(u32, TermEntry)],
@@ -142,6 +146,13 @@ fn or_iterator(
     let Some(opened) = open_clauses(seg, entries)? else {
         return Ok(None); // tier 3
     };
+    if opened.iter().all(|o| o.is_some()) {
+        let views: Vec<&FrozenBitmap> = opened.iter().map(|o| o.as_ref().unwrap()).collect();
+        let docs = codec_lucene9::roaring::union_docs(&views);
+        return Ok(Some(SegmentDocIter::RoaringOr(RoaringOrDocIter::new(
+            vec![DocSource::slice(docs)],
+        ))));
+    }
     let mut sources: Vec<DocSource> = Vec::new();
     for ((_, entry), opened) in entries.iter().zip(opened.into_iter()) {
         match opened {
@@ -169,17 +180,31 @@ pub(crate) fn segment_iterator(
     }
 }
 
-/// Count (spec §5: count 走同一引擎): T2 驱动同一迭代器到尽头（count
-/// == 迭代结果数由构造保证）。None = tier 3, caller iterates. (T3: 全
-/// bitmap 时换 and/or_cardinality 快路径, spec §2.)
+/// Count (spec §2): all-bitmap clauses → and/or_cardinality fold (µs级,
+/// no per-doc driving); tier-2 mixed → drive the same iterator to
+/// exhaustion (bounded candidates; count == iteration by construction).
+/// None = tier 3, caller iterates.
 pub(crate) fn count(
     seg: &SegmentReader,
     entries: &[(u32, TermEntry)],
     has_freqs: bool,
     is_and: bool,
 ) -> io::Result<Option<u64>> {
+    let Some(opened) = open_clauses(seg, entries)? else {
+        return Ok(None); // tier 3
+    };
+    if opened.iter().all(|o| o.is_some()) {
+        let views: Vec<&FrozenBitmap> = opened.iter().map(|o| o.as_ref().unwrap()).collect();
+        return Ok(Some(if is_and {
+            codec_lucene9::roaring::and_cardinality(&views)
+        } else {
+            codec_lucene9::roaring::or_cardinality(&views)
+        }));
+    }
+    // tier 2: same-iterator count (reopening regions is µs级 and keeps
+    // the two entry points stateless)
     let Some(mut it) = segment_iterator(seg, entries, has_freqs, is_and)? else {
-        return Ok(None);
+        return Ok(None); // unreachable: open_clauses succeeded on the same bytes
     };
     let mut n = 0u64;
     loop {

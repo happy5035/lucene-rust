@@ -23,13 +23,16 @@ use super::segment_reader::SegmentReader;
 
 /// Tier-1 skew gate: when max/min df reaches this ratio the AND runs
 /// smallest-side iteration + contains() probes; below it, the croaring
-/// materialized `and` fold. Initial 4 pending T5 recalibration with
-/// croaring costs (contains 8.5–28.7 ns/probe, and_cardinality 7.7µs
-/// sparse / 4.2µs dense / 0.27µs run, materialized and 10.2µs sparse /
-/// 157µs dense — probe REPORT §Bench; method 关键设计事实 15). Both
-/// strategies pay both region reads under frozen (关键设计事实 6), so
-/// the crossover can only be measured.
-pub(crate) const SKEW_RATIO: u64 = 4; // bench-calibrated (T5)
+/// materialized `and` fold. T5 calibration (m5 skew micro, two nested
+/// ladders run/array-bitset containers, ratio 1..244, two rounds): the
+/// croaring fold won at EVERY measurable ratio (A/B 0.06–0.38 — fold
+/// 24–64µs vs probe 149–403µs; probe pays 4096 × (iter ~5ns +
+/// contains 8.5–28.7ns) plus per-candidate view creation, while the
+/// fold's SIMD C path is ratio-independent), so the gate sits above the
+/// 1M-corpus ladder max (244 → 256, same disposition as M4): the probe
+/// path stays for larger indexes where the crossover may exist, but is
+/// never taken at this scale (关键设计事实 8/15).
+pub(crate) const SKEW_RATIO: u64 = 256; // bench-calibrated (T5): fold wins all r≤244
 
 /// Collects the (df, entry) pairs of an And/Or's term clauses, df-sorted
 /// (conjunction cost order, same as the existing query.rs inline code).

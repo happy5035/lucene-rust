@@ -22,9 +22,14 @@ use super::segment_reader::SegmentReader;
 /// Tier-1 skew gate (M4 §5): when max/min df reaches this ratio the AND
 /// runs lead-cursor + contains() probes (the high-df side is never read
 /// wholesale, 用户指令②); below it, k-way byte-cursor merge-intersect.
-/// Initial value 4 per spec §5; T5 bench calibrates and records the
-/// chosen value in .superpowers/sdd/m4-bench-report.md.
-pub(crate) const SKEW_RATIO: u64 = 4; // bench-calibrated (T5)
+/// T5 calibration (.superpowers/sdd/m4-bench-report.md §4): the nested-df
+/// ladder micro-bench shows merge-intersect beating probe at EVERY
+/// measurable ratio (r=1..244, A/B 0.35–0.54 — a page-cache-hot
+/// sequential region read costs less than 4096 per-candidate probes at
+/// 1M-doc scale), so the gate sits just above the ladder max (rounded to
+/// a power of 2). Ratios > 244 require max_doc > 1M docs (min bitmap df
+/// 4096): the probe path remains for larger indexes, unmeasured here.
+pub(crate) const SKEW_RATIO: u64 = 256; // bench-calibrated (T5)
 
 /// Collects the (df, entry) pairs of an And/Or's term clauses, df-sorted
 /// (conjunction cost order, same as the existing query.rs inline code).

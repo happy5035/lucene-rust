@@ -951,8 +951,10 @@ mod tests {
     }
 
     /// M4 §5 skew 语料：20000 doc；rare df=4500（doc 0..4500）、common
-    /// df=20000（全量）——都 ≥4096 有 bitmap，df 比 4.44 ≥ SKEW_RATIO →
-    /// 档 1 偏斜：小侧全量模式迭代 + 大侧 contains probe。
+    /// df=20000（全量）——都 ≥4096 有 bitmap。df 比 4.44：T5 标定前
+    /// （SKEW_RATIO=4）走档 1 偏斜 probe；标定后（256，梯级微基准实测
+    /// merge 在 r≤244 全胜）走档 1 非偏斜 merge——两形态同为
+    /// RoaringAnd 迭代器，下方路径断言与 on/off 等价对两形态均成立。
     fn write_skew_corpus(root: &std::path::Path, bitmap: bool) {
         let mut cfg = IndexWriterConfig::default();
         cfg.bitmap = bitmap;

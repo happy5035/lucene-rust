@@ -606,4 +606,73 @@ mod tests {
         assert_eq!(docs, vec![0, 2]);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// M3 写侧：同一语料 bitmap off/on 两个索引，所有查询路径结果逐位一致；
+    /// bitmap 索引的 .doc 严格更大（缝隙字节确实写入）。读侧 roaring 接入在
+    /// T4/T5，这里验证的是"开了 --bitmap 写，既有读路径（校验失败自然落档
+    /// postings）结果完全不变"。
+    fn write_bitmap_corpus(root: &std::path::Path, bitmap: bool) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema(), cfg).unwrap();
+        for i in 0..5000u32 {
+            // hot: df=5000 ≥ 4096 → 命中；t0..t6: df≈714 不命中
+            w.add_document(doc("INFO", &format!("tid-{i}"), &format!("hot t{}", i % 7)))
+                .unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    #[test]
+    fn bitmap_write_keeps_all_results_identical() {
+        let root_off = temp_dir("bmoff");
+        let root_on = temp_dir("bmon");
+        write_bitmap_corpus(&root_off, false);
+        write_bitmap_corpus(&root_on, true);
+
+        // .doc 尺寸：on > off（hot 的 bitmap + len 后缀）
+        let doc_size = |root: &std::path::Path| -> u64 {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().map(|x| x == "doc").unwrap_or(false))
+                .map(|p| std::fs::metadata(p).unwrap().len())
+                .unwrap()
+        };
+        assert!(doc_size(&root_on) > doc_size(&root_off));
+
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let mut s_on = Searcher::open(&dir_on).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::term("message", "hot"),
+            Query::term("message", "t3"),
+            Query::term("level", "INFO"),
+            Query::term("tid", "tid-7"),
+            Query::and("message", &["hot", "t3"]),
+            Query::or("message", &["hot", "t3"]),
+            Query::or("message", &["t0", "t1", "t2"]),
+            Query::terms("message", &["hot", "t3", "nosuch"]),
+            Query::prefix("message", "ho"),
+            Query::MatchAll,
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        assert_eq!(
+            s_off.freq_sum(&Query::term("message", "hot")).unwrap(),
+            s_on.freq_sum(&Query::term("message", "hot")).unwrap()
+        );
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
 }

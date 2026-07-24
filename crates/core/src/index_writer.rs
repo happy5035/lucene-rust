@@ -16,6 +16,13 @@ pub struct IndexWriterConfig {
     /// project spec; Lucene's fair-comparison counterpart is
     /// IndexWriterConfig.setRAMBufferSizeMB.
     pub max_ram_bytes: usize,
+    /// M3 §4 (experimental, default off): build inline roaring bitmaps for
+    /// terms with df >= `bitmap_threshold` at segment flush. Off ⇒ the
+    /// written index is byte-identical to M2.
+    pub bitmap: bool,
+    /// df threshold for the inline bitmap (spec §4: 4096 对齐 level-1 skip
+    /// 粒度 32×128).
+    pub bitmap_threshold: u32,
 }
 
 impl Default for IndexWriterConfig {
@@ -23,6 +30,8 @@ impl Default for IndexWriterConfig {
         Self {
             max_buffered_docs: 1_000_000,
             max_ram_bytes: 512 * 1024 * 1024,
+            bitmap: false,
+            bitmap_threshold: 4096,
         }
     }
 }
@@ -72,7 +81,13 @@ impl IndexWriter {
 
     pub fn add_document(&mut self, doc: Document) -> io::Result<()> {
         if self.builder.is_none() {
-            self.builder = Some(SegmentBuilder::new(self.dir.clone(), self.segment_counter));
+            let mut b = SegmentBuilder::new(self.dir.clone(), self.segment_counter);
+            b.set_bitmap_threshold(if self.config.bitmap {
+                Some(self.config.bitmap_threshold)
+            } else {
+                None
+            });
+            self.builder = Some(b);
             self.segment_counter += 1;
         }
         let b = self.builder.as_mut().unwrap();

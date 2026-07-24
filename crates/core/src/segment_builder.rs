@@ -42,6 +42,8 @@ pub struct SegmentBuilder {
     seg_id: [u8; 16],
     dw: DocWriter,
     sfw: Option<StoredFieldsWriter>,
+    /// M3 §4: Some(t) → finalize 时对 df >= t 的 term 写内联 bitmap。
+    bitmap_threshold: Option<u32>,
 }
 
 impl SegmentBuilder {
@@ -55,11 +57,18 @@ impl SegmentBuilder {
             seg_id: random_id(),
             dw: DocWriter::new(),
             sfw: None,
+            bitmap_threshold: None,
         }
     }
 
     pub fn buffered_docs(&self) -> u32 {
         self.dw.max_doc
+    }
+
+    /// M3 §4: `Some(t)` → write inline roaring bitmaps for terms with
+    /// df >= t at finalize; None (default) keeps .doc byte-identical to M2.
+    pub fn set_bitmap_threshold(&mut self, threshold: Option<u32>) {
+        self.bitmap_threshold = threshold;
     }
 
     /// Approximate RAM held by the indexing buffers (postings/docvalues/
@@ -93,6 +102,7 @@ impl SegmentBuilder {
             seg_id,
             mut dw,
             sfw,
+            bitmap_threshold,
         } = self;
         let max_doc = dw.max_doc as i32;
 
@@ -149,7 +159,8 @@ impl SegmentBuilder {
             .enumerate()
             .any(|(n, f)| f.is_indexed() && field_has_terms(&dw, n));
         if has_indexed {
-            let mut pw = PostingsWriter::new(&dir, &seg_name, &seg_id)?;
+            let mut pw = PostingsWriter::new(&dir, &seg_name, &seg_id)?
+                .with_bitmap_threshold(bitmap_threshold);
             for (number, spec) in dw.fields().iter().enumerate() {
                 if !spec.is_indexed() || !field_has_terms(&dw, number) {
                     continue;

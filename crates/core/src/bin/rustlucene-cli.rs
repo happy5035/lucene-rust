@@ -859,6 +859,7 @@ fn logbench(
 }
 
 /// Single-writer log-schema indexing (the interop counterpart of JavaLogBench).
+/// `bitmap` = Some(threshold) → M3 §4 inline roaring bitmaps (experimental).
 fn logwrite(
     index_dir: &Path,
     num_docs: u32,
@@ -866,13 +867,15 @@ fn logwrite(
     positions: bool,
     sparse: bool,
     bigdict: bool,
+    bitmap: Option<u32>,
 ) -> std::io::Result<()> {
     let vocab = vocab();
-    let mut w = IndexWriter::create(
-        index_dir,
-        log_schema(positions, bigdict),
-        IndexWriterConfig::default(),
-    )?;
+    let mut config = IndexWriterConfig::default();
+    if let Some(t) = bitmap {
+        config.bitmap = true;
+        config.bitmap_threshold = t;
+    }
+    let mut w = IndexWriter::create(index_dir, log_schema(positions, bigdict), config)?;
     let mut rng = XorShift::new(seed);
     let t0 = Instant::now();
     for doc_id in 0..num_docs {
@@ -1232,7 +1235,7 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli write <indexDir> <numDocs> <docBytes> <seed> [goldenFile]");
     eprintln!("  rustlucene-cli bench <indexDir> <numDocs> <docBytes> <seed> [threads]");
     eprintln!("  rustlucene-cli index <inputFileOrDir> <indexDir> [--positions] [--docs N]");
-    eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions]");
+    eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions] [--sparse] [--bigdict] [--bitmap [--bitmap-threshold N]]");
     eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
@@ -1306,6 +1309,18 @@ fn main() -> std::io::Result<()> {
             let positions = args[5..].iter().any(|a| a == "--positions");
             let sparse = args[5..].iter().any(|a| a == "--sparse");
             let bigdict = args[5..].iter().any(|a| a == "--bigdict");
+            let bitmap = if args[5..].iter().any(|a| a == "--bitmap") {
+                let threshold = args[5..]
+                    .windows(2)
+                    .find_map(|w| {
+                        (w[0] == "--bitmap-threshold")
+                            .then(|| w[1].parse::<u32>().unwrap_or_else(|_| usage()))
+                    })
+                    .unwrap_or(4096);
+                Some(threshold)
+            } else {
+                None
+            };
             logwrite(
                 Path::new(&args[2]),
                 args[3].parse().unwrap(),
@@ -1313,6 +1328,7 @@ fn main() -> std::io::Result<()> {
                 positions,
                 sparse,
                 bigdict,
+                bitmap,
             )
         }
         "jsonindex" => {

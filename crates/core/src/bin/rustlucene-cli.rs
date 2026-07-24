@@ -1316,7 +1316,11 @@ fn main() -> std::io::Result<()> {
                         (w[0] == "--bitmap-threshold")
                             .then(|| w[1].parse::<u32>().unwrap_or_else(|_| usage()))
                     })
-                    .unwrap_or(4096);
+                    .unwrap_or(4096)
+                    // 读侧门槛固定 BITMAP_MIN_DF=4096：低于它的阈值只产永不探测的
+                    // 死字节（终审 Minor 1）；clamp 到 >=4096。高于 4096 会放宽档 2
+                    // 物化上界（df∈[4096,t) 的子句），正确性不受影响。
+                    .max(4096);
                 Some(threshold)
             } else {
                 None

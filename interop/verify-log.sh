@@ -42,7 +42,7 @@ echo "== Search diff: searchdump vs VerifySearchIndex"
 
 if [ "$POSITIONS" = "--bitmap" ]; then
   echo "== Bitmap A/B: Rust searchdump bitmap on vs off (RL_BITMAP=0)"
-  cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
+  env -u RL_BITMAP cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
     searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" > /tmp/rl-search-bitmap-on.out
   RL_BITMAP=0 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- \
     searchdump "$RUST_DIR" "$NUM_DOCS" "$SEED" > /tmp/rl-search-bitmap-off.out

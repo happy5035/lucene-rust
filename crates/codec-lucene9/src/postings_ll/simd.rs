@@ -22,8 +22,9 @@
 //!
 //! ## Safety argument (module-level `allow(unsafe_code)`)
 //!
-//! The crate is `#![deny(unsafe_code)]`; this module is the single, narrow
-//! exception, and every unsafe operation is an AVX2/SSE intrinsic inside a
+//! The crate is `#![deny(unsafe_code)]`; this module and `roaring/simd.rs`
+//! are the two narrow exceptions, and every unsafe operation is an AVX2/SSE
+//! intrinsic inside a
 //! `#[target_feature(enable = "avx2")]` function. Those functions are only
 //! reached through [`try_decode`], which gates on a cached
 //! `is_x86_feature_detected!("avx2")` (cpuid-based, also works on the

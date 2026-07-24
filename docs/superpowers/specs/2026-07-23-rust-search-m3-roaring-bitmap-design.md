@@ -96,7 +96,7 @@ Term 单查询：有 bitmap → cardinality O(1)（只读 bitmap 头）/ 容器�
 走 bitmap 无收益）。**freq/freq_sum 永远走 postings**（bitmap 无 freq）。
 
 - `RoaringDocIter` 实现 DocIter 协议：array 二分、bitset next_set_bit、run 区间跳。
-- And：容器对分发——array∩array galloping、bitset∩bitset AVX2（512 bit/指令）+ popcount、
+- And：容器对分发——array∩array galloping、bitset∩bitset AVX2（256 bit/指令）+ popcount、
   run∩run 双指针；Or 对偶。结果仍是 roaring，直接迭代，不物化成数组。
 - 惰性加载：open 不读任何 bitmap；term 首次触及才读（len+头一次小读，payload 按需）。
 

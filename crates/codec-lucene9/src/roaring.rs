@@ -15,6 +15,9 @@ use std::io;
 use crate::io::{DataInput, DataOutput, IndexInput, IndexOutput};
 
 mod simd;
+pub mod view;
+
+pub use view::{RoaringView, ViewCursor};
 
 /// Bitmap-source read gate (spec §5): only terms with df >= this threshold
 /// attempt the inline-bitmap path.

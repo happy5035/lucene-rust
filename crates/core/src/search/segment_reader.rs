@@ -7,7 +7,7 @@ use std::io;
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
-use codec_lucene9::roaring::RoaringBitmap;
+use codec_lucene9::roaring::{RoaringBitmap, RoaringView};
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
@@ -98,6 +98,24 @@ impl SegmentReader {
         }
         self.postings
             .read_term_bitmap_header(entry, self.max_doc as u32)
+    }
+
+    /// Zero-copy full-mode bitmap view (M4 §4) for Term iteration / OR /
+    /// the AND small side. None → postings fallback.
+    pub(crate) fn open_term_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringView>> {
+        if !bitmap_enabled() {
+            return Ok(None);
+        }
+        self.postings.open_term_bitmap(entry, self.max_doc as u32)
+    }
+
+    /// Probe-mode bitmap view (M4 §4, AND 大侧定点测位): container
+    /// directory scan only, data sections read per-probe.
+    pub(crate) fn probe_term_bitmap(&self, entry: &TermEntry) -> io::Result<Option<RoaringView>> {
+        if !bitmap_enabled() {
+            return Ok(None);
+        }
+        self.postings.probe_term_bitmap(entry, self.max_doc as u32)
     }
 
     /// Look up a field info by name (for Boolean query construction).

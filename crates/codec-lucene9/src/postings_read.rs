@@ -13,7 +13,7 @@ use crate::postings_ll::{
     BLOCK_SIZE, for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints,
     read_vint15, read_vlong15,
 };
-use crate::roaring::{self, RoaringBitmap};
+use crate::roaring::{self, RoaringBitmap, RoaringView};
 use crate::terms_read::TermEntry;
 
 /// DocIdSetIterator.NO_MORE_DOCS.
@@ -222,6 +222,38 @@ impl PostingsReader {
             return Ok(None);
         }
         Ok(Some(card as u64))
+    }
+
+    /// Zero-copy full-mode view over the term's inline bitmap (M4 §4):
+    /// v2 triple validation + one sequential region read; None →
+    /// postings fallback. The query path's Term/OR/AND-small-side entry
+    /// point (replaces the M3 deserialize-rebuild `read_term_bitmap`,
+    /// which stays until T4 for the write-side round-trip tests).
+    pub fn open_term_bitmap(
+        &self,
+        entry: &TermEntry,
+        max_doc: u32,
+    ) -> io::Result<Option<RoaringView>> {
+        let mut input = self.fresh_input()?;
+        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
+            return Ok(None);
+        };
+        RoaringView::open_full(input, start, len, entry.doc_freq)
+    }
+
+    /// Zero-copy probe-mode view (M4 §4, AND 大侧专用): container-
+    /// directory header scan only — data sections are read per-probe by
+    /// `RoaringView::contains`, never wholesale (用户指令②).
+    pub fn probe_term_bitmap(
+        &self,
+        entry: &TermEntry,
+        max_doc: u32,
+    ) -> io::Result<Option<RoaringView>> {
+        let mut input = self.fresh_input()?;
+        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
+            return Ok(None);
+        };
+        RoaringView::open_probe(input, start, len, entry.doc_freq)
     }
 }
 
@@ -1564,6 +1596,65 @@ mod tests {
         let e2 = seek(&dir2, &fis2, "tx", b"hot");
         assert!(postings2.read_term_bitmap(&e2, 6000).unwrap().is_none());
         assert_eq!(postings2.read_term_bitmap_header(&e2, 6000).unwrap(), None);
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
+    }
+
+    /// M4 §4 两种打开模式：full 视图游标迭代 == postings；probe contains
+    /// 与之一致；未命中 / df 不符 / 无 bitmap 索引全部 None。
+    #[test]
+    fn open_and_probe_term_bitmap_match_postings() {
+        let root = temp_dir("bitmap-view");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        let e = seek(&dir, &fis, "tx", b"hot"); // docs 0..5000 → single run container
+
+        // full mode: cardinality + byte-cursor iteration == postings
+        let v = postings
+            .open_term_bitmap(&e, 6000)
+            .unwrap()
+            .expect("hot has a full view");
+        assert_eq!(v.cardinality(), 5000);
+        let mut cur = v.cursor();
+        for expected in 0..5000u32 {
+            assert_eq!(v.cursor_next(&mut cur), Some(expected));
+        }
+        assert_eq!(v.cursor_next(&mut cur), None);
+
+        // probe mode: contains agrees on both sides of the boundary
+        let mut p = postings
+            .probe_term_bitmap(&e, 6000)
+            .unwrap()
+            .expect("hot has a probe view");
+        for d in [0u32, 1, 42, 4999] {
+            assert!(p.contains(d).unwrap(), "probe {d}");
+        }
+        for d in [5000u32, 5001, 6000, 9 << 16] {
+            assert!(!p.contains(d).unwrap(), "probe miss {d}");
+        }
+
+        // below the df read gate: None (and no read attempted)
+        let e = seek(&dir, &fis, "tx", b"warm");
+        assert!(postings.open_term_bitmap(&e, 6000).unwrap().is_none());
+        assert!(postings.probe_term_bitmap(&e, 6000).unwrap().is_none());
+
+        // df mismatch (>= gate, so the header check fires): None
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let mut bad = e;
+        bad.doc_freq = 4096; // real df is 5000; 4096 >= BITMAP_MIN_DF
+        assert!(postings.open_term_bitmap(&bad, 6000).unwrap().is_none());
+        assert!(postings.probe_term_bitmap(&bad, 6000).unwrap().is_none());
+
+        // index written without bitmaps: natural None
+        let root2 = temp_dir("bitmap-view-off");
+        let dir2 = FSDirectory::open(&root2).unwrap();
+        let (fis2, _, _) = write_segment(&dir2);
+        let postings2 = PostingsReader::open(&dir2, "_0", &[4u8; 16]).unwrap();
+        let e2 = seek(&dir2, &fis2, "tx", b"hot");
+        assert!(postings2.open_term_bitmap(&e2, 6000).unwrap().is_none());
+        assert!(postings2.probe_term_bitmap(&e2, 6000).unwrap().is_none());
 
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&root2).unwrap();

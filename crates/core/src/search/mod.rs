@@ -846,7 +846,7 @@ mod tests {
         let dir_on = FSDirectory::open(&root_on).unwrap();
         let mut reader = Reader::open(&dir_on).unwrap();
         let (_base, seg) = reader.leaves().next().unwrap();
-        // 档 1：两个子句都有 bitmap（M4：RoaringAnd = 字节游标 + probe）
+        // 档 1：两个子句都有 bitmap（M5：RoaringAnd = 物化 fold / 偏斜 probe）
         let q = Query::and("message", &["hot", "scorching"]);
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(

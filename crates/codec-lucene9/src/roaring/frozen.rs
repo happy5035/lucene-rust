@@ -11,7 +11,7 @@
 //! `roaring_bitmap_frozen_view` performs (cookie, typecodes, exact length —
 //! roaring.c:18153-18203): the C side signals invalid bytes with NULL, and
 //! the croaring wrapper asserts non-null (croaring-2.7.0
-//! src/bitmap/view.rs:34), so without the pre-check corrupt bytes would
+//! src/bitmap/view.rs:33), so without the pre-check corrupt bytes would
 //! panic instead of falling back. Post-open, `cardinality == df` is
 //! rechecked (validation ③). Any failure → None, the silent postings
 //! fallback (查询永不报错).
@@ -56,6 +56,8 @@ fn validate_frozen_layout(payload: &[u8]) -> Option<()> {
         return None;
     }
     let num = (header >> 15) as usize;
+    // 有意比 C 严：C 接受 num_containers==0（4B 空 frozen bitmap，roaring.c:18156
+    // 零次循环），但写侧恒 df >= BITMAP_MIN_DF(4096) 必有 container，收紧无漏。
     if num < 1 || n < 4 + num * 5 {
         return None;
     }

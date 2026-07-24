@@ -1484,6 +1484,19 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// M5 §3 校验③：头内 df != termState.doc_freq → Ok(None) 落档
+    ///（df 门的直接用例；版本门/cardinality 门各有专项）。
+    #[test]
+    fn open_term_bitmap_rejects_df_mismatch() {
+        let root = temp_dir("bitmap-df-mismatch");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        let mut e = seek(&dir, &fis, "tx", b"hot");
+        e.doc_freq = 4096; // 真实 df 是 5000；4096 >= BITMAP_MIN_DF 故会走到校验③
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+        assert!(postings.open_term_bitmap(&e, 6000).unwrap().is_none());
+    }
+
     /// M5 §2/§3 frozen view 打开：view 迭代与 postings 逐 doc 一致，
     /// contains 抽样一致，cardinality == doc_freq（write_segment_bitmap
     /// 语料：tx "hot" df=5000，docs = 0..5000）。

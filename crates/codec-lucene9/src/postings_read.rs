@@ -13,6 +13,7 @@ use crate::postings_ll::{
     BLOCK_SIZE, for_delta_util_decode, pfor_util_decode, pfor_util_skip, read_group_vints,
     read_vint15, read_vlong15,
 };
+use crate::roaring::{self, RoaringBitmap};
 use crate::terms_read::TermEntry;
 
 /// DocIdSetIterator.NO_MORE_DOCS.
@@ -134,6 +135,90 @@ impl PostingsReader {
     /// An independent positioned stream over .doc (enums own their cursor).
     fn fresh_input(&self) -> io::Result<IndexInput> {
         self.doc_in.slice(0, self.doc_in.length())
+    }
+
+    /// Locates + bounds-checks the inline bitmap region for `entry`
+    /// (`[docStartFP-4-len, docStartFP-4)`, M3 §4). Returns
+    /// Some((region_start, len)). Implements the read gate (df >=
+    /// BITMAP_MIN_DF, spec §5) and validation ① (len bound); never seeks
+    /// below 0 — `docStartFP >= 4 + len` is required before any read
+    /// (正确性硬性要求 b). Shares the caller's positioned stream.
+    fn locate_bitmap_region(
+        input: &mut IndexInput,
+        entry: &TermEntry,
+        max_doc: u32,
+    ) -> io::Result<Option<(u64, u32)>> {
+        if entry.doc_freq < roaring::BITMAP_MIN_DF {
+            return Ok(None);
+        }
+        let fp = entry.state.doc_start_fp;
+        if fp < 4 {
+            return Ok(None);
+        }
+        input.seek(fp - 4)?;
+        let len = input.read_int()? as u32;
+        if len == 0 || len as u64 > roaring::max_bitmap_len(max_doc) {
+            return Ok(None);
+        }
+        if fp - 4 < len as u64 {
+            return Ok(None);
+        }
+        Ok(Some((fp - 4 - len as u64, len)))
+    }
+
+    /// Reads + fully validates the inline roaring bitmap preceding this
+    /// term's postings (M3 §4): len bound → magic/version → header df ==
+    /// termState.doc_freq (+ cardinality == df) → crc32. ANY failure
+    /// yields `Ok(None)`, the caller's silent-fallback signal (spec §4:
+    /// 静默落档 postings，查询永不报错). Uses its own positioned slice of
+    /// the .doc stream (fresh_input pattern, postings_read.rs:135).
+    pub fn read_term_bitmap(
+        &self,
+        entry: &TermEntry,
+        max_doc: u32,
+    ) -> io::Result<Option<RoaringBitmap>> {
+        let mut input = self.fresh_input()?;
+        let Some((start, len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
+            return Ok(None);
+        };
+        input.seek(start)?;
+        let mut buf = vec![0u8; len as usize];
+        input.read_bytes(&mut buf)?;
+        Ok(RoaringBitmap::deserialize(&buf, entry.doc_freq))
+    }
+
+    /// Header-only read for count queries (M3 §5: count 查询只读头):
+    /// locate (len bound) + magic + version + header df, then return the
+    /// header cardinality. The payload crc32 is unreachable without
+    /// reading the payload; the combined false-positive probability of the
+    /// three applicable checks is ~2^-40 (spec §4 误判概率实际为零), and a
+    /// failed check falls back to the caller's doc_freq path.
+    pub fn read_term_bitmap_header(
+        &self,
+        entry: &TermEntry,
+        max_doc: u32,
+    ) -> io::Result<Option<u64>> {
+        let mut input = self.fresh_input()?;
+        let Some((start, _len)) = Self::locate_bitmap_region(&mut input, entry, max_doc)? else {
+            return Ok(None);
+        };
+        input.seek(start)?;
+        let mut magic = [0u8; 4];
+        input.read_bytes(&mut magic)?;
+        if magic != roaring::BITMAP_MAGIC {
+            return Ok(None);
+        }
+        if input.read_byte()? != roaring::BITMAP_VERSION {
+            return Ok(None);
+        }
+        if input.read_vint()? as u32 != entry.doc_freq {
+            return Ok(None);
+        }
+        let card = input.read_vint()? as u32;
+        if card != entry.doc_freq {
+            return Ok(None);
+        }
+        Ok(Some(card as u64))
     }
 }
 
@@ -1429,5 +1514,55 @@ mod tests {
             assert!(crate::roaring::RoaringBitmap::deserialize(&region, e.doc_freq).is_none());
         }
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn read_term_bitmap_validates_and_reads() {
+        let root = temp_dir("bitmap-read");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment_bitmap(&dir);
+        let postings = PostingsReader::open(&dir, "_0", &[4u8; 16]).unwrap();
+
+        // 命中 term：全量读 + 四重校验通过，内容 == postings
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let bitmap = postings
+            .read_term_bitmap(&e, 6000)
+            .unwrap()
+            .expect("hot has a valid bitmap");
+        assert_eq!(bitmap.cardinality(), 5000);
+        let mut cur = bitmap.cursor();
+        for expected in 0..5000u32 {
+            assert_eq!(bitmap.cursor_next(&mut cur), Some(expected));
+        }
+        // count 专用只读头：cardinality == df
+        assert_eq!(
+            postings.read_term_bitmap_header(&e, 6000).unwrap(),
+            Some(5000)
+        );
+
+        // 未命中 term（df < 4096 读侧门槛）：None，且不做任何读
+        let e = seek(&dir, &fis, "tx", b"warm");
+        assert!(postings.read_term_bitmap(&e, 6000).unwrap().is_none());
+        assert_eq!(postings.read_term_bitmap_header(&e, 6000).unwrap(), None);
+
+        // df 不符（entry 的 df 与 bitmap 头内 df 不同，但 ≥ 门槛以越过
+        // 读侧 gate）：校验③失败 → None
+        let e = seek(&dir, &fis, "tx", b"hot");
+        let mut bad = e;
+        bad.doc_freq = 4096; // 真实 df 是 5000；4096 ≥ BITMAP_MIN_DF 故会走到校验③
+        assert!(postings.read_term_bitmap(&bad, 6000).unwrap().is_none());
+        assert_eq!(postings.read_term_bitmap_header(&bad, 6000).unwrap(), None);
+
+        // 不开 bitmap 写的索引：自然 None（校验①/②失败）
+        let root2 = temp_dir("bitmap-read-off");
+        let dir2 = FSDirectory::open(&root2).unwrap();
+        let (fis2, _, _) = write_segment(&dir2);
+        let postings2 = PostingsReader::open(&dir2, "_0", &[4u8; 16]).unwrap();
+        let e2 = seek(&dir2, &fis2, "tx", b"hot");
+        assert!(postings2.read_term_bitmap(&e2, 6000).unwrap().is_none());
+        assert_eq!(postings2.read_term_bitmap_header(&e2, 6000).unwrap(), None);
+
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
     }
 }

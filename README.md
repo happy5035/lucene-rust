@@ -1,6 +1,6 @@
 # RustLucene
 
-用 Rust 重写的 **Lucene 9.12.3 格式兼容索引写入器**：追加写（append-only）链路，产出 Java Lucene 9.12.3 可读的段文件与 `segments_N` 提交点。读取 / 检索 / 段合并不在范围内——由 Java Lucene 担任读侧做校验（`CheckIndex` + 查询结果逐条 diff）。
+用 Rust 重写的 **Lucene 9.12.3 格式兼容索引**：追加写（append-only）链路，产出 Java Lucene 9.12.3 可读的段文件与 `segments_N` 提交点；并提供 **Rust 搜索读路径**（Term / Phrase / Boolean / multi-term / 范围 / 排序，ConstantScore 无打分），高 df term 可选内联 Roaring bitmap 加速。段合并不在范围内——Java Lucene 担任交叉校验（`CheckIndex` + 查询结果逐条 diff）。
 
 全部格式细节以 `reference/lucene-9.12.3/` 源码为唯一事实来源，逐文件对照并注释出处（见 `docs/format-notes-*.md`）。
 
@@ -35,9 +35,24 @@
 - 多线程：文档分片到多个私有 `SegmentBuilder`（无共享可变状态），`commit_segments` 把各分片的段并成一个提交点
 - 段命名 / seg id / diagnostics 与 Java 一致；无 DV/points 字段时不产生对应文件
 
+### 搜索读路径（`crates/core/src/search`，M2）
+
+- **查询能力**（由写入能力严格限定，全部 ConstantScore、无打分 / norms / impact）：Term、Phrase（slop=0）、Boolean must/should、Terms（IN 语义）、Prefix、Wildcard（`*`/`?`，前缀形走 FST 前缀扫）、1D PointRange（BKD）、MatchAll、Sort by NumericDV / SortedDV、stored 批量取回
+- **架构**：方案 C——执行语义逐行对照 Lucene 9.12.3 源码（advance 协议、position 合取、BKD 边界、MISSING 排序），对象结构 Rust 化：`enum Query` + `trait DocIter`，不做 Java 式 Query/Weight/Scorer 继承体系
+- **快照语义**：open 即快照，重开即刷新（无 NRT 原地 refresh）；单线程逐段执行
+- 只保证读**本系统写出的**索引（无 delete / `.liv` / norms）；Java 写的索引可读但不做删除语义
+
+### 高 df term 内联 Roaring bitmap（M3–M5）
+
+- **格式**（Lucene 兼容附加字节）：写侧 `--bitmap` 开启后，对 df ≥ 4096 的 term 在 `.doc` 流内、该 term postings **之前**内联 `[magic "RLBM" + version + df + cardinality + Frozen payload][len u32]`。FST output（docStartFP）不动——bitmap 紧邻其前，`docStartFP-4` 取 len 回退定位；Java 读写该索引零感知，CheckIndex 照常通过。无 bitmap / 版本不符 → 四重校验失败静默落档 postings
+- **引擎**：croaring（CRoaring C 库）2.7.0。v3 格式直接写 **Frozen 序列化**（Lucene 离线场景的标准用法），读侧 `FrozenBitmap::view()` 对齐缓冲零拷贝打开（~60ns），AND/OR 走 croaring 的 SIMD C 容器算子；count 命中 `and_cardinality` 快路径不物化
+- **三档执行**：档 1 全部子句有 bitmap → 纯 roaring fold（AND 按 df 升序 fold，df 偏斜 ≥256x 时改 probe：小侧迭代 + 大侧 `contains`）；档 2 混合 → bitmap 侧物化后与 postings 迭代器对齐；档 3 纯低 df → 原生 PFOR + 跳表（保留 Lucene 跳读红利）
+- **演进结论**（M3→M5 三次引擎迭代的教训）：M3 自研容器 + 每查询全量反序列化 → 稠密快（8.7x/15.2x）但稀疏倒挂（反序列化税 ~13ns/doc）；M4 零拷贝字节游标视图去掉了反序列化税，却丢了容器级折叠 → 稠密回退；M5 Frozen 格式让"零拷贝视图"与"容器级 SIMD 算子"两全，稀疏稠密全面转正
+- 读侧总开关 `RL_BITMAP=0`（落档纯 PFOR，用于 A/B 对拍）
+
 ### 工具与集成
 
-- CLI `rustlucene-cli`：`write` / `bench` / `index <文件或目录> [--positions] [--docs N]` / `logwrite` / `logbench` / `jsonindex <jsonlFile> <indexDir> <schemaSpec>` / `jsongen`
+- CLI `rustlucene-cli`：`write` / `bench` / `index <文件或目录> [--positions] [--docs N]` / `logwrite [--bitmap]` / `logbench` / `searchbench <indexDir> <field> [--load-queries F] [--warmup N] [--iter N]` / `jsonindex <jsonlFile> <indexDir> <schemaSpec>` / `jsongen`
 - JNI 绑定（`crates/jni-binding`，cdylib）：`RustIndexWriter` 供 Java 进程内调用；除逐字段 API 外提供**批量 JSON 写入** `addJsonBatch(byte[][])`——原始 JSON 字节整批一次 JNI 穿越，解析 / 强转 / 过滤 / 绑定全在 Rust 内闭环
 - JSON 绑定层（`core/src/json.rs`）：schema spec 声明类型与索引配置（`name:type+mods[@json键]`、`$policy=` 指令），未知字段三策略：`strict`（过滤）/ `dynamic`（按值类型推断并自动注册，对齐 Lucene 动态字段语义）/ `stored-only`
 - 互操作脚本：`interop/verify-index.sh`、`interop/verify-log.sh`、`interop/compare-index.sh`（同语料双侧建索引 + CheckIndex + term 级 diff，`--json` 模式为 rust / java-jni / java 三方对比）；`make interop-test` / `log-test` / `bench` / `log-bench` / `compare`
@@ -109,28 +124,52 @@ JSONL 写入（20 万篇 7 字段日志 JSON，`compare-index.sh --json` 口径�
 
 JNI 批量路径达到纯 Rust 的 ~84%、stock Java 的 2.8×——每批一次 JNI 穿越摊薄了调用开销，JSON 解析只在 Rust 侧发生一次；剩余差距主要是 `byte[]` 拷贝。JIT 预热 / 火焰图 CPU 归因分析见 `docs/bench-jit-warmup-flamegraph.md`。
 
+### 搜索性能（M5 终值，1M docs 日志语料，--no-cache 同口径，qps 比）
+
+roaring（`--bitmap` 索引）vs 同索引纯 PFOR（`RL_BITMAP=0`）vs Java Lucene 9.12.3：
+
+| 分组 | roaring / PFOR | roaring / Java |
+|---|---|---|
+| term high | 1.06 | 1.38 |
+| and high | **7.02** | **2.28** |
+| or high | **12.70** | **1.88** |
+| iterm high | 1.23 | 0.67 |
+| and / or 稠密（df≈200k，bitset 容器） | **23.1 / 43.8** | — |
+
+- 高 df 布尔是 bitmap 的主场：M3 时稀疏 AND 倒挂 0.55x，M5 修到 7.02x（对自身 PFOR）并反超 Java 2.28x；稠密 regime and/or 提升 23–44 倍
+- term count = doc_freq 直读，bitmap 零开销（~1.0x 校验）；iterm 靠 frozen view 批量迭代小幅领先 PFOR
+- 写侧代价：吞吐损失 3.6–3.8%、索引体积 +15%（2262 个高 df term 各配一份 bitmap）
+- **诚实残留**：vs Java 仍有 med 桶（df 4096–数万）未反超——or med 0.38、iterm med 0.62、and med 0.94；Java 的 DocIdSetIterator + 跳表 + JIT 热循环在该区间仍快 1.5–2.6x
+
+详细口径与逐组数字见 `docs/m3-bench-report.md`（M3 基线）与 `.superpowers/sdd/m5-bench-report.md`（M5 终值，gitignored）。
+
 ## 格式兼容验证
 
-- 双侧 `CheckIndex` 零错误（单段、8 段并发、稀疏、大字典、positions 等场景全覆盖）
-- 查询结果与同语料 Java 索引**逐条 diff 一致**：term count、point range、sort by DV、phrase、DV 基数 / 字典 hash
+- 双侧 `CheckIndex` 零错误（单段、8 段并发、稀疏、大字典、positions、bitmap 等场景全覆盖，`make log-test` 五变体 11 次 "No problems"）
+- 查询结果与同语料 Java 索引**逐条 diff 一致**：term count、boolean and/or、prefix / wildcard / terms、point range、sort by DV、phrase、DV 基数 / 字典 hash
+- bitmap A/B 对拍：roaring 路径 vs 纯 PFOR 路径（`RL_BITMAP=0`）hit-counts 逐位一致；v1/v2 旧格式索引自动落档
 - 低层编码字节级 golden vectors 对齐 `ForUtil` / `ForDeltaUtil` / `PForUtil`；FST `.tip` 由 Java `FST.read` 读回逐条比对
-- `cargo test` 98 项全绿
+- `cargo test`：codec-lucene9 153 项 + rustlucene-core 46 项全绿
 
 ## 快速开始
 
 ```bash
 make build          # cargo build --release + javac interop 工具
 make interop-test   # M1 文本链路：Rust 写 → Java CheckIndex + 查询 diff
-make log-test       # M2 日志 schema 四轮互操作验证
+make log-test       # 日志 schema 五变体互操作验证（含 --bitmap、forceMerge）
 make compare INPUT=/path/to/logs NDOCS=500000   # 同语料 Rust/Java 对比
-make log-bench LOGDOCS=1000000 LOGTHREADS=8     # 日志场景基准
+make log-bench LOGDOCS=1000000 LOGTHREADS=8     # 日志场景写入基准
+# 搜索基准：先建 bitmap 索引，再三路对拍（roaring / RL_BITMAP=0 / Java --no-cache）
+cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- logwrite /tmp/idx 1000000 42 --bitmap
+cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- searchbench /tmp/idx message --warmup 10 --iter 30
 ```
 
 ## 范围与限制
 
-- 只写不读：读取 / 检索 / 段合并（merge）委托 Java Lucene；`commit_segments` 已预留多段合并提交接口
-- 无打分配置：一律 omitNorms、不写 `.nvm/.nvd/.nrm`
-- `IndexWriter::create` 仅支持 CREATE（空目录建索引），暂不支持追加打开已有索引
-- 暂不支持：SortedSet / Binary / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）
+- 段合并（merge）、delete / 更新不在范围内（`commit_segments` 已预留多段合并提交接口）；写侧仅 CREATE（空目录建索引），暂不支持追加打开已有索引
+- 无打分：写侧一律 omitNorms、不写 `.nvm/.nvd/.nrm`；读侧全部 ConstantScore
+- 读侧只保证读本系统写出的索引（无 `.liv` / norms / vector）；NRT 为 open 即快照、重开即刷新
+- 暂不支持：SortedSet / Binary / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet
+- bitmap 为实验性写侧开关（`--bitmap` 默认 off）：只加速 docs 维度，phrase / freq 永远落档 postings；multi-term 的 roaring 集成未做
 
-详细里程碑报告见 `docs/m1-report.md`、`docs/m2-report.md`；格式笔记见 `docs/format-notes-*.md`。
+里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲）；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。

@@ -440,6 +440,21 @@ fn sexpr_node(toks: &[&str], pos: &mut usize) -> Result<Query, String> {
             sexpr_close(toks, pos)?;
             Ok(Query::phrase(field, &[t1, t2]))
         }
+        "RANGE" => {
+            let field = sexpr_atom(toks, pos)?;
+            let low: i64 = sexpr_atom(toks, pos)?
+                .parse()
+                .map_err(|_| "RANGE low must be a decimal i64".to_string())?;
+            let high: i64 = sexpr_atom(toks, pos)?
+                .parse()
+                .map_err(|_| "RANGE high must be a decimal i64".to_string())?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::PointRange {
+                field: field.to_string(),
+                low,
+                high,
+            })
+        }
         "AND" | "OR" => {
             let occur = if head == "AND" {
                 Occur::Must
@@ -1732,5 +1747,32 @@ mod tests {
         assert!(parse_bool_sexpr("(TERM f a) junk").is_err());
         assert!(parse_bool_sexpr("(NOT (TERM f a) (TERM f b))").is_err());
         assert!(parse_bool_sexpr("(BOOL (FILTER (TERM f a)))").is_err());
+    }
+
+    /// RANGE 叶子 → Query::PointRange（钉死的跨任务接口，T-B 交付执行）。
+    #[test]
+    fn parse_bool_sexpr_range_leaf() {
+        let q = parse_bool_sexpr(
+            "(AND (TERM level INFO) (NOT (RANGE timestamp 1700000000000 1700000100000)))",
+        )
+        .unwrap();
+        let Query::Bool { clauses } = &q else {
+            panic!("top must be Bool");
+        };
+        let Query::Bool {
+            clauses: not_clauses,
+        } = &clauses[1].1
+        else {
+            panic!("NOT child must be Bool");
+        };
+        assert_eq!(
+            not_clauses[0].1,
+            Query::PointRange {
+                field: "timestamp".to_string(),
+                low: 1_700_000_000_000,
+                high: 1_700_000_100_000,
+            }
+        );
+        assert!(parse_bool_sexpr("(RANGE timestamp abc 5)").is_err());
     }
 }

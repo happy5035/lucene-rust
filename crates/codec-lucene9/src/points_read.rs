@@ -325,6 +325,324 @@ fn decode_node(
     Ok(())
 }
 
+/// PointValues.Relation (:223-230).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Relation {
+    Inside,
+    Outside,
+    Crosses,
+}
+
+/// PointRangeQuery.relate (:145-167) specialized to numDims == 1: the
+/// unsigned byte compares degenerate to signed i64 compares on unpacked
+/// values (sortable byte order == signed order).
+fn relate(cell_lo: i64, cell_hi: i64, low: i64, high: i64) -> Relation {
+    if cell_lo > high || cell_hi < low {
+        Relation::Outside // :152-155
+    } else if cell_lo < low || cell_hi > high {
+        Relation::Crosses // :157-163
+    } else {
+        Relation::Inside // :164-166
+    }
+}
+
+impl PointsReader {
+    /// PointValues.intersect driver (:344-380) for 1D inclusive ranges.
+    /// `visitor` receives (value, doc_id) per matching point — multi-valued
+    /// docs arrive once per value; dedup is the caller's job (spec §3.2).
+    /// `intersect(field, i64::MIN, i64::MAX, ..)` doubles as the forceMerge
+    /// point-enumeration channel (spec §4.2).
+    ///
+    /// `low > high` is tolerated here as an empty result (relate naturally
+    /// reports Outside everywhere — Java `newRangeQuery` does not reject it
+    /// either, PointRangeQuery.checkArgs :100-110); the `Err(InvalidInput)`
+    /// contract lives at the `Query::PointRange` layer (spec §3.1).
+    pub fn intersect(
+        &self,
+        field: &str,
+        low: i64,
+        high: i64,
+        visitor: &mut dyn FnMut(i64, i32),
+    ) -> io::Result<()> {
+        let Some((_, m)) = self.fields.iter().find(|(name, _)| name == field) else {
+            return Ok(()); // 段内无此 point 字段：空命中（null-scorer 语义）
+        };
+        // IntPoint 复用（spec §3.1）：4 字节字段把查询界 clamp 进 i32 值域；
+        // 整区间出界 → 零回调。
+        let (low, high) = if m.bytes_per_dim == 4 {
+            if low > i32::MAX as i64 || high < i32::MIN as i64 {
+                return Ok(());
+            }
+            (
+                low.clamp(i32::MIN as i64, i32::MAX as i64),
+                high.clamp(i32::MIN as i64, i32::MAX as i64),
+            )
+        } else {
+            (low, high)
+        };
+        // root cell == [min_value, max_value]（.kdm min/max packed value）
+        self.intersect_node(
+            m,
+            0,
+            m.num_leaves,
+            m.min_value,
+            m.max_value,
+            low,
+            high,
+            visitor,
+        )
+    }
+
+    /// PointValues.intersect (:352-380) recursive driver, 1D:
+    /// Outside → 跳过（不读 .kdd）；Inside → 整子树逐叶全收（无逐点过滤）；
+    /// Crosses → 内部节点按 split 收紧 cell 界递归、叶内逐点过滤。
+    #[allow(clippy::too_many_arguments)]
+    fn intersect_node(
+        &self,
+        m: &FieldMeta,
+        leaves_offset: usize,
+        num_leaves: usize,
+        cell_lo: i64,
+        cell_hi: i64,
+        low: i64,
+        high: i64,
+        visitor: &mut dyn FnMut(i64, i32),
+    ) -> io::Result<()> {
+        match relate(cell_lo, cell_hi, low, high) {
+            Relation::Outside => Ok(()), // :355-357
+            Relation::Inside => {
+                // visitDocIDs 全收 (:358-361)——本实现 visitor 需要 value，
+                // 逐叶全量解码但跳过过滤（与 addAll :562-586 的偏差见模块 doc）
+                for i in 0..num_leaves {
+                    self.visit_leaf(m, leaves_offset + i, None, visitor)?;
+                }
+                Ok(())
+            }
+            Relation::Crosses => {
+                if num_leaves == 1 {
+                    // visitDocValues 逐点过滤 (:371-373)
+                    self.visit_leaf(m, leaves_offset, Some((low, high)), visitor)
+                } else {
+                    let num_left = get_num_left_leaf_nodes(num_leaves);
+                    let right_offset = leaves_offset + num_left;
+                    let split = m.splits[right_offset - 1];
+                    // left cell [lo, split], right cell [split, hi]
+                    // (pushBoundsLeft/Right, BKDReader.java:375-426)
+                    self.intersect_node(
+                        m,
+                        leaves_offset,
+                        num_left,
+                        cell_lo,
+                        split,
+                        low,
+                        high,
+                        visitor,
+                    )?;
+                    self.intersect_node(
+                        m,
+                        right_offset,
+                        num_leaves - num_left,
+                        split,
+                        cell_hi,
+                        low,
+                        high,
+                        visitor,
+                    )?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// One leaf: decode every (value, doc) and callback; the `filter`
+    /// (Crosses 叶) drops out-of-range points (PointRangeQuery.matches
+    /// :130-143).
+    fn visit_leaf(
+        &self,
+        m: &FieldMeta,
+        leaves_offset: usize,
+        filter: Option<(i64, i64)>,
+        visitor: &mut dyn FnMut(i64, i32),
+    ) -> io::Result<()> {
+        for (value, doc) in self.read_leaf(m, leaves_offset)? {
+            if let Some((low, high)) = filter {
+                if value < low || value > high {
+                    continue;
+                }
+            }
+            visitor(value, doc as i32);
+        }
+        Ok(())
+    }
+
+    /// BKDReader.visitDocValues(fp) (:607-631) + readDocIDs (:633-644):
+    /// leaf block = VInt count + docs block + commonPrefix block + values
+    /// block (writer points.rs:267-296, reversed). Random access via the
+    /// packed index's leaf fp (BKDPointTree.getLeafBlockFP :490-494).
+    fn read_leaf(&self, m: &FieldMeta, leaves_offset: usize) -> io::Result<Vec<(i64, u32)>> {
+        let fp = m.leaf_fps[leaves_offset];
+        let mut input = self.data_in.slice(fp, self.data_in.length() - fp)?;
+        let count = input.read_vint()?; // :637
+        if count <= 0 || count as usize > MAX_POINTS_IN_LEAF_NODE {
+            return Err(corrupt(format!(
+                "leaf point count {count} outside [1, {MAX_POINTS_IN_LEAF_NODE}]"
+            )));
+        }
+        let count = count as usize;
+        let docs = read_doc_ids(&mut input, count)?; // :639
+
+        // readCommonPrefixes (:947-957), single dim
+        let common_prefix_len = input.read_vint()? as usize;
+        if common_prefix_len > m.bytes_per_dim {
+            return Err(corrupt(format!(
+                "commonPrefixLen {common_prefix_len} > bytesPerDim {}",
+                m.bytes_per_dim
+            )));
+        }
+        let mut value_base = [0u8; 8];
+        input.read_bytes(&mut value_base[..common_prefix_len])?;
+
+        // readCompressedDim (:937-945)
+        let compressed_dim = input.read_byte()? as i8;
+        let mut points: Vec<(i64, u32)> = Vec::with_capacity(count);
+        match compressed_dim {
+            -1 => {
+                // visitUniqueRawDocValues (:893-901): the common prefix IS the value
+                let v = unpack_value(&value_base, m.bytes_per_dim);
+                for &doc in &docs {
+                    points.push((v, doc));
+                }
+            }
+            0 => {
+                // visitCompressedDocValues (:903-935), 1D: run-length on the
+                // byte at compressedByteOffset == commonPrefixLen (:914-916)
+                if common_prefix_len == m.bytes_per_dim {
+                    return Err(corrupt("compressedDim 0 with a full common prefix"));
+                }
+                let suffix_len = m.bytes_per_dim - common_prefix_len - 1;
+                let mut i = 0usize;
+                while i < count {
+                    let run_byte = input.read_byte()?; // :919
+                    let run_len = input.read_byte()? as usize; // :920
+                    if run_len == 0 || i + run_len > count {
+                        return Err(corrupt(format!(
+                            "bad run {run_len} at point {i}/{count} (:931-934)"
+                        )));
+                    }
+                    for j in 0..run_len {
+                        let mut v = value_base;
+                        v[common_prefix_len] = run_byte;
+                        input.read_bytes(
+                            &mut v[common_prefix_len + 1..common_prefix_len + 1 + suffix_len],
+                        )?; // :922-927
+                        points.push((unpack_value(&v, m.bytes_per_dim), docs[i + j]));
+                    }
+                    i += run_len;
+                }
+            }
+            d => {
+                return Err(corrupt(format!(
+                    "unsupported compressedDim {d} (the low-cardinality -2 branch is never \
+                     emitted by this system's writer, points.rs:284-294)"
+                )));
+            }
+        }
+        Ok(points)
+    }
+}
+
+/// DocIdsWriter.readInts (:182-206): all five write-side branches reversed
+/// (writer points.rs:339-410). Flags -2/-1/16/24/32 (DocIdsWriter.java:30-34);
+/// 0 (LEGACY_DELTA_VINT, :36) is never emitted by 9.x writers and rejected.
+fn read_doc_ids(input: &mut impl DataInput, count: usize) -> io::Result<Vec<u32>> {
+    debug_assert!(count > 0);
+    let mut docs = vec![0u32; count];
+    match input.read_byte()? as i8 {
+        -2 => {
+            // readContinuousIds (:217-222)
+            let start = input.read_vint()? as u32;
+            for (i, d) in docs.iter_mut().enumerate() {
+                *d = start.wrapping_add(i as u32);
+            }
+        }
+        -1 => {
+            // readBitSet (:233-240) via readBitSetIterator (:208-215)
+            let offset_words = input.read_vint()? as u64;
+            let word_count = input.read_vint()? as usize;
+            let mut pos = 0usize;
+            for w in 0..word_count as u64 {
+                let mut word = input.read_long()? as u64;
+                let base = ((offset_words + w) << 6) as u32;
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    if pos >= count {
+                        return Err(corrupt("bitset doc ids overflow count"));
+                    }
+                    docs[pos] = base.wrapping_add(bit);
+                    pos += 1;
+                    word &= word - 1;
+                }
+            }
+            if pos != count {
+                return Err(corrupt(format!(
+                    "bitset cardinality {pos} != count {count} (:239)"
+                )));
+            }
+        }
+        16 => {
+            // readDelta16 (:242-254): VInt min; count/2 LE ints pairing
+            // delta[i] (high 16) with delta[halfLen+i] (low 16); odd tail
+            // as one LE short.
+            let min = input.read_vint()? as u32;
+            let half_len = count / 2;
+            let mut packed = Vec::with_capacity(half_len);
+            for _ in 0..half_len {
+                packed.push(input.read_int()? as u32);
+            }
+            for i in 0..half_len {
+                docs[i] = (packed[i] >> 16).wrapping_add(min);
+                docs[half_len + i] = (packed[i] & 0xFFFF).wrapping_add(min);
+            }
+            if count & 1 == 1 {
+                docs[count - 1] = (input.read_short()? as u16 as u32).wrapping_add(min);
+            }
+        }
+        24 => {
+            // readInts24 (:256-274): 8 docs per 3 LE longs, MSB-first
+            // 24-bit lanes; tail docs as LE short(doc >>> 8) + byte(doc).
+            let mut i = 0usize;
+            while i + 8 <= count {
+                let l1 = input.read_long()? as u64;
+                let l2 = input.read_long()? as u64;
+                let l3 = input.read_long()? as u64;
+                docs[i] = (l1 >> 40) as u32;
+                docs[i + 1] = ((l1 >> 16) & 0xFF_FFFF) as u32;
+                docs[i + 2] = (((l1 & 0xFFFF) << 8) | (l2 >> 56)) as u32;
+                docs[i + 3] = ((l2 >> 32) & 0xFF_FFFF) as u32;
+                docs[i + 4] = ((l2 >> 8) & 0xFF_FFFF) as u32;
+                docs[i + 5] = (((l2 & 0xFF) << 16) | (l3 >> 48)) as u32;
+                docs[i + 6] = ((l3 >> 24) & 0xFF_FFFF) as u32;
+                docs[i + 7] = (l3 & 0xFF_FFFF) as u32;
+                i += 8;
+            }
+            while i < count {
+                docs[i] = ((input.read_short()? as u16 as u32) << 8) | input.read_byte()? as u32;
+                i += 1;
+            }
+        }
+        32 => {
+            // readInts32 (:276-278)
+            for d in docs.iter_mut() {
+                *d = input.read_int()? as u32;
+            }
+        }
+        other => {
+            return Err(corrupt(format!("unknown doc ids flag {other} (:203-205)")));
+        }
+    }
+    Ok(docs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +831,233 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---------- 行为级辅助：collect + brute force ----------
+
+    fn collect(reader: &PointsReader, field: &str, low: i64, high: i64) -> Vec<(i64, i32)> {
+        let mut hits = Vec::new();
+        reader
+            .intersect(field, low, high, &mut |v, d| hits.push((v, d)))
+            .unwrap();
+        hits.sort();
+        hits
+    }
+
+    fn brute_force(points: &[(i64, u32)], low: i64, high: i64) -> Vec<(i64, i32)> {
+        let mut v: Vec<(i64, i32)> = points
+            .iter()
+            .filter(|&&(val, _)| val >= low && val <= high)
+            .map(|&(val, d)| (val, d as i32))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn field_meta<'a>(reader: &'a PointsReader, field: &str) -> &'a FieldMeta {
+        &reader
+            .fields
+            .iter()
+            .find(|(n, _)| n == field)
+            .unwrap_or_else(|| panic!("field {field} exists"))
+            .1
+    }
+
+    /// 写侧按 (value, doc) 排序后 512 一切（points.rs:174-205）——期望的叶序列。
+    fn expected_leaves(points: &[(i64, u32)]) -> Vec<Vec<(i64, u32)>> {
+        let mut sorted = points.to_vec();
+        sorted.sort();
+        sorted
+            .chunks(MAX_POINTS_IN_LEAF_NODE)
+            .map(|c| c.to_vec())
+            .collect()
+    }
+
+    // ---------- 叶解码（read_leaf 直调，五分支 doc ids 全覆盖） ----------
+
+    #[test]
+    fn read_leaf_matches_writer_layout() {
+        // 数据形态即写侧五分支测试的形态（points.rs:1417-1461）：
+        // continuous（连续 doc）、bitset（稀疏严格序）、delta16（重复 doc
+        // 小跨度 / 稀疏大步）、bpv24（doc 跨度 > 0xFFFF）、bpv32（> 0xFFFFFF）
+        let cases: Vec<(&str, Vec<(i64, u32)>)> = vec![
+            (
+                "continuous",
+                (0..2000u32).map(|i| (i as i64 * 7, i)).collect(),
+            ),
+            ("bitset", (0..2000u32).map(|i| (i as i64, i * 3)).collect()),
+            (
+                "delta16",
+                (0..2000u32).map(|i| (i as i64, (i / 2) as u32)).collect(),
+            ),
+            ("bpv24", gen_long_points(&mut Rng(42), 5000, 1_000_000)),
+            ("bpv32", gen_long_points(&mut Rng(43), 5000, 1_000_000_000)),
+        ];
+        for (tag, points) in cases {
+            let (root, fis) = write_segment(tag, &[(0, "ts", points.clone())], &[]);
+            let reader = open(&root, &fis);
+            let m = field_meta(&reader, "ts");
+            let expected = expected_leaves(&points);
+            assert_eq!(m.num_leaves, expected.len(), "{tag}");
+            for (i, want) in expected.iter().enumerate() {
+                assert_eq!(reader.read_leaf(m, i).unwrap(), *want, "{tag} leaf {i}");
+            }
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn read_leaf_all_equal_and_int() {
+        // 全等值叶（compressedDim -1 分支）+ 分裂 delta 0 链
+        let points: Vec<(i64, u32)> = (0..1200u32).map(|doc| (777, doc)).collect();
+        let (root, fis) = write_segment("leaf-equal", &[(0, "ts", points.clone())], &[]);
+        let reader = open(&root, &fis);
+        let m = field_meta(&reader, "ts");
+        assert_eq!(m.splits, vec![777, 777]);
+        for (i, want) in expected_leaves(&points).iter().enumerate() {
+            assert_eq!(reader.read_leaf(m, i).unwrap(), *want, "leaf {i}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+        // int 字段：i32 值解包宽化为 i64
+        let ints: Vec<(i32, u32)> = vec![(i32::MIN, 3), (0, 1), (i32::MAX, 2), (-1, 5), (1, 4)];
+        let (root, fis) = write_segment("leaf-int", &[], &[(5, "lvl", ints)]);
+        let reader = open(&root, &fis);
+        let m = field_meta(&reader, "lvl");
+        let got = reader.read_leaf(m, 0).unwrap();
+        let mut want: Vec<(i64, u32)> = vec![
+            (i32::MIN as i64, 3),
+            (-1, 5),
+            (0, 1),
+            (1, 4),
+            (i32::MAX as i64, 2),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---------- intersect：三分支 + 边界 + clamp + 多值点 ----------
+
+    #[test]
+    fn intersect_matches_brute_force_multileaf() {
+        let mut rng = Rng(0xC0FFEE);
+        let points = gen_long_points(&mut rng, 5000, 3000); // 10 叶
+        let (root, fis) = write_segment("intersect-5k", &[(0, "ts", points.clone())], &[]);
+        let reader = open(&root, &fis);
+        let sorted_vals: Vec<i64> = {
+            let mut v: Vec<i64> = points.iter().map(|p| p.0).collect();
+            v.sort();
+            v
+        };
+        let (lo, mid, hi) = (sorted_vals[1000], sorted_vals[2500], sorted_vals[4000]);
+        for (low, high) in [
+            (i64::MIN, i64::MAX),   // 全区间：root 直接 Inside
+            (mid, mid),             // 点查询退化 [v,v]
+            (lo, hi),               // 中部区间：三分支都打
+            (hi + 1, hi + 1000),    // 可能不相交
+            (i64::MIN, lo),         // 贴 MIN
+            (hi, i64::MAX),         // 贴 MAX
+            (1_000_000, 1_000_000), // 生成器值域内单点
+        ] {
+            assert_eq!(
+                collect(&reader, "ts", low, high),
+                brute_force(&points, low, high),
+                "range [{low}, {high}]"
+            );
+        }
+        // 保证不相交（生成器 full-range 分支是 u64 转 i64，不保证留出空隙，
+        // 用全空值域之外的区间锁不相交路径）
+        assert!(
+            collect(&reader, "ts", i64::MAX - 1, i64::MAX)
+                .iter()
+                .all(|&(v, _)| v >= i64::MAX - 1)
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_disjoint_is_empty() {
+        let points: Vec<(i64, u32)> = (0..1000u32).map(|i| (i as i64, i)).collect();
+        let (root, fis) = write_segment("intersect-disjoint", &[(0, "ts", points)], &[]);
+        let reader = open(&root, &fis);
+        assert!(collect(&reader, "ts", 2000, 3000).is_empty());
+        assert!(collect(&reader, "ts", -100, -1).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_multivalued_docs_callback_per_value() {
+        // 多值点逐值回调（spec §3.2：调用方去重，codec 不去重）
+        let points: Vec<(i64, u32)> = vec![(5, 3), (50, 3), (500, 3), (70, 8), (5, 8)];
+        let (root, fis) = write_segment("intersect-multi", &[(0, "ts", points)], &[]);
+        let reader = open(&root, &fis);
+        assert_eq!(
+            collect(&reader, "ts", i64::MIN, i64::MAX),
+            vec![(5, 3), (5, 8), (50, 3), (70, 8), (500, 3)]
+        );
+        assert_eq!(collect(&reader, "ts", 5, 5), vec![(5, 3), (5, 8)]);
+        assert_eq!(collect(&reader, "ts", 6, 100), vec![(50, 3), (70, 8)]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_int_field_clamps_bounds() {
+        let ints: Vec<(i32, u32)> = (0..100u32).map(|i| (i as i32 - 50, i)).collect();
+        let (root, fis) = write_segment("intersect-int", &[], &[(5, "lvl", ints.clone())]);
+        let reader = open(&root, &fis);
+        let as_i64: Vec<(i64, u32)> = ints.iter().map(|&(v, d)| (v as i64, d)).collect();
+        // i64 全域 → clamp 到 i32 全域
+        assert_eq!(
+            collect(&reader, "lvl", i64::MIN, i64::MAX),
+            brute_force(&as_i64, i64::MIN, i64::MAX)
+        );
+        // 部分出界 clamp
+        assert_eq!(
+            collect(&reader, "lvl", i64::MIN, -40),
+            brute_force(&as_i64, -50, -40)
+        );
+        // 整区间出 i32 域 → 零回调（spec §3.1 clamp-to-empty）
+        assert!(collect(&reader, "lvl", i32::MAX as i64 + 1, i64::MAX).is_empty());
+        assert!(collect(&reader, "lvl", i64::MIN, i32::MIN as i64 - 1).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_boundaries_min_max() {
+        let points: Vec<(i64, u32)> = vec![
+            (i64::MIN, 0),
+            (i64::MIN + 1, 1),
+            (-1, 2),
+            (0, 3),
+            (1, 4),
+            (i64::MAX - 1, 5),
+            (i64::MAX, 6),
+        ];
+        let (root, fis) = write_segment("intersect-minmax", &[(0, "ts", points.clone())], &[]);
+        let reader = open(&root, &fis);
+        for (low, high) in [
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, -1),
+            (1, i64::MAX),
+            (i64::MIN, i64::MAX),
+        ] {
+            assert_eq!(
+                collect(&reader, "ts", low, high),
+                brute_force(&points, low, high),
+                "range [{low}, {high}]"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_unknown_field_is_empty() {
+        let points: Vec<(i64, u32)> = vec![(1, 0)];
+        let (root, fis) = write_segment("intersect-unknown", &[(0, "ts", points)], &[]);
+        let reader = open(&root, &fis);
+        assert!(collect(&reader, "nope", i64::MIN, i64::MAX).is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -54,6 +54,7 @@ import org.apache.lucene.util.BytesRef;
  *   TERMS\t<bucket>\t<term1,term2,...,termN>   (N=4 -> label "terms",
  *                                              N>16 -> label "termsbig")
  *   PHRASE\t<bucket>\t<term1>\t<term2>         (only when the field has positions)
+ *   BOOL\t<bucket>\t<sexpr>                    (nested BooleanQuery, S-expression; see M6 spec §2.6)
  * --load-queries replays AND/OR lines verbatim (MUST+MUST / SHOULD+SHOULD
  * msm=1, both wrapped in ConstantScoreQuery) when present, and only falls
  * back to self-sampling when the file has none — so Java and the Rust
@@ -248,6 +249,125 @@ public class SearchBench {
         return gen.name() + "\t" + bucketLabel(bucket) + "\t" + idx;
     }
 
+    /**
+     * M6 BOOL 行 S 表达式解析（与 rustlucene-cli parse_bool_sexpr 同一
+     * grammar，见 M6 计划 Task A「查询文件格式」一节）。叶子包
+     * ConstantScoreQuery（与既有 AND/OR 行同款）；OR 节点显式 msm=1；
+     * BOOL 混合节点：无 MUST 且有 SHOULD 时 msm=1（= Lucene 默认化简，
+     * 显式钉死），有 MUST 时 SHOULD 纯可选（msm=0）。
+     */
+    static Query parseBoolSexpr(String s) {
+        String spaced = s.replace("(", " ( ").replace(")", " ) ").trim();
+        List<String> toks = new ArrayList<>();
+        for (String t : spaced.split("\\s+")) toks.add(t);
+        int[] pos = {0};
+        Query q = parseBoolNode(toks, pos);
+        if (pos[0] != toks.size())
+            throw new IllegalArgumentException("trailing tokens at " + pos[0]);
+        return q;
+    }
+
+    static String sexprAtom(List<String> toks, int[] pos) {
+        if (pos[0] >= toks.size())
+            throw new IllegalArgumentException("unexpected end of sexpr");
+        String t = toks.get(pos[0]);
+        if (t.equals("(") || t.equals(")"))
+            throw new IllegalArgumentException("expected atom, found '" + t + "'");
+        pos[0]++;
+        return t;
+    }
+
+    static void sexprClose(List<String> toks, int[] pos) {
+        if (pos[0] >= toks.size() || !toks.get(pos[0]).equals(")"))
+            throw new IllegalArgumentException("expected ')' at token " + pos[0]);
+        pos[0]++;
+    }
+
+    static Query parseBoolNode(List<String> toks, int[] pos) {
+        if (pos[0] >= toks.size() || !toks.get(pos[0]).equals("("))
+            throw new IllegalArgumentException("expected '(' at token " + pos[0]);
+        pos[0]++;
+        String head = sexprAtom(toks, pos);
+        switch (head) {
+            case "TERM": {
+                String f = sexprAtom(toks, pos), t = sexprAtom(toks, pos);
+                sexprClose(toks, pos);
+                return new ConstantScoreQuery(new TermQuery(new Term(f, t)));
+            }
+            case "PREFIX": {
+                String f = sexprAtom(toks, pos), p = sexprAtom(toks, pos);
+                sexprClose(toks, pos);
+                return new ConstantScoreQuery(new PrefixQuery(new Term(f, p)));
+            }
+            case "WILDCARD": {
+                String f = sexprAtom(toks, pos), p = sexprAtom(toks, pos);
+                sexprClose(toks, pos);
+                return new ConstantScoreQuery(new WildcardQuery(new Term(f, p)));
+            }
+            case "PHRASE": {
+                String f = sexprAtom(toks, pos), t1 = sexprAtom(toks, pos), t2 = sexprAtom(toks, pos);
+                sexprClose(toks, pos);
+                return new ConstantScoreQuery(new PhraseQuery(f, t1, t2));
+            }
+            case "RANGE": {
+                String f = sexprAtom(toks, pos);
+                long lo = Long.parseLong(sexprAtom(toks, pos));
+                long hi = Long.parseLong(sexprAtom(toks, pos));
+                sexprClose(toks, pos);
+                return new ConstantScoreQuery(LongPoint.newRangeQuery(f, lo, hi));
+            }
+            case "AND": case "OR": {
+                BooleanClause.Occur occur = head.equals("AND")
+                        ? BooleanClause.Occur.MUST : BooleanClause.Occur.SHOULD;
+                BooleanQuery.Builder b = new BooleanQuery.Builder();
+                int n = 0;
+                while (pos[0] < toks.size() && !toks.get(pos[0]).equals(")")) {
+                    b.add(parseBoolNode(toks, pos), occur);
+                    n++;
+                }
+                sexprClose(toks, pos);
+                if (n == 0) throw new IllegalArgumentException(head + " needs at least one child");
+                if (occur == BooleanClause.Occur.SHOULD) b.setMinimumNumberShouldMatch(1);
+                return new ConstantScoreQuery(b.build());
+            }
+            case "NOT": {
+                Query sub = parseBoolNode(toks, pos);
+                sexprClose(toks, pos);
+                BooleanQuery.Builder b = new BooleanQuery.Builder();
+                b.add(sub, BooleanClause.Occur.MUST_NOT);
+                return new ConstantScoreQuery(b.build());
+            }
+            case "BOOL": {
+                BooleanQuery.Builder b = new BooleanQuery.Builder();
+                boolean hasMust = false, hasShould = false;
+                int n = 0;
+                while (pos[0] < toks.size() && !toks.get(pos[0]).equals(")")) {
+                    if (!toks.get(pos[0]).equals("("))
+                        throw new IllegalArgumentException("expected clause at token " + pos[0]);
+                    pos[0]++;
+                    String occ = sexprAtom(toks, pos);
+                    BooleanClause.Occur occur;
+                    switch (occ) {
+                        case "MUST": occur = BooleanClause.Occur.MUST; hasMust = true; break;
+                        case "SHOULD": occur = BooleanClause.Occur.SHOULD; hasShould = true; break;
+                        case "NOT": occur = BooleanClause.Occur.MUST_NOT; break;
+                        default: throw new IllegalArgumentException(
+                                "BOOL clause occur must be MUST/SHOULD/NOT, found '" + occ + "'");
+                    }
+                    b.add(parseBoolNode(toks, pos), occur);
+                    sexprClose(toks, pos);
+                    n++;
+                }
+                sexprClose(toks, pos);
+                if (n == 0) throw new IllegalArgumentException("BOOL needs at least one clause");
+                if (hasShould && !hasMust) b.setMinimumNumberShouldMatch(1);
+                return new ConstantScoreQuery(b.build());
+            }
+            default:
+                throw new IllegalArgumentException("unknown node head '" + head + "'");
+        }
+    }
+
     /** Build a flat list of queries from the term dictionary. */
     static List<Query> buildQueries(
             IndexReader reader, String field, int tasksPer, Random rng,
@@ -400,6 +520,40 @@ public class SearchBench {
                             }
                         }
                     }
+                    // M6 nested BOOL lines (S 表达式, spec M6 §2.6): 四种
+                    // 确定性形状——拍平 AND / 拍平 OR（同字段纯 Term，Rust
+                    // 侧命中 roaring 三档）与 MUST(OR)+NOT / 三层
+                    // OR(AND(NOT))（通用组合器路径）。
+                    for (FreqBucket bucket : FreqBucket.values()) {
+                        List<TermStats> sample = buckets.get(bucket);
+                        if (sample.size() < 4) continue;
+                        for (int i = 0; i < tasks; i++) {
+                            String t1 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String t2 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String t3 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String t4 = sample.get(rng.nextInt(sample.size())).term.utf8ToString();
+                            String sexpr;
+                            switch (i % 4) {
+                                case 0:
+                                    sexpr = "(AND (TERM " + field + " " + t1 + ") (TERM " + field + " " + t2
+                                            + ") (TERM " + field + " " + t3 + "))";
+                                    break;
+                                case 1:
+                                    sexpr = "(OR (TERM " + field + " " + t1 + ") (TERM " + field + " " + t2
+                                            + ") (TERM " + field + " " + t3 + "))";
+                                    break;
+                                case 2:
+                                    sexpr = "(AND (TERM " + field + " " + t1 + ") (OR (TERM " + field + " " + t2
+                                            + ") (TERM " + field + " " + t3 + ")) (NOT (TERM " + field + " " + t4 + ")))";
+                                    break;
+                                default:
+                                    sexpr = "(OR (TERM " + field + " " + t1 + ") (AND (TERM " + field + " " + t2
+                                            + ") (NOT (TERM " + field + " " + t3 + "))))";
+                                    break;
+                            }
+                            pw.printf(Locale.ROOT, "BOOL\t%s\t%s%n", bucketLabel(bucket), sexpr);
+                        }
+                    }
                 }
                 System.out.println("DUMPED terms to " + dumpQueriesFile);
                 return;
@@ -411,6 +565,7 @@ public class SearchBench {
                 for (FreqBucket b : FreqBucket.values()) loadedTerms.put(b, new ArrayList<>());
                 // AND/OR lines: {op, bucketLabel, term1, term2}, kept in file order
                 List<String[]> loadedBool = new ArrayList<>();
+                List<String[]> loadedBoolSexpr = new ArrayList<>();
                 List<String[]> loadedPrefix = new ArrayList<>();
                 List<String[]> loadedWildcard = new ArrayList<>();
                 List<String[]> loadedTermSets = new ArrayList<>();
@@ -434,6 +589,8 @@ public class SearchBench {
                         loadedPhrase.add(new String[]{parts[1], parts[2], parts[3]});
                     } else if (parts[0].equals("RANGE") && parts.length >= 4) {
                         loadedRange.add(new String[]{parts[1], parts[2], parts[3]});
+                    } else if (parts[0].equals("BOOL") && parts.length >= 3) {
+                        loadedBoolSexpr.add(new String[]{parts[1], parts[2]});
                     }
                 }
                 // Build queries using the loaded terms
@@ -530,6 +687,12 @@ public class SearchBench {
                     queries.add(new ConstantScoreQuery(new PhraseQuery(field, p[1], p[2])));
                     labels.add("phrase\t" + p[0]);
                     details.add("phrase t1=" + p[1] + " t2=" + p[2] + " bucket=phrase\t" + p[0]);
+                }
+                // M6 BOOL lines, replayed verbatim like the AND/OR lines
+                for (String[] p : loadedBoolSexpr) {
+                    queries.add(parseBoolSexpr(p[1]));
+                    labels.add("bool\t" + p[0]);
+                    details.add("bool=" + p[1] + " bucket=bool\t" + p[0]);
                 }
                 // M6 RANGE lines: LongPoint/IntPoint newRangeQuery chosen by
                 // the field's point width (IntPoint clamp mirrors the Rust

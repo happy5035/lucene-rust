@@ -120,15 +120,162 @@ pub(crate) struct SegmentMergeSource {
 /// 自动重建）；df/totalTermFreq 由 writer 累加；bitmap 由 with_bitmap_threshold
 /// 按归并后 df 重建。对照 SegmentMerger.mergeTerms（SegmentMerger.java:208）+
 /// MappingMultiPostingsEnum（:30；docIDShift 即 doc_base）。
+fn has_positions(fi: &FieldInfo) -> bool {
+    matches!(
+        fi.index_options,
+        IndexOptions::DocsAndFreqsAndPositions | IndexOptions::DocsAndFreqsAndPositionsAndOffsets
+    )
+}
+
 pub(crate) fn merge_postings(
-    _dir: &FSDirectory,
-    _readers: &[SegmentMergeSource],
-    _field_infos: &FieldInfos,
-    _new_segment: &str,
-    _new_segment_id: &[u8; 16],
-    _bitmap_threshold: Option<u32>,
+    dir: &FSDirectory,
+    sources: &[SegmentMergeSource],
+    field_infos: &FieldInfos,
+    new_segment: &str,
+    new_segment_id: &[u8; 16],
+    bitmap_threshold: Option<u32>,
 ) -> io::Result<Vec<String>> {
-    todo!("Step 12")
+    use codec_lucene9::postings::PostingsWriter;
+    use codec_lucene9::postings_read::PostingsReader;
+    use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
+
+    let indexed: Vec<&FieldInfo> = field_infos
+        .fields
+        .iter()
+        .filter(|f| f.index_options != IndexOptions::None)
+        .collect();
+    if indexed.is_empty() {
+        return Ok(Vec::new()); // 无 indexed 字段：无 postings 文件（同 flush）
+    }
+    // 每段惰性打开 TermsDict + PostingsReader：全段无 indexed terms ⇒ flush
+    // 不写 .doc/.tim（segment_builder.rs:156-161）⇒ 该段两个 reader 都是 None。
+    // 判据用 .doc 文件存在性（.tmd 与 .doc 同生共死，postings.rs:290-296）。
+    let mut dicts: Vec<Option<TermsDict>> = Vec::with_capacity(sources.len());
+    let mut readers: Vec<Option<PostingsReader>> = Vec::with_capacity(sources.len());
+    for s in sources {
+        if dir.file_exists(&codec_lucene9::postings::file_name(&s.name, "doc")) {
+            dicts.push(Some(TermsDict::open(dir, &s.name, &s.id, &s.field_infos)?));
+            readers.push(Some(PostingsReader::open(dir, &s.name, &s.id)?));
+        } else {
+            dicts.push(None);
+            readers.push(None);
+        }
+    }
+    let mut pw = PostingsWriter::new(dir, new_segment, new_segment_id)?
+        .with_bitmap_threshold(bitmap_threshold);
+
+    for fi in indexed {
+        // doc_count = 各段 .tmd FieldTermsMeta.doc_count 之和（字段在段内无
+        // terms ⇒ None ⇒ 0；write 侧 start_field 的 doc_count 同义，
+        // postings.rs:308 只写进 .tmd 记录）
+        let doc_count: u32 = dicts
+            .iter()
+            .map(|d| {
+                d.as_ref()
+                    .and_then(|d| d.field_meta(fi.number))
+                    .map_or(0, |m| m.doc_count as u32)
+            })
+            .sum();
+        pw.start_field(fi, doc_count)?;
+
+        // 每段 TermsIter peeked k-way 归并（TermsIter::next 词典序，terms_read.rs:769；
+        // 字段在某段无 terms ⇒ 该段 field_meta 为 None ⇒ TermsIter 立即 done）
+        let mut iters: Vec<Option<TermsIter>> = dicts
+            .iter_mut()
+            .map(|d| d.as_mut().map(|d| d.terms_iter(fi)))
+            .collect();
+        let mut heads: Vec<Option<(Vec<u8>, TermEntry)>> = Vec::with_capacity(iters.len());
+        for it in iters.iter_mut() {
+            heads.push(match it {
+                Some(it) => it.next()?,
+                None => None,
+            });
+        }
+        loop {
+            // 当前最小 term
+            let mut min: Option<&[u8]> = None;
+            for h in heads.iter().flatten() {
+                min = Some(match min {
+                    None => h.0.as_slice(),
+                    Some(m) if h.0.as_slice() < m => h.0.as_slice(),
+                    Some(m) => m,
+                });
+            }
+            let Some(min_term) = min else { break };
+            let min_term = min_term.to_vec();
+
+            // 逐段拼接文档流（段序即 doc_base 序 ⇒ 全局升序，免交错）
+            let mut docs: Vec<u32> = Vec::new();
+            let mut freqs: Vec<u32> = Vec::new();
+            let mut positions: Option<Vec<Vec<u32>>> = if has_positions(fi) {
+                Some(Vec::new())
+            } else {
+                None
+            };
+            for (i, h) in heads.iter_mut().enumerate() {
+                let Some((term, entry)) = h else { continue };
+                if term.as_slice() != min_term.as_slice() {
+                    continue;
+                }
+                let base = sources[i].doc_base;
+                let reader = readers[i].as_ref().expect("dict present ⇒ reader present");
+                match fi.index_options {
+                    IndexOptions::Docs => {
+                        let mut en = reader.docs(entry)?;
+                        loop {
+                            let d = en.next_doc()?;
+                            if d == NO_MORE_DOCS {
+                                break;
+                            }
+                            docs.push(base + d as u32);
+                            freqs.push(1); // DOCS 字段 freq 恒 1（ttf 不入盘）
+                        }
+                    }
+                    IndexOptions::DocsAndFreqs => {
+                        let mut en = reader.docs_and_freqs(entry)?;
+                        loop {
+                            let d = en.next_doc()?;
+                            if d == NO_MORE_DOCS {
+                                break;
+                            }
+                            docs.push(base + d as u32);
+                            freqs.push(en.freq());
+                        }
+                    }
+                    _ => {
+                        // DocsAndFreqsAndPositions(+Offsets)：EverythingEnum
+                        let mut en = reader.positions(entry)?;
+                        let pos_lists = positions.as_mut().unwrap();
+                        loop {
+                            let d = en.next_doc()?;
+                            if d == NO_MORE_DOCS {
+                                break;
+                            }
+                            docs.push(base + d as u32);
+                            let f = en.freq();
+                            freqs.push(f);
+                            let mut plist = Vec::with_capacity(f as usize);
+                            for _ in 0..f {
+                                plist.push(en.next_position()?);
+                            }
+                            pos_lists.push(plist);
+                        }
+                    }
+                }
+                *h = match &mut iters[i] {
+                    Some(it) => it.next()?,
+                    None => None,
+                };
+            }
+            debug_assert!(
+                docs.windows(2).all(|w| w[0] < w[1]),
+                "concatenated ascending"
+            );
+            pw.write_term(&min_term, &docs, &freqs, positions.as_deref())?;
+        }
+        pw.finish_field()?;
+    }
+    pw.finish()
 }
 
 /// stored 块级裸拷贝（spec §4.2 修正后方案；Lucene90CompressingStoredFieldsWriter
@@ -182,6 +329,13 @@ pub fn force_merge(_dir: &FSDirectory, _config: &IndexWriterConfig) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustlucene-merge-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     fn dict(items: &[&str]) -> Vec<Vec<u8>> {
         items.iter().map(|s| s.as_bytes().to_vec()).collect()
@@ -283,5 +437,121 @@ mod tests {
         ]);
         let d = fis(&[("level", IndexOptions::Docs, DocValuesType::Sorted)]);
         assert!(assert_field_infos_consistent(&[c, d]).is_err());
+    }
+
+    use codec_lucene9::postings_read::PostingsReader;
+    use codec_lucene9::segment_infos::{random_id, SegmentInfos};
+    use codec_lucene9::terms_read::TermsDict;
+    use codec_lucene9::FieldInfos;
+
+    /// 写一个小段并返回其 SegmentCommitInfo（merge 测试专用 builder）。
+    fn write_segment(
+        dir: &FSDirectory,
+        name_counter: u64,
+        docs: &[(&str, &str)], // (level, message)
+    ) -> SegmentCommitInfo {
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        schema.add(FieldSpec::text("message"));
+        let mut b = crate::SegmentBuilder::new(dir.clone(), name_counter);
+        for (level, msg) in docs {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d.add("message", FieldValue::Text(msg.to_string()));
+            b.add_document(&schema, d).unwrap();
+        }
+        b.finalize().unwrap().expect("non-empty segment")
+    }
+
+    fn open_sources(dir: &FSDirectory) -> Vec<SegmentMergeSource> {
+        let (infos, _gen) = SegmentInfos::read_latest(dir).unwrap();
+        let mut doc_base = 0u32;
+        infos
+            .segments
+            .iter()
+            .map(|sci| {
+                let s = SegmentMergeSource {
+                    name: sci.info.name.clone(),
+                    id: sci.info.id,
+                    max_doc: sci.info.doc_count,
+                    doc_base,
+                    field_infos: FieldInfos::read(dir, &sci.info.name, &sci.info.id, "").unwrap(),
+                };
+                doc_base += sci.info.doc_count as u32;
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_postings_offsets_and_reencodes() {
+        let root = temp_dir("pmerge");
+        let dir = FSDirectory::open(&root).unwrap();
+        let s0 = write_segment(
+            &dir,
+            0,
+            &[
+                ("INFO", "alpha beta"),
+                ("WARN", "alpha"),
+                ("INFO", "beta gamma"),
+            ],
+        );
+        let s1 = write_segment(&dir, 1, &[("INFO", "alpha delta"), ("WARN", "alpha")]);
+        let mut infos = SegmentInfos::new();
+        infos.segments = vec![s0, s1];
+        infos.counter = 2;
+        infos.min_segment_version = Some((9, 12, 3));
+        infos.commit(&dir, 1).unwrap();
+
+        let sources = open_sources(&dir);
+        assert_eq!(sources[1].doc_base, 3);
+        let merged_fis = FieldInfos::new(sources[0].field_infos.fields.clone());
+        let new_id = random_id();
+        let files = merge_postings(
+            &dir,
+            &sources,
+            &merged_fis,
+            "_m",
+            &new_id,
+            Some(2), // bitmap threshold：alpha df=5 >= 2
+        )
+        .unwrap();
+        assert!(files.iter().any(|f| f.ends_with(".doc")));
+
+        // 复读新段：词典序 + 偏移后 postings（.fnm 由总装步写，本测试直接用 merged_fis）
+        let mut dict = TermsDict::open(&dir, "_m", &new_id, &merged_fis).unwrap();
+        let postings = PostingsReader::open(&dir, "_m", &new_id).unwrap();
+        let msg = merged_fis.by_name("message").unwrap();
+        let mut it = dict.terms_iter(msg);
+        let mut terms = Vec::new();
+        while let Some((term, entry)) = it.next().unwrap() {
+            terms.push((String::from_utf8(term).unwrap(), entry));
+        }
+        assert_eq!(
+            terms.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "delta", "gamma"]
+        );
+        let alpha = &terms[0].1;
+        assert_eq!(alpha.doc_freq, 4);
+        let mut en = postings.docs_and_freqs(alpha).unwrap();
+        let mut got = Vec::new();
+        loop {
+            let d = en.next_doc().unwrap();
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            got.push((d, en.freq()));
+        }
+        // 段 0: alpha@(0,f1),(1,f1)；段 1: alpha@(0,f1),(1,f1) → 偏移后 3,4
+        assert_eq!(got, vec![(0, 1), (1, 1), (3, 1), (4, 1)]);
+        // df=4 低于读侧 BITMAP_MIN_DF(4096)，open_term_bitmap 返回 None；
+        // 但 writer 仍因 threshold=2 写了内联 bitmap（由 Step 18 大电池覆盖）。
+        assert!(postings.open_term_bitmap(alpha, 4).unwrap().is_none());
+        // singleton：gamma df=1
+        let gamma = &terms[3].1;
+        assert_eq!(gamma.doc_freq, 1);
+        let mut en = postings.docs_and_freqs(gamma).unwrap();
+        assert_eq!(en.next_doc().unwrap(), 2);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

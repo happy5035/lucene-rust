@@ -1088,4 +1088,163 @@ mod tests {
         assert_eq!(s.max_doc(), 2);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// spec §4.4：空索引 no-op（0-doc 段本系统不存在，关键代码事实 10）。
+    #[test]
+    fn force_merge_empty_index_noop() {
+        let root = temp_dir("fmempty");
+        let dir = FSDirectory::open(&root).unwrap();
+        // 手工提交一个 0 段 commit（本系统唯一构造空索引的方式；
+        // Searcher::open 对 0 段 commit 已有先例：search/mod.rs:222）
+        let infos = SegmentInfos::new();
+        infos.commit(&dir, 1).unwrap();
+        force_merge(&dir, &IndexWriterConfig::default()).unwrap();
+        assert_eq!(Searcher::open(&dir).unwrap().segment_count(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// spec §4.4：字段级空——全稀疏 DV（段 1 latency/host 全缺）+ 无 points
+    /// 字段（schema 不含 points ⇒ merge_points 空返回）。注：points 字段
+    /// "部分段有数据"在本系统会让 .fnm 分歧（point flags 数据依赖，
+    /// segment_builder.rs:136-142）——那是 field infos 断言的拒绝场景
+    /// （Step 10/15 已覆盖），不属于归并路径。
+    #[test]
+    fn force_merge_field_level_empties() {
+        let root = temp_dir("fmsparse");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        schema.add(FieldSpec::text("message"));
+        schema.add(FieldSpec::numeric_dv("latency"));
+        schema.add(FieldSpec::sorted_dv("host"));
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        // 段 0：200 docs 全字段（latency/host 有值）
+        for i in 0..200u64 {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword("INFO".into()));
+            d.add("message", FieldValue::Text(format!("m{}", i % 5)));
+            d.add("latency", FieldValue::Long(i as i64));
+            d.add("host", FieldValue::Keyword(format!("h{}", i % 3)));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        // 段 1：50 docs 只有 level/message（latency/host 字段级全缺）
+        for i in 0..50u64 {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword("WARN".into()));
+            d.add("message", FieldValue::Text(format!("m{}", i % 5)));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        force_merge(&dir, &IndexWriterConfig::default()).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(s.max_doc(), 250);
+        assert_eq!(s.count(&Query::term("level", "INFO")).unwrap(), 200);
+        assert_eq!(s.count(&Query::term("level", "WARN")).unwrap(), 50);
+        for i in 0..5 {
+            assert_eq!(
+                s.count(&Query::term("message", &format!("m{i}"))).unwrap(),
+                50
+            );
+        }
+        // DV 层断言：latency = 段 0 的 200 条原样（docs 0..199，无偏移）
+        let (infos, _gen) = SegmentInfos::read_latest(&dir).unwrap();
+        let sci = &infos.segments[0];
+        let dvr = codec_lucene9::doc_values_read::DocValuesReader::open(
+            &dir,
+            &sci.info.name,
+            &sci.info.id,
+            "Lucene90_0",
+        )
+        .unwrap();
+        let fis = FieldInfos::read(&dir, &sci.info.name, &sci.info.id, "").unwrap();
+        let lat = fis.by_name("latency").unwrap();
+        let vals = dvr.numeric_values(lat.number).unwrap();
+        assert_eq!(vals.len(), 200);
+        assert_eq!(vals[42], (42, 42));
+        let host = fis.by_name("host").unwrap();
+        let dict = dvr.sorted_dict(host.number).unwrap();
+        assert_eq!(dict, vec![b"h0".to_vec(), b"h1".to_vec(), b"h2".to_vec()]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// spec §4.4：bitmap on/off × positions 四组合。
+    #[test]
+    fn force_merge_bitmap_positions_matrix() {
+        for (bitmap, positions) in [(false, false), (true, false), (false, true), (true, true)] {
+            let root = temp_dir(&format!("fmedge-{bitmap}-{positions}"));
+            let dir = FSDirectory::open(&root).unwrap();
+            let mut schema = Schema::new();
+            schema.add(FieldSpec::keyword("level"));
+            schema.add(if positions {
+                FieldSpec::text_with_positions("message")
+            } else {
+                FieldSpec::text("message")
+            });
+            schema.add(FieldSpec::numeric_dv("latency")); // 段 1 全缺（稀疏）
+            schema.add(FieldSpec::sorted_dv("host")); // 段 1 全缺
+            let mut config = IndexWriterConfig::default();
+            config.bitmap = bitmap;
+            config.bitmap_threshold = 4096;
+            let mut w = IndexWriter::create(&root, schema, config).unwrap();
+            // 段 0：df 做厚一点让 bitmap 门真命中（重复 level=INFO ≥4096 docs）
+            for i in 0..5000u64 {
+                let mut d = Document::new();
+                d.add("level", FieldValue::Keyword("INFO".into()));
+                d.add("message", FieldValue::Text(format!("m{}", i % 10)));
+                d.add("latency", FieldValue::Long(i as i64));
+                d.add("host", FieldValue::Keyword(format!("h{}", i % 3)));
+                w.add_document(d).unwrap();
+            }
+            w.commit().unwrap();
+            // 段 1：level/message 有值，latency/host 全缺（字段级空）
+            for i in 0..100u64 {
+                let mut d = Document::new();
+                d.add("level", FieldValue::Keyword("WARN".into()));
+                d.add("message", FieldValue::Text(format!("m{}", i % 10)));
+                w.add_document(d).unwrap();
+            }
+            w.commit().unwrap();
+            drop(w);
+
+            let count_battery = |s: &mut Searcher, positions: bool| {
+                let mut counts = Vec::new();
+                for t in ["INFO", "WARN"] {
+                    counts.push(s.count(&Query::term("level", t)).unwrap());
+                }
+                for i in 0..10 {
+                    counts.push(s.count(&Query::term("message", &format!("m{i}"))).unwrap());
+                }
+                if positions {
+                    counts.push(s.count(&Query::phrase("message", &["m1"])).unwrap());
+                }
+                counts
+            };
+            let pre_counts = {
+                let mut s = Searcher::open(&dir).unwrap();
+                count_battery(&mut s, positions)
+            };
+            force_merge(
+                &dir,
+                &IndexWriterConfig {
+                    bitmap,
+                    bitmap_threshold: 4096,
+                    ..IndexWriterConfig::default()
+                },
+            )
+            .unwrap();
+            let mut s = Searcher::open(&dir).unwrap();
+            assert_eq!(s.segment_count(), 1);
+            assert_eq!(s.max_doc(), 5100);
+            assert_eq!(
+                pre_counts,
+                count_battery(&mut s, positions),
+                "bitmap={bitmap} positions={positions}"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
 }

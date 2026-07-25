@@ -195,6 +195,29 @@ public class VerifySearchIndex {
                    .append(" count=").append(s.count(q))
                    .append(" first20=").append(b).append('\n');
             }
+
+            // M6 nested-Bool battery: same items/format as the bool_battery
+            // in rustlucene-cli searchdump.
+            String[] boolBattery = {
+                "(AND (TERM message connection0) (TERM message query23))",
+                "(OR (TERM level INFO) (TERM level WARN) (TERM level ERROR))",
+                "(BOOL (MUST (TERM message connection0)) (SHOULD (TERM level INFO)))",
+                "(AND (TERM level INFO) (NOT (TERM message connection0)))",
+                "(NOT (TERM level WARN))",
+                "(OR (TERM message connection0) (AND (TERM level ERROR) (NOT (TERM message query23))))",
+                "(AND (PREFIX message conn) (NOT (TERM level WARN)))",
+                "(BOOL (MUST (WILDCARD message que?y3*)) (SHOULD (TERM level DEBUG)))",
+            };
+            for (String sexpr : boolBattery) {
+                Query q = SearchBench.parseBoolSexpr(sexpr);
+                TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                StringBuilder b = new StringBuilder();
+                for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                out.append("bool ").append(sexpr)
+                   .append(" count=").append(s.count(q))
+                   .append(" first20=").append(b).append('\n');
+            }
+
             // M2 phrase battery (positions variant only): same items/format
             // as searchdump. The phrase terms are doc7's real adjacent tokens
             // (a guaranteed hit), read from stored fields.
@@ -229,6 +252,17 @@ public class VerifySearchIndex {
                     Query q = new ConstantScoreQuery(new PhraseQuery("message", terms));
                     out.append("phrase message=").append(String.join(",", terms))
                        .append(" count=").append(s.count(q)).append('\n');
+                }
+                {
+                    String boolPhrase = "(AND (PHRASE message " + t0 + " " + t1
+                                        + ") (NOT (TERM level WARN)))";
+                    Query q = SearchBench.parseBoolSexpr(boolPhrase);
+                    TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                    StringBuilder b = new StringBuilder();
+                    for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                    out.append("bool ").append(boolPhrase)
+                       .append(" count=").append(s.count(q))
+                       .append(" first20=").append(b).append('\n');
                 }
             }
         }

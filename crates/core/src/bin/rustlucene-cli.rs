@@ -324,6 +324,31 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
             doc_csv(&docs)
         ));
     }
+
+    // M6 §2.6 nested-Bool battery: spec §2 三态 + 拍平形 + 嵌套 + 跨字段
+    // + Prefix/Wildcard 子句；S 表达式即 searchbench BOOL 行格式。
+    // Mirrored in VerifySearchIndex.java.
+    let bool_battery: [&str; 8] = [
+        "(AND (TERM message connection0) (TERM message query23))", // 纯 MUST（拍平形）
+        "(OR (TERM level INFO) (TERM level WARN) (TERM level ERROR))", // 纯 SHOULD（拍平形）
+        "(BOOL (MUST (TERM message connection0)) (SHOULD (TERM level INFO)))", // MUST+SHOULD 丢弃
+        "(AND (TERM level INFO) (NOT (TERM message connection0)))", // MUST+MUST_NOT 跨字段
+        "(NOT (TERM level WARN))",                                 // 纯 MUST_NOT
+        "(OR (TERM message connection0) (AND (TERM level ERROR) (NOT (TERM message query23))))", // 三层嵌套跨字段
+        "(AND (PREFIX message conn) (NOT (TERM level WARN)))", // Prefix 子句
+        "(BOOL (MUST (WILDCARD message que?y3*)) (SHOULD (TERM level DEBUG)))", // Wildcard + 混合
+    ];
+    for sexpr in bool_battery {
+        let q = parse_bool_sexpr(sexpr)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "bool {sexpr} count={count} first20={}\n",
+            doc_csv(&docs)
+        ));
+    }
+
     // M2 phrase battery (search spec M2 §6), positions variant only: the
     // two/three-term phrases come from doc7's real adjacent tokens (a
     // guaranteed hit), the reversed pair exercises the not-adjacent case,
@@ -359,6 +384,16 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
                 terms.join(",")
             ));
         }
+        // M6 Bool + Phrase 子句（positions variant only）
+        let bool_phrase = format!("(AND (PHRASE message {t0} {t1}) (NOT (TERM level WARN)))");
+        let q = parse_bool_sexpr(&bool_phrase)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let count = searcher.count(&q)?;
+        let (_, docs) = searcher.top_docs(&q, 20)?;
+        out.push_str(&format!(
+            "bool {bool_phrase} count={count} first20={}\n",
+            doc_csv(&docs)
+        ));
     }
     print!("{out}");
     Ok(())

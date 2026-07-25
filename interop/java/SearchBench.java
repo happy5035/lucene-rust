@@ -334,12 +334,15 @@ public class SearchBench {
                 Query sub = parseBoolNode(toks, pos);
                 sexprClose(toks, pos);
                 BooleanQuery.Builder b = new BooleanQuery.Builder();
+                // MatchAll − sub，与 Rust 侧 Bool[MustNot sub] = MatchAll 排除
+                // 的语义一致（Lucene 纯 MUST_NOT BooleanQuery 返回 0 文档）。
+                b.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
                 b.add(sub, BooleanClause.Occur.MUST_NOT);
                 return new ConstantScoreQuery(b.build());
             }
             case "BOOL": {
                 BooleanQuery.Builder b = new BooleanQuery.Builder();
-                boolean hasMust = false, hasShould = false;
+                boolean hasMust = false, hasShould = false, hasMustNot = false;
                 int n = 0;
                 while (pos[0] < toks.size() && !toks.get(pos[0]).equals(")")) {
                     if (!toks.get(pos[0]).equals("("))
@@ -350,7 +353,7 @@ public class SearchBench {
                     switch (occ) {
                         case "MUST": occur = BooleanClause.Occur.MUST; hasMust = true; break;
                         case "SHOULD": occur = BooleanClause.Occur.SHOULD; hasShould = true; break;
-                        case "NOT": occur = BooleanClause.Occur.MUST_NOT; break;
+                        case "NOT": occur = BooleanClause.Occur.MUST_NOT; hasMustNot = true; break;
                         default: throw new IllegalArgumentException(
                                 "BOOL clause occur must be MUST/SHOULD/NOT, found '" + occ + "'");
                     }
@@ -360,6 +363,10 @@ public class SearchBench {
                 }
                 sexprClose(toks, pos);
                 if (n == 0) throw new IllegalArgumentException("BOOL needs at least one clause");
+                if (!hasMust && !hasShould && hasMustNot) {
+                    // 纯 MUST_NOT：补 MatchAll 正集，与 Rust 侧语义一致。
+                    b.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
+                }
                 if (hasShould && !hasMust) b.setMinimumNumberShouldMatch(1);
                 return new ConstantScoreQuery(b.build());
             }

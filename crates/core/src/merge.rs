@@ -11,12 +11,12 @@ use codec_lucene9::{DocValuesType, FSDirectory, IndexOptions};
 
 use crate::IndexWriterConfig;
 
+use codec_lucene9::io::DataInput;
+
 #[cfg(test)]
 use crate::search::{Query, Searcher};
 #[cfg(test)]
 use crate::{Document, FieldSpec, FieldValue, IndexWriter, Schema};
-#[cfg(test)]
-use codec_lucene9::io::DataInput;
 #[cfg(test)]
 use codec_lucene9::segment_infos::random_id;
 #[cfg(test)]
@@ -281,40 +281,159 @@ pub(crate) fn merge_postings(
 /// stored 块级裸拷贝（spec §4.2 修正后方案；Lucene90CompressingStoredFieldsWriter
 /// .copyChunks :520-595 主路径——同 codec、无 delete ⇒ 恒可裸拷）。
 pub(crate) fn merge_stored(
-    _dir: &FSDirectory,
-    _sources: &[SegmentMergeSource],
-    _new_segment: &str,
-    _new_segment_id: &[u8; 16],
-    _total_max_doc: i32,
+    dir: &FSDirectory,
+    sources: &[SegmentMergeSource],
+    new_segment: &str,
+    new_segment_id: &[u8; 16],
+    total_max_doc: i32,
 ) -> io::Result<[String; 3]> {
-    todo!("Step 14")
+    use codec_lucene9::stored_fields::{StoredFieldsIndexReader, StoredFieldsWriter};
+    let mut w = StoredFieldsWriter::new(dir, new_segment, *new_segment_id, "")?;
+    for s in sources {
+        let idx = StoredFieldsIndexReader::open(dir, &s.name, &s.id)?;
+        let [fdt_name, _fdx, _fdm] = codec_lucene9::stored_fields::file_names(&s.name, "");
+        let mut fdt = dir.open_input(&fdt_name)?;
+        let mut expect_base = 0i32;
+        for c in 0..idx.num_chunks() {
+            let (start, end) = idx.chunk_byte_range(c);
+            fdt.seek(start)?;
+            let src_base = fdt.read_vint()?;
+            let code = fdt.read_vint()?;
+            // copyChunks :558-562 的完好性断言（chunk header base == 期望 doc 序）
+            if src_base != expect_base {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt fdt: segment {} chunk {c} base {src_base} != {expect_base}",
+                        s.name
+                    ),
+                ));
+            }
+            let mut payload = vec![0u8; (end - fdt.file_pointer()) as usize];
+            fdt.read_bytes(&mut payload)?;
+            w.append_raw_chunk(idx.chunk_doc_count(c), code, &payload)?;
+            expect_base += idx.chunk_doc_count(c);
+        }
+    }
+    let stats = w.finish(total_max_doc, dir)?;
+    Ok([stats.fdt_name, stats.fdx_name, stats.fdm_name])
 }
 
 /// NumericDV：顺序读 + base 重映射 + 现有 writer 重写（spec §4.2）。
 /// SortedDV：字典读 + merge_sorted_dicts 全局归并 + build_ord_remap 重映射 +
 /// 逐 doc 重写 ord（spec §4.2/§5.1）。返回 [_N_Lucene90_0.{dvd,dvm}] 或空。
 pub(crate) fn merge_doc_values(
-    _dir: &FSDirectory,
-    _sources: &[SegmentMergeSource],
-    _field_infos: &FieldInfos,
-    _new_segment: &str,
-    _new_segment_id: &[u8; 16],
-    _total_max_doc: u32,
+    dir: &FSDirectory,
+    sources: &[SegmentMergeSource],
+    field_infos: &FieldInfos,
+    new_segment: &str,
+    new_segment_id: &[u8; 16],
+    total_max_doc: u32,
 ) -> io::Result<Vec<String>> {
-    todo!("Step 14")
+    use codec_lucene9::doc_values::DocValuesWriter;
+    use codec_lucene9::doc_values_read::DocValuesReader;
+    const DV_SUFFIX: &str = "Lucene90_0"; // segment_builder.rs:30
+    let dv_fields: Vec<&FieldInfo> = field_infos
+        .fields
+        .iter()
+        .filter(|f| f.doc_values_type != DocValuesType::None)
+        .collect();
+    if dv_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    let readers: Vec<DocValuesReader> = sources
+        .iter()
+        .map(|s| DocValuesReader::open(dir, &s.name, &s.id, DV_SUFFIX))
+        .collect::<io::Result<_>>()?;
+    let mut w = DocValuesWriter::new(dir, new_segment, new_segment_id, DV_SUFFIX)?;
+    for fi in dv_fields {
+        match fi.doc_values_type {
+            DocValuesType::Numeric => {
+                let mut pairs: Vec<(u32, i64)> = Vec::new();
+                for (s, r) in sources.iter().zip(&readers) {
+                    for (d, v) in r.numeric_values(fi.number)? {
+                        pairs.push((s.doc_base + d, v));
+                    }
+                }
+                w.add_numeric_field(fi.number, total_max_doc, &pairs)?;
+            }
+            DocValuesType::Sorted => {
+                // ① 各段字典 → 全局字典 + 重映射（Step 1-2 纯函数）
+                let dicts: Vec<Vec<Vec<u8>>> = readers
+                    .iter()
+                    .map(|r| r.sorted_dict(fi.number))
+                    .collect::<io::Result<_>>()?;
+                let global = merge_sorted_dicts(&dicts);
+                let remap = build_ord_remap(&dicts, &global);
+                // ② 逐 doc 重写 ord（doc 序 = 段序拼接，升序天然保持）
+                let mut ords: Vec<(u32, u32)> = Vec::new();
+                for (i, r) in readers.iter().enumerate() {
+                    for (d, o) in r.sorted_ords(fi.number)? {
+                        ords.push((sources[i].doc_base + d, remap[i][o as usize]));
+                    }
+                }
+                let dict_refs: Vec<&[u8]> = global.iter().map(Vec::as_slice).collect();
+                w.add_sorted_field(fi.number, total_max_doc, &dict_refs, &ords)?;
+            }
+            t => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported DV type {t:?} in merge (spec §1 premise)"),
+                ))
+            }
+        }
+    }
+    w.finish()
 }
 
 /// points：T-B BKD 读路径全区间（i64::MIN..=i64::MAX）全量遍历 +
 /// base 重映射，灌回现有 BKD writer（全内存排序吸收多段输入；
 /// PointsWriter.mergeOneField 同款朴素归并，PointsWriter.java:42）。
 pub(crate) fn merge_points(
-    _dir: &FSDirectory,
-    _sources: &[SegmentMergeSource],
-    _field_infos: &FieldInfos,
-    _new_segment: &str,
-    _new_segment_id: &[u8; 16],
+    dir: &FSDirectory,
+    sources: &[SegmentMergeSource],
+    field_infos: &FieldInfos,
+    new_segment: &str,
+    new_segment_id: &[u8; 16],
 ) -> io::Result<Vec<String>> {
-    todo!("Step 14")
+    use codec_lucene9::points::PointsWriter;
+    use codec_lucene9::points_read::PointsReader;
+    let point_fields: Vec<&FieldInfo> = field_infos
+        .fields
+        .iter()
+        .filter(|f| f.point_dimension_count == 1)
+        .collect();
+    if point_fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    let readers: Vec<Option<PointsReader>> = sources
+        .iter()
+        .map(|s| PointsReader::open(dir, &s.name, &s.id, &s.field_infos))
+        .collect::<io::Result<_>>()?;
+    let mut w = PointsWriter::new(dir, new_segment, new_segment_id)?;
+    for fi in point_fields {
+        // 全区间取点（spec §4.2；PointsWriter.mergeOneField 朴素归并，
+        // PointsWriter.java:42-216 的 visitDocValues 路径——本系统无 delete，
+        // docMap 恒等偏移）
+        let mut longs: Vec<(i64, u32)> = Vec::new();
+        for (i, r) in readers.iter().enumerate() {
+            let Some(r) = r else { continue };
+            let base = sources[i].doc_base;
+            r.intersect(&fi.name, i64::MIN, i64::MAX, &mut |v, d| {
+                longs.push((v, base + d as u32));
+            })?;
+        }
+        if longs.is_empty() {
+            continue; // 全段无点：同 flush 的 field_has_points 判定
+        }
+        if fi.point_num_bytes == 8 {
+            w.write_field_long(fi.number, &mut longs)?;
+        } else {
+            let mut ints: Vec<(i32, u32)> = longs.iter().map(|&(v, d)| (v as i32, d)).collect();
+            w.write_field_int(fi.number, &mut ints)?;
+        }
+    }
+    w.finish()
 }
 
 /// forceMerge(1)（M6 spec §4.1）：读当前 segments_N → 逐格式归并出一个新段 →
@@ -553,5 +672,112 @@ mod tests {
         let mut en = postings.docs_and_freqs(gamma).unwrap();
         assert_eq!(en.next_doc().unwrap(), 2);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 两段含 stored + NumericDV + SortedDV + LongPoint 字段，逐格式归并后复读。
+    #[test]
+    fn merge_stored_dv_points_end_to_end() {
+        let root = temp_dir("fmtmerge");
+        let dir = FSDirectory::open(&root).unwrap();
+        // 段 0：3 docs；段 1：2 docs（含 level 字典跨段重复 "INFO"）
+        let schema = |s: &mut Schema| {
+            s.add(
+                FieldSpec::long_point("ts")
+                    .with_numeric_dv()
+                    .with_stored(true),
+            );
+            s.add(FieldSpec::keyword("level").with_sorted_dv());
+        };
+        let mut sch = Schema::new();
+        schema(&mut sch);
+        let mk = |ts: i64, level: &str| {
+            let mut d = Document::new();
+            d.add("ts", FieldValue::Long(ts));
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d
+        };
+        let mut b0 = crate::SegmentBuilder::new(dir.clone(), 0);
+        b0.add_document(&sch, mk(100, "INFO")).unwrap();
+        b0.add_document(&sch, mk(200, "WARN")).unwrap();
+        b0.add_document(&sch, mk(300, "INFO")).unwrap();
+        let s0 = b0.finalize().unwrap().unwrap();
+        let mut b1 = crate::SegmentBuilder::new(dir.clone(), 1);
+        b1.add_document(&sch, mk(150, "ERROR")).unwrap();
+        b1.add_document(&sch, mk(250, "INFO")).unwrap();
+        let s1 = b1.finalize().unwrap().unwrap();
+        let mut infos = SegmentInfos::new();
+        infos.segments = vec![s0, s1];
+        infos.counter = 2;
+        infos.min_segment_version = Some((9, 12, 3));
+        infos.commit(&dir, 1).unwrap();
+
+        let sources = open_sources(&dir);
+        let merged_fis = FieldInfos::new(sources[0].field_infos.fields.clone());
+        let new_id = random_id();
+
+        // --- stored 裸拷贝 ---
+        let stored_files = merge_stored(&dir, &sources, "_m", &new_id, 5).unwrap();
+        assert_eq!(stored_files, stored_fields_file_names("_m"));
+        let idx = codec_lucene9::stored_fields::StoredFieldsIndexReader::open(&dir, "_m", &new_id)
+            .unwrap();
+        assert_eq!(idx.num_chunks(), 2); // 每源段 1 chunk（小文档）
+        assert_eq!(idx.chunk_doc_count(0), 3);
+        assert_eq!(idx.chunk_doc_count(1), 2);
+        // chunk 1 的 docBase 重定基为 3
+        let mut fdt = dir.open_input("_m.fdt").unwrap();
+        let (s, _e) = idx.chunk_byte_range(1);
+        fdt.seek(s).unwrap();
+        assert_eq!(fdt.read_vint().unwrap(), 3, "chunk 1 rebased to doc_base 3");
+
+        // --- DV 归并 ---
+        let dv_files = merge_doc_values(&dir, &sources, &merged_fis, "_m", &new_id, 5).unwrap();
+        assert_eq!(dv_files.len(), 2);
+        let dvr = codec_lucene9::doc_values_read::DocValuesReader::open(
+            &dir,
+            "_m",
+            &new_id,
+            "Lucene90_0",
+        )
+        .unwrap();
+        let ts_fi = merged_fis.by_name("ts").unwrap();
+        assert_eq!(
+            dvr.numeric_values(ts_fi.number).unwrap(),
+            vec![(0, 100), (1, 200), (2, 300), (3, 150), (4, 250)]
+        );
+        let level_fi = merged_fis.by_name("level").unwrap();
+        let dict = dvr.sorted_dict(level_fi.number).unwrap();
+        assert_eq!(
+            dict.iter()
+                .map(|t| String::from_utf8(t.clone()).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ERROR", "INFO", "WARN"] // 全局字典：跨段 "INFO" 去重
+        );
+        // ords：ERROR=0 INFO=1 WARN=2；段 0 INFO,WARN,INFO → 1,2,1；段 1 ERROR,INFO → 0,1
+        assert_eq!(
+            dvr.sorted_ords(level_fi.number).unwrap(),
+            vec![(0, 1), (1, 2), (2, 1), (3, 0), (4, 1)]
+        );
+
+        // --- points 归并（T-B PointsReader 全区间取点 + base 偏移 + 重写）---
+        let point_files = merge_points(&dir, &sources, &merged_fis, "_m", &new_id).unwrap();
+        assert_eq!(point_files.len(), 3);
+        // 复读：T-B PointsReader 全区间收集 → (value, doc) 多重集与输入一致
+        let pr = codec_lucene9::points_read::PointsReader::open(&dir, "_m", &new_id, &merged_fis)
+            .unwrap()
+            .expect("points present");
+        let mut got: Vec<(i64, i32)> = Vec::new();
+        pr.intersect("ts", i64::MIN, i64::MAX, &mut |v, d| got.push((v, d)))
+            .unwrap();
+        got.sort();
+        assert_eq!(got, vec![(100, 0), (150, 3), (200, 1), (250, 4), (300, 2)]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn stored_fields_file_names(segment: &str) -> [String; 3] {
+        [
+            format!("{segment}.fdt"),
+            format!("{segment}.fdx"),
+            format!("{segment}.fdm"),
+        ]
     }
 }

@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::field_infos::IndexOptions;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, NO_MORE_DOCS};
-use codec_lucene9::roaring::FrozenBitmap;
+use codec_lucene9::roaring::{FrozenBitmap, MaterializedBitmap};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
@@ -515,13 +515,34 @@ impl DocIter for PhraseDocIter {
 
 // ── Roaring (inline term bitmap, M5 §2 croaring frozen view) ─────────
 
-/// Batch-refill cursor over a `FrozenBitmap` (M5 T2, 关键设计事实 5):
-/// the ~60ns frozen-view create is amortized over a 512-doc batch; each
-/// refill is a container-level `reset_at_or_after` seek + bulk
+/// Bitmap doc sources for `BitmapCursor` (M5 §2 FrozenBitmap zero-copy
+/// view; M6 §3.3 MaterializedBitmap owned hits materialization). The only
+/// surface the cursor needs.
+pub trait DocsBitmap {
+    /// Fills `dst` with the first docs >= `from`, returns the count read
+    /// (0 = exhausted) — croaring `reset_at_or_after` + `next_many`.
+    fn docs_from(&self, from: u32, dst: &mut [u32]) -> usize;
+}
+
+impl DocsBitmap for FrozenBitmap {
+    fn docs_from(&self, from: u32, dst: &mut [u32]) -> usize {
+        FrozenBitmap::docs_from(self, from, dst)
+    }
+}
+
+impl DocsBitmap for MaterializedBitmap {
+    fn docs_from(&self, from: u32, dst: &mut [u32]) -> usize {
+        MaterializedBitmap::docs_from(self, from, dst)
+    }
+}
+
+/// Batch-refill cursor over a bitmap source (M5 T2, 关键设计事实 5):
+/// the ~60ns frozen-view create / owned-iter create is amortized over a
+/// 512-doc batch; each refill is a `reset_at_or_after` seek + bulk
 /// `next_many`. docs are < max_doc <= i32::MAX, so `d + 1` never
 /// overflows u32.
-pub struct BitmapCursor {
-    bitmap: FrozenBitmap,
+pub struct BitmapCursor<B: DocsBitmap> {
+    bitmap: B,
     buf: Vec<u32>,
     pos: usize,
     end: usize,
@@ -531,8 +552,8 @@ pub struct BitmapCursor {
 
 const BITMAP_ITER_BATCH: usize = 512;
 
-impl BitmapCursor {
-    fn new(bitmap: FrozenBitmap) -> BitmapCursor {
+impl<B: DocsBitmap> BitmapCursor<B> {
+    fn new(bitmap: B) -> BitmapCursor<B> {
         BitmapCursor {
             bitmap,
             buf: vec![0; BITMAP_ITER_BATCH],
@@ -580,7 +601,7 @@ impl BitmapCursor {
 /// and needs_freq paths never get this iterator (correctness
 /// requirement (e)).
 pub struct RoaringDocIter {
-    cur: BitmapCursor,
+    cur: BitmapCursor<FrozenBitmap>,
     doc: i32,
 }
 
@@ -620,14 +641,66 @@ impl DocIter for RoaringDocIter {
     }
 }
 
+// ── Points (M6 §3.3 materialized point-range hits) ───────────────────
+
+/// DocIter over a PointRange query's materialized per-segment hits
+/// (M6 spec §3.3): same batch-cursor shape as RoaringDocIter. freq() is
+/// 1 — points carry no freqs and `needs_freq` is never routed here.
+pub struct PointsDocIter {
+    cur: BitmapCursor<MaterializedBitmap>,
+    doc: i32,
+}
+
+impl PointsDocIter {
+    pub fn new(bitmap: MaterializedBitmap) -> PointsDocIter {
+        PointsDocIter {
+            cur: BitmapCursor::new(bitmap),
+            doc: -1,
+        }
+    }
+}
+
+impl DocIter for PointsDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = match self.cur.next() {
+            Some(d) => d as i32,
+            None => NO_MORE_DOCS,
+        };
+        Ok(self.doc)
+    }
+
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if target > self.doc {
+            self.doc = match self.cur.advance(target.max(0) as u32) {
+                Some(d) => d as i32,
+                None => NO_MORE_DOCS,
+            };
+        }
+        Ok(self.doc)
+    }
+}
+
 // ── AND over views (M4 §5) ─────────────────────────────────────────────
 
 /// One merge-intersect / merge-union source (M5 §2): a frozen-view batch
 /// cursor, or a materialized doc slice (low-df clause or tier-1 fold
 /// result). Both yield ascending docs with a forward-only advance.
 pub enum DocSource {
-    Bitmap { cur: BitmapCursor, doc: Option<u32> },
-    Slice { docs: Vec<u32>, pos: usize },
+    Bitmap {
+        cur: BitmapCursor<FrozenBitmap>,
+        doc: Option<u32>,
+    },
+    Slice {
+        docs: Vec<u32>,
+        pos: usize,
+    },
 }
 
 impl DocSource {
@@ -864,6 +937,7 @@ pub enum SegmentDocIter {
     Roaring(RoaringDocIter),
     RoaringAnd(RoaringAndDocIter),
     RoaringOr(RoaringOrDocIter),
+    Points(PointsDocIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -879,6 +953,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.doc_id(),
             Self::RoaringAnd(a) => a.doc_id(),
             Self::RoaringOr(o) => o.doc_id(),
+            Self::Points(p) => p.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -893,6 +968,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.next_doc(),
             Self::RoaringAnd(a) => a.next_doc(),
             Self::RoaringOr(o) => o.next_doc(),
+            Self::Points(p) => p.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -907,6 +983,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.advance(t),
             Self::RoaringAnd(a) => a.advance(t),
             Self::RoaringOr(o) => o.advance(t),
+            Self::Points(p) => p.advance(t),
         }
     }
     fn freq(&self) -> u32 {

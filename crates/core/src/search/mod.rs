@@ -1119,4 +1119,31 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
+
+    /// M6 T-B: PointsDocIter 批量游标（BitmapCursor<MaterializedBitmap>）——
+    /// next/advance 序列与物化集合逐点一致（游标形态同 RoaringDocIter，
+    /// M5 关键设计事实 5）。
+    #[test]
+    fn points_doc_iter_cursor_sequences() {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        use codec_lucene9::roaring::MaterializedBitmap;
+        let docs: Vec<u32> = (0..5000u32).map(|i| i * 2).collect();
+        let mut it = doc_iter::PointsDocIter::new(MaterializedBitmap::of(&docs));
+        assert_eq!(it.next_doc().unwrap(), 0);
+        assert_eq!(it.next_doc().unwrap(), 2);
+        assert_eq!(it.advance(101).unwrap(), 102); // 落缝 → 下一个
+        assert_eq!(it.advance(102).unwrap(), 102); // 已在目标上不动
+        assert_eq!(it.doc_id(), 102);
+        let mut last = 102;
+        loop {
+            let d = it.next_doc().unwrap();
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            assert!(d > last);
+            last = d;
+        }
+        assert_eq!(last, 9998);
+        assert_eq!(it.next_doc().unwrap(), NO_MORE_DOCS); // 粘滞
+    }
 }

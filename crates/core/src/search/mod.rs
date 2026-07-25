@@ -1898,6 +1898,79 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
     }
 
+    /// M7 T-D：top-N 新旧行为钉死——(total, docs) 与"全程迭代 + 前 N"
+    /// 参照逐字节一致；N ∈ {0,1,7,100,6000}，含跨段与无快路径形状。
+    fn reference_top_docs(dir: &FSDirectory, q: &Query, n: usize) -> (u64, Vec<i32>) {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        let mut reader = Reader::open(dir).unwrap();
+        let mut total = 0u64;
+        let mut docs = Vec::new();
+        for (base, seg) in reader.leaves() {
+            if let Some(mut it) = q.segment_iterator(seg, false).unwrap() {
+                loop {
+                    let d = it.next_doc().unwrap();
+                    if d == NO_MORE_DOCS {
+                        break;
+                    }
+                    if !it.matches().unwrap() {
+                        continue;
+                    }
+                    total += 1;
+                    if docs.len() < n {
+                        docs.push(base + d);
+                    }
+                }
+            }
+        }
+        (total, docs)
+    }
+
+    #[test]
+    fn topn_early_termination_equivalence() {
+        let root = temp_dir("topn");
+        write_phrase_bitmap_corpus(&root, true);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::MatchAll,
+            Query::term("message", "hot"),            // doc_freq 直读快路径
+            Query::term("message", "nosuch"),         // 空
+            Query::phrase("message", &["hot", "warm"]), // 无快路径（Phrase）→ 全程迭代
+            Query::terms("message", &["hot", "x"]),   // ≤16 OR 路径
+            Query::prefix("message", "ho"),           // bitset popcount
+            Query::bool(vec![                          // fold 快路径
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            Query::bool(vec![(Occur::MustNot, Query::term("message", "x"))]), // maxDoc−prohibited
+            Query::point_range("nope", 0, 1),         // 未知 point 字段 → 0
+        ];
+        for q in &battery {
+            for n in [0usize, 1, 7, 100, 6000] {
+                assert_eq!(
+                    s.top_docs(q, n).unwrap(),
+                    reference_top_docs(&dir, q, n),
+                    "top_docs({n}) {q:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(&root).unwrap();
+        // 跨段边界：bitmap tier 语料（3 段）
+        let root_ms = temp_dir("topnms");
+        write_tier_corpus(&root_ms, true, 3);
+        let dir_ms = FSDirectory::open(&root_ms).unwrap();
+        let mut s_ms = Searcher::open(&dir_ms).unwrap();
+        let q = Query::or("message", &["hot", "scorching"]); // 以 write_tier_corpus 实际 term 为准
+        for n in [0usize, 1, 7, 100, 100_000] {
+            assert_eq!(
+                s_ms.top_docs(&q, n).unwrap(),
+                reference_top_docs(&dir_ms, &q, n),
+                "multi-segment top_docs({n})"
+            );
+        }
+        fs::remove_dir_all(&root_ms).unwrap();
+    }
+
     /// M7 §3.2 成本护栏：budget=0 必 OverBudget；budget=u64::MAX 必 Hits。
     #[test]
     fn fold_cost_guard_triggers() {

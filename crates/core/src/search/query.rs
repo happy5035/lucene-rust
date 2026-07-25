@@ -731,46 +731,84 @@ pub(crate) fn materialize_bool_bitmap(
     Ok(MatOutcome::Hits(positive))
 }
 
-/// spec §2.5 Bool per-segment count：与迭代同一结构——拍平形命中
-/// roaring count 快路径（档 1 cardinality 折叠 / 档 2 驱动计数）；纯
-/// MUST_NOT 走 maxDoc − prohibited count（避免全量迭代）；其余形状驱动
-/// 组合迭代器逐 doc 计数。
-pub(crate) fn bool_segment_count(
+/// M7 §5.1 Bool 段级 count 快路径：Some = 快路径结果（拍平 roaring /
+/// 纯 MUST_NOT / T-B fold）；None = 无快路径（调用方迭代）。
+pub(crate) fn bool_segment_fast_count(
     seg: &mut SegmentReader,
     clauses: &[(Occur, Query)],
-) -> io::Result<u64> {
-    // 拍平快路径（§2.4 同形状）：roaring count；档 3 落档（None）与非
-    // 拍平形继续向下走通用路径。
+) -> io::Result<Option<u64>> {
+    // 拍平快路径（§2.4 同形状）：roaring count
     let refs: Vec<(Occur, &Query)> = clauses.iter().map(|(o, q)| (*o, q)).collect();
     if let Some((is_and, field, terms)) = flatten_bool(&refs) {
         if terms.len() >= 2 {
             let Some((has_freqs, entries)) =
                 roaring_exec::collect_bool_entries(seg, field, &terms, is_and)?
             else {
-                return Ok(0); // 未知字段 / AND 缺子句 / OR 全缺 → 段内空
+                return Ok(Some(0)); // 未知字段 / AND 缺子句 / OR 全缺 → 段内空
             };
             if let Some(c) = roaring_exec::count(seg, &entries, has_freqs, is_and)? {
-                return Ok(c);
+                return Ok(Some(c));
             }
         }
     }
     // 纯 MUST_NOT（§2.2/§2.5）：MatchAll 排除，count = maxDoc − prohibited。
     if !clauses.is_empty() && clauses.iter().all(|(o, _)| *o == Occur::MustNot) {
         let prohibited = prohibited_count(seg, clauses)?;
-        return Ok(seg.max_doc() as u64 - prohibited);
+        return Ok(Some(seg.max_doc() as u64 - prohibited));
     }
-    // T-B（M7 §3）：通用形状 count 的 bitmap fold——count-only 无提前
-    // 终止，全量物化 + roaring fold 稳赢逐 doc 对齐；超预算回落迭代。
+    // T-B（M7 §3）：通用形状 bitmap fold；超预算 None 回落迭代。
     if !clauses.is_empty() {
         let budget = FOLD_COST_FACTOR * seg.max_doc() as u64;
         let mut cost = 0u64;
         match materialize_bool_bitmap(seg, clauses, budget, &mut cost)? {
-            MatOutcome::Hits(bm) => return Ok(bm.cardinality()),
-            MatOutcome::OverBudget => {} // 回落 drive_count
+            MatOutcome::Hits(bm) => return Ok(Some(bm.cardinality())),
+            MatOutcome::OverBudget => {}
         }
     }
-    // 通用：组合迭代器逐 doc 计数。
+    Ok(None)
+}
+
+/// spec §2.5 Bool per-segment count：快路径（拍平 roaring / 纯 MUST_NOT /
+/// T-B fold）优先，None 回落组合迭代器逐 doc 计数。
+#[allow(dead_code)]
+pub(crate) fn bool_segment_count(
+    seg: &mut SegmentReader,
+    clauses: &[(Occur, Query)],
+) -> io::Result<u64> {
+    if let Some(c) = bool_segment_fast_count(seg, clauses)? {
+        return Ok(c);
+    }
     drive_count(bool_segment_iterator(seg, clauses, false)?)
+}
+
+/// M7 §5.1 段级 count 快路径统一入口：Some(c) = 快路径结果；None = 无
+/// 快路径（调用方迭代计数）。归并既有全部捷径（Term doc_freq 直读 /
+/// PointRange bitmap cardinality / multi-term bitset popcount / And-Or
+/// roaring count / Bool 快路径族）。Searcher::count 与 top_docs 共用。
+pub(crate) fn fast_segment_count(seg: &mut SegmentReader, query: &Query) -> io::Result<Option<u64>> {
+    match query {
+        Query::MatchAll => Ok(Some(seg.max_doc() as u64)),
+        Query::Term { field, term } => Ok(Some(match seg.seek_term(field, term)? {
+            Some((_, entry)) => entry.doc_freq as u64,
+            None => 0,
+        })),
+        Query::PointRange { field, low, high } => {
+            let bm = point_range_bitmap(seg, field, *low, *high)?;
+            Ok(Some(bm.map_or(0, |b| b.cardinality())))
+        }
+        q if q.is_multi_term() => q.bitset_count(seg),
+        Query::And { field, terms } | Query::Or { field, terms } if terms.len() >= 2 => {
+            let is_and = matches!(query, Query::And { .. });
+            let Some((has_freqs, entries)) =
+                roaring_exec::collect_bool_entries(seg, field, terms, is_and)?
+            else {
+                return Ok(Some(0));
+            };
+            roaring_exec::count(seg, &entries, has_freqs, is_and)
+        }
+        Query::Bool { clauses } => bool_segment_fast_count(seg, clauses),
+        _ => Ok(None), // Phrase 等：无快路径
+    }
 }
 
 /// 纯 MUST_NOT 的 prohibited 侧 count：子句换 SHOULD 视角取并集——拍平

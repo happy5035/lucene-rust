@@ -726,26 +726,28 @@ impl DocIter for RoaringDocIter {
     }
 }
 
-// ── Points (M6 §3.3 materialized point-range hits) ───────────────────
+// ── Materialized (owned bitmap over a materialized hit set) ──────────
 
-/// DocIter over a PointRange query's materialized per-segment hits
-/// (M6 spec §3.3): same batch-cursor shape as RoaringDocIter. freq() is
-/// 1 — points carry no freqs and `needs_freq` is never routed here.
-pub struct PointsDocIter {
+/// DocIter over an owned materialized bitmap: PointRange 段内命中
+/// (M6 spec §3.3) 与 Bool 物化 fold 结果（P1-1：排除形容器级 andnot
+/// 后顺序迭代，替代 ExcludingDocIter 逐候选 advance 丢批病理）共用。
+/// 同 RoaringDocIter 的批量游标形状。freq() is 1 — 物化集不携带 freq，
+/// `needs_freq` 路径不会路由到此。
+pub struct MaterializedDocIter {
     cur: BitmapCursor<MaterializedBitmap>,
     doc: i32,
 }
 
-impl PointsDocIter {
-    pub fn new(bitmap: MaterializedBitmap) -> PointsDocIter {
-        PointsDocIter {
+impl MaterializedDocIter {
+    pub fn new(bitmap: MaterializedBitmap) -> MaterializedDocIter {
+        MaterializedDocIter {
             cur: BitmapCursor::new(bitmap),
             doc: -1,
         }
     }
 }
 
-impl DocIter for PointsDocIter {
+impl DocIter for MaterializedDocIter {
     fn doc_id(&self) -> i32 {
         self.doc
     }
@@ -1501,7 +1503,7 @@ pub enum SegmentDocIter {
     Roaring(RoaringDocIter),
     RoaringAnd(RoaringAndDocIter),
     RoaringOr(RoaringOrDocIter),
-    Points(PointsDocIter),
+    Materialized(MaterializedDocIter),
     // M6 §2.3 通用组合器：全是 Vec/Box 小 payload（≤40B），enum 尺寸
     // 不变（仍由 Freqs 的 18.7KB 决定），栈预算不受新变体影响。
     ConjOver(ConjOverDocIter),
@@ -1522,7 +1524,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.doc_id(),
             Self::RoaringAnd(a) => a.doc_id(),
             Self::RoaringOr(o) => o.doc_id(),
-            Self::Points(p) => p.doc_id(),
+            Self::Materialized(p) => p.doc_id(),
             Self::ConjOver(c) => c.doc_id(),
             Self::DisjOver(d) => d.doc_id(),
             Self::Excluding(e) => e.doc_id(),
@@ -1540,7 +1542,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.next_doc(),
             Self::RoaringAnd(a) => a.next_doc(),
             Self::RoaringOr(o) => o.next_doc(),
-            Self::Points(p) => p.next_doc(),
+            Self::Materialized(p) => p.next_doc(),
             Self::ConjOver(c) => c.next_doc(),
             Self::DisjOver(d) => d.next_doc(),
             Self::Excluding(e) => e.next_doc(),
@@ -1558,7 +1560,7 @@ impl DocIter for SegmentDocIter {
             Self::Roaring(r) => r.advance(t),
             Self::RoaringAnd(a) => a.advance(t),
             Self::RoaringOr(o) => o.advance(t),
-            Self::Points(p) => p.advance(t),
+            Self::Materialized(p) => p.advance(t),
             Self::ConjOver(c) => c.advance(t),
             Self::DisjOver(d) => d.advance(t),
             Self::Excluding(e) => e.advance(t),

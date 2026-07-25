@@ -9,11 +9,12 @@ use codec_lucene9::terms_read::TermEntry;
 
 use super::doc_iter::{
     ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, DocIter,
-    ExcludingDocIter, MatchAllIter, PhraseDocIter, PointsDocIter, RoaringDocIter, SegmentDocIter,
+    ExcludingDocIter, MatchAllIter, MaterializedDocIter, PhraseDocIter, RoaringDocIter,
+    SegmentDocIter,
 };
 use super::multi_term;
 use super::roaring_exec;
-use super::segment_reader::SegmentReader;
+use super::segment_reader::{bitmap_enabled, SegmentReader};
 
 /// Boolean clause occur (spec M6 §2.1)：MUST / SHOULD / MUST_NOT；
 /// FILTER 不做（ConstantScore 下与 MUST 等价，spec §0 拍板）。
@@ -259,7 +260,7 @@ impl Query {
                 let Some(bm) = point_range_bitmap(seg, field, *low, *high)? else {
                     return Ok(None);
                 };
-                Ok(Some(SegmentDocIter::Points(PointsDocIter::new(bm))))
+                Ok(Some(SegmentDocIter::Materialized(MaterializedDocIter::new(bm))))
             }
             Query::Bool { clauses } => bool_segment_iterator(seg, clauses, needs_freq),
         }
@@ -447,7 +448,43 @@ fn bool_segment_iterator(
             or_segment_iterator(seg, field, &terms, false)
         };
     }
-    // 通用装配（spec §2.2 三态 + §2.3 组合器）。
+    // P1-1 物化先行：通用组合器形状先试全树物化 fold（count 路径同款
+    // materialize_bool_bitmap，正集三态与组合语义逐条镜像迭代路径，
+    // Phrase 叶子经 drive_materialize 走 matches() 两阶段协议）。
+    // 动机：ExcludingDocIter 逐候选 prohibited.advance(d)——bitmap 禁集上
+    // BitmapCursor::advance 每次丢 512-doc 批缓存重 seek，稠密禁集
+    // （level 词 df≈200k）实测 10–20× 慢于 PFOR 同路径（nothi 257ms vs
+    // 18.6ms）。容器级 and/andnot fold + MaterializedDocIter 顺序迭代
+    // 消除该病理，ConjOver/DisjOver 同形状一并受益。超预算 → 回落下方
+    // 通用装配（保持惰性，topN 早停形状不受损）。
+    //
+    // 门控：物化 ROI 来自 bitmap/BKD 容器级 fold。纯 postings 读路径
+    // （RL_BITMAP=0 kill-switch，bitmap_enabled()==false）下物化要全扫
+    // 各子句，小 MUST + 大 NOT 形状反而失去惰性优势（实测 mnfmh/
+    // multinot 回归 2–4×），而惰性二指针在 PFOR 禁集上已近优 → 跳过
+    // 物化走下方通用装配。PointRange 叶子恒物化（BKD 路径与位图开关
+    // 无关），且 Points 二指针同受批游标 advance 丢批病理 → 恒放行。
+    let bitmap_source = bitmap_enabled()
+        || clauses
+            .iter()
+            .any(|(_, q)| matches!(q, Query::PointRange { .. }));
+    if bitmap_source {
+        let budget = FOLD_COST_FACTOR * seg.max_doc() as u64;
+        let mut cost = 0u64;
+        match materialize_bool_bitmap(seg, clauses, budget, &mut cost)? {
+            MatOutcome::Hits(bm) => {
+                if bm.cardinality() == 0 {
+                    // 段内空，与通用装配的三种 None 形态同语义（顺带对齐
+                    // count 路径与 Lucene minShouldMatch=1：SHOULD 全缺 +
+                    // MUST_NOT 存在 → 空，而非 MatchAll − prohibited）。
+                    return Ok(None);
+                }
+                return Ok(Some(SegmentDocIter::Materialized(MaterializedDocIter::new(bm))));
+            }
+            MatOutcome::OverBudget => {}
+        }
+    }
+    // 通用装配（spec §2.2 三态 + §2.3 组合器）——物化超预算的回落路径。
     let mut musts: Vec<SegmentDocIter> = Vec::new();
     let mut shoulds: Vec<SegmentDocIter> = Vec::new();
     let mut nots: Vec<SegmentDocIter> = Vec::new();

@@ -1120,7 +1120,7 @@ mod tests {
         fs::remove_dir_all(&root_on).unwrap();
     }
 
-    /// M6 T-B: PointsDocIter 批量游标（BitmapCursor<MaterializedBitmap>）——
+    /// M6 T-B: MaterializedDocIter 批量游标（BitmapCursor<MaterializedBitmap>）——
     /// next/advance 序列与物化集合逐点一致（游标形态同 RoaringDocIter，
     /// M5 关键设计事实 5）。
     #[test]
@@ -1128,7 +1128,7 @@ mod tests {
         use codec_lucene9::postings_read::NO_MORE_DOCS;
         use codec_lucene9::roaring::MaterializedBitmap;
         let docs: Vec<u32> = (0..5000u32).map(|i| i * 2).collect();
-        let mut it = doc_iter::PointsDocIter::new(MaterializedBitmap::of(&docs));
+        let mut it = doc_iter::MaterializedDocIter::new(MaterializedBitmap::of(&docs));
         assert_eq!(it.next_doc().unwrap(), 0);
         assert_eq!(it.next_doc().unwrap(), 2);
         assert_eq!(it.advance(101).unwrap(), 102); // 落缝 → 下一个
@@ -1194,8 +1194,8 @@ mod tests {
         let (_b, seg) = reader.leaves().next().unwrap();
         let it = q.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Points(_)),
-            "PointRange must materialize into SegmentDocIter::Points"
+            matches!(it, SegmentDocIter::Materialized(_)),
+            "PointRange must materialize into SegmentDocIter::Materialized"
         );
         drop(reader);
         // 点查询退化 [v,v]
@@ -1553,8 +1553,9 @@ mod tests {
     }
 
     /// spec §2.4 拍平路径：bitmap 索引上拍平形命中 roaring 三档（变体断言
-    /// 钉死），非拍平形走通用组合器；bitmap off/on 全量结果逐位一致
-    /// （RL_BITMAP=0 等价物的单测形态——同语料双索引 A/B）。
+    /// 钉死），非拍平形走 P1-1 物化 fold（超预算回落通用组合器）；
+    /// bitmap off/on 全量结果逐位一致（RL_BITMAP=0 等价物的单测形态——
+    /// 同语料双索引 A/B）。
     #[test]
     fn bool_query_flatten_roaring_paths() {
         let root_off = temp_dir("bflatoff");
@@ -1609,20 +1610,24 @@ mod tests {
             matches!(it, SegmentDocIter::RoaringAnd(_)),
             "Bool ignores needs_freq (freq undefined under combination)"
         );
+        // P1-1：非拍平形状物化先行——AND(OR) / SHOULD+MUST_NOT / 纯
+        // MUST_NOT 全部落 Materialized（容器级 fold + 顺序迭代），替代
+        // 旧 ConjOver/Excluding 通用装配（ExcludingDocIter 逐候选 advance
+        // 丢批病理）。超预算形状仍回落通用组合器（本语料 df 和 ≪ 4×maxDoc）。
         let it = nested_or.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::ConjOver(_)),
-            "AND(OR) is not a flat shape: generic combinator"
+            matches!(it, SegmentDocIter::Materialized(_)),
+            "AND(OR) is not a flat shape: materialized fold"
         );
         let it = excluding.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Excluding(_)),
-            "SHOULD + MUST_NOT: top-level Excluding"
+            matches!(it, SegmentDocIter::Materialized(_)),
+            "SHOULD + MUST_NOT: materialized or-then-andnot"
         );
         let it = pure_not.segment_iterator(seg, false).unwrap().unwrap();
         assert!(
-            matches!(it, SegmentDocIter::Excluding(_)),
-            "pure MUST_NOT: Excluding over MatchAll"
+            matches!(it, SegmentDocIter::Materialized(_)),
+            "pure MUST_NOT: materialized full-andnot"
         );
         drop(reader);
 

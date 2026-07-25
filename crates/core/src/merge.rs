@@ -363,7 +363,16 @@ pub(crate) fn merge_doc_values(
                 let mut ords: Vec<(u32, u32)> = Vec::new();
                 for (i, r) in readers.iter().enumerate() {
                     for (d, o) in r.sorted_ords(fi.number)? {
-                        ords.push((sources[i].doc_base + d, remap[i][o as usize]));
+                        let new_ord = remap[i].get(o as usize).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "sorted ord {o} out of segment dict (len {})",
+                                    remap[i].len()
+                                ),
+                            )
+                        })?;
+                        ords.push((sources[i].doc_base + d, *new_ord));
                     }
                 }
                 let dict_refs: Vec<&[u8]> = global.iter().map(Vec::as_slice).collect();
@@ -1320,5 +1329,57 @@ mod tests {
             );
             fs::remove_dir_all(&root).unwrap();
         }
+    }
+
+    /// 腐蚀 .dvm 把 SortedDV dict_size 3→2：ords 仍含 ord 2，
+    /// merge_doc_values 必须 InvalidData 而非 remap 索引 panic。
+    #[test]
+    fn force_merge_corrupt_sorted_ord_returns_invalid_data() {
+        let root = temp_dir("fm-corrupt-ord");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::sorted_dv("level"));
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        for level in ["A", "B", "C"] {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap(); // 段 _0：字典 [A,B,C]，稠密 ords 0,1,2
+        let mut d = Document::new();
+        d.add("level", FieldValue::Keyword("A".to_string()));
+        w.add_document(d).unwrap();
+        w.commit().unwrap(); // 段 _1
+        drop(w);
+
+        // dict_size 在 .dvm 的位置：header + field_number(i32) + type(u8)
+        // + ords numeric meta（8+8+2+1+8+4+1+8+8+8+8+8 = 72B）。
+        let dvm_name = codec_lucene9::doc_values::file_names("_0", "Lucene90_0")[1].clone();
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = std::fs::read(&dvm_path).unwrap();
+        let off = codec_lucene9::codec_util::index_header_length(
+            "Lucene90DocValuesMetadata",
+            "Lucene90_0",
+        ) + 4
+            + 1
+            + 72;
+        assert_eq!(bytes[off], 3, "dict_size=3 的单字节 VLong");
+        bytes[off] = 2;
+        // 重算 footer CRC（覆盖 0..len-8），绕过 open 的 CRC 校验，
+        // 模拟通过校验的腐蚀数据。
+        let n = bytes.len();
+        let mut h = crc32fast::Hasher::new();
+        h.update(&bytes[..n - 8]);
+        let crc = h.finalize() as u64;
+        bytes[n - 8..].copy_from_slice(&crc.to_be_bytes());
+        std::fs::write(&dvm_path, bytes).unwrap();
+
+        let err = force_merge(&dir, &IndexWriterConfig::default()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("sorted ord 2 out of segment dict"),
+            "应命中 ord 越界守卫: {err}"
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

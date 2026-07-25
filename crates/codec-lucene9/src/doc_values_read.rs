@@ -445,6 +445,9 @@ impl DocValuesReader {
                     }
                     let mut sfx = vec![0u8; suffix];
                     dr.read_bytes(&mut sfx)?;
+                    if prefix > prev.len() {
+                        return Err(corrupt("terms dict prefix exceeds prev term"));
+                    }
                     let mut term = prev[..prefix].to_vec();
                     term.extend_from_slice(&sfx);
                     prev = term.clone();
@@ -727,6 +730,59 @@ mod tests {
         let dir = FSDirectory::open(&root).unwrap();
         let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
         let err = r.numeric_values(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_terms_dict_prefix_overflow_fails() {
+        // terms dict LZ4 解压流的 prefix 超过前一词长度 → sorted_dict 返回
+        // InvalidData 而非 slice panic（.dvd 数据区无 CRC 兜底，bit-rot 直达）。
+        let dict: Vec<String> = vec!["aaa".into(), "aab".into()];
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = vec![(0, 0), (1, 1)];
+        let root = write_index("corrupt-prefix", |w| {
+            w.add_sorted_field(0, 2, &dict_refs, &ords).unwrap();
+        });
+        // 借 meta 定位 terms dict 区域（单块）：VInt first_len + first +
+        // VInt uncompressed + LZ4 块；原位替换为恶意流（prefix=5 > "aaa".len()=3）。
+        let dir0 = FSDirectory::open(&root).unwrap();
+        let r0 = DocValuesReader::open(&dir0, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let (off, len) = match &r0.entries[0].1 {
+            DvEntry::Sorted(m) => (
+                m.terms_data_offset as usize, // meta offset 是 .dvd 绝对 fp
+                m.terms_data_length as usize,
+            ),
+            _ => panic!("expected sorted field"),
+        };
+        drop(r0);
+        drop(dir0);
+        let [dvd_name, _] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvd_path = root.join(&dvd_name);
+        let mut bytes = fs::read(&dvd_path).unwrap();
+        let region = &bytes[off..off + len];
+        assert_eq!(region[0], 3, "first term len"); // "aaa"
+        let p = 1 + 3;
+        assert_eq!(region[p], 2, "uncompressed length"); // 1 entry: token + suffix
+        let old_compressed = &region[p + 1..];
+        // token = prefix 5 | (suffix-1)=0 << 4；解压后恰 2 字节。
+        let malicious = lz4::block::compress(
+            &[0x05u8, b'z'],
+            Some(lz4::block::CompressionMode::FAST(2)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            malicious.len(),
+            old_compressed.len(),
+            "等长原位替换保持后续区域偏移不变"
+        );
+        bytes[off + p + 1..off + len].copy_from_slice(&malicious);
+        fs::write(&dvd_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.sorted_dict(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(&root).unwrap();
     }

@@ -1995,4 +1995,73 @@ mod tests {
         drop(reader);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// M7 T-C：多子句 OR 线性扫描 vs 索引堆 micro bench。
+    /// cargo test -p rustlucene-core --lib disj_over_heap_micro -- --ignored --nocapture
+    #[test]
+    #[ignore = "T-C micro bench"]
+    fn disj_over_heap_micro() {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        use std::time::Instant;
+        const DOCS: u32 = 200_000;
+        const K_TERMS: u32 = 256; // term 池 t0..t255；df ≈ 3×200k/256 ≈ 2.3k（无 bitmap）
+        let root = temp_dir("orheap");
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = false;
+        let mut w = IndexWriter::create(&root, schema(), cfg).unwrap();
+        for i in 0..DOCS {
+            let m = format!("t{} t{} t{}", i % K_TERMS, (i / 3) % K_TERMS, (i / 7) % K_TERMS);
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        for k in [8usize, 32, 128] {
+            let terms: Vec<String> = (0..k as u32).map(|j| format!("t{j}")).collect();
+            // 同一批子句构造两种 DisjOver，驱动到穷尽计时（5 轮取最小）
+            let run = |heap: bool| -> u128 {
+                let dir = FSDirectory::open(&root).unwrap();
+                let mut reader = Reader::open(&dir).unwrap();
+                let (_b, seg) = reader.leaves().next().unwrap();
+                let mut sub = Vec::new();
+                for t in &terms {
+                    if let Some(it) =
+                        Query::term("message", t).segment_iterator(seg, false).unwrap()
+                    {
+                        sub.push(it);
+                    }
+                }
+                let start = Instant::now();
+                let mut n = 0u64;
+                if heap {
+                    let mut it = doc_iter::DisjOverHeapDocIter::new(sub).unwrap();
+                    loop {
+                        if it.next_doc().unwrap() == NO_MORE_DOCS {
+                            break;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    let mut it = doc_iter::DisjOverLinearDocIter::new(sub).unwrap();
+                    loop {
+                        if it.next_doc().unwrap() == NO_MORE_DOCS {
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+                assert!(n > 0);
+                start.elapsed().as_nanos()
+            };
+            let (mut lin, mut hp) = (u128::MAX, u128::MAX);
+            for _ in 0..5 {
+                lin = lin.min(run(false));
+                hp = hp.min(run(true));
+            }
+            println!(
+                "k={k}: linear={lin}ns heap={hp}ns heap/linear={:.2}",
+                hp as f64 / lin as f64
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

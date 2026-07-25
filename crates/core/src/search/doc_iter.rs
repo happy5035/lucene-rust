@@ -1119,19 +1119,95 @@ impl DocIter for ConjOverDocIter {
     // freq: 1（ConstantScore，spec §2.3 Bool 路径恒 needs_freq=false）
 }
 
-/// Disjunction over arbitrary per-segment iterators (spec M6 §2.3):
-/// DisjunctionDocIter 同款线性最小值 k 路归并（spec 提到"参照堆实现"——
-/// 现有 DisjunctionDocIter 实为线性扫描，doc_iter.rs:255-312；k = 子句
-/// 数，沿用线性，不引堆）。
-pub struct DisjOverDocIter {
+/// T-C bench 原型（M7 §4）：DisjOver 的索引堆版本——堆内只放 sub 下标，
+/// 18.7KB 的 SegmentDocIter 不挪动。堆序 = sub[i].doc_id() 小顶。
+/// 子句恒单阶段故不吸收 matches()；保留为 `pub(crate)` bench 原型，
+/// 使 k=8/32/128 门槛判定可复现。
+pub(crate) struct DisjOverHeapDocIter {
+    sub: Vec<SegmentDocIter>,
+    heap: Vec<usize>,
+    doc: i32,
+}
+
+impl DisjOverHeapDocIter {
+    pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverHeapDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let n = sub.len();
+        let mut it = DisjOverHeapDocIter {
+            sub,
+            heap: (0..n).collect(),
+            doc: -1,
+        };
+        for s in &mut it.sub {
+            s.next_doc()?;
+        }
+        for i in (0..it.heap.len() / 2).rev() {
+            it.sift_down(i); // heapify
+        }
+        Ok(it)
+    }
+    fn less(&self, a: usize, b: usize) -> bool {
+        self.sub[self.heap[a]].doc_id() < self.sub[self.heap[b]].doc_id()
+    }
+    fn sift_down(&mut self, mut i: usize) {
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < self.heap.len() && self.less(l, m) {
+                m = l;
+            }
+            if r < self.heap.len() && self.less(r, m) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            self.heap.swap(i, m);
+            i = m;
+        }
+    }
+}
+
+impl DocIter for DisjOverHeapDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        loop {
+            let top = self.heap[0];
+            let d = self.sub[top].doc_id();
+            if d == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            if self.doc < d {
+                self.doc = d;
+                return Ok(d);
+            }
+            // 堆顶停在已消费的 doc → 推进并下滤（NO_MORE_DOCS 自然沉底）
+            self.sub[top].next_doc()?;
+            self.sift_down(0);
+        }
+    }
+}
+
+/// Linear-scan baseline for the M7 T-C micro bench: same semantics as
+/// the heap `DisjOverDocIter` below, but finds the minimum doc ID by
+/// scanning all sub-iterators every step. Kept as a `pub(crate)` bench
+/// prototype so the k=8/32/128 threshold decision remains reproducible
+/// after the production path was heapified.
+pub(crate) struct DisjOverLinearDocIter {
     sub: Vec<SegmentDocIter>,
     doc: i32,
 }
 
-impl DisjOverDocIter {
-    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverDocIter> {
+impl DisjOverLinearDocIter {
+    pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverLinearDocIter> {
         debug_assert!(sub.len() >= 2);
-        let mut it = DisjOverDocIter { sub, doc: -1 };
+        let mut it = DisjOverLinearDocIter { sub, doc: -1 };
         for s in &mut it.sub {
             s.next_doc()?;
         }
@@ -1139,7 +1215,7 @@ impl DisjOverDocIter {
     }
 }
 
-impl DocIter for DisjOverDocIter {
+impl DocIter for DisjOverLinearDocIter {
     fn doc_id(&self) -> i32 {
         self.doc
     }
@@ -1205,6 +1281,127 @@ impl DocIter for DisjOverDocIter {
                 best = d;
             }
         }
+        self.doc = best;
+        Ok(best)
+    }
+}
+
+/// Disjunction over arbitrary per-segment iterators (spec M6 §2.3):
+/// k 路最小值归并，使用索引堆：堆内只存 sub 下标，18.7KB 的
+/// SegmentDocIter 不挪动；堆顶即当前最小 doc。保留 M7 §2.3 的
+/// matches() 吸收逻辑——停在 best 的子句逐个 confirmation，任一命中
+/// 即返回（短路）。
+pub struct DisjOverDocIter {
+    sub: Vec<SegmentDocIter>,
+    heap: Vec<usize>, // heap[h] = index into sub
+    pos: Vec<usize>,  // pos[i] = heap position of sub i
+    doc: i32,
+}
+
+impl DisjOverDocIter {
+    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let n = sub.len();
+        let mut it = DisjOverDocIter {
+            sub,
+            heap: (0..n).collect(),
+            pos: (0..n).collect(),
+            doc: -1,
+        };
+        for s in &mut it.sub {
+            s.next_doc()?;
+        }
+        for i in (0..it.heap.len() / 2).rev() {
+            it.sift_down(i); // heapify
+        }
+        Ok(it)
+    }
+
+    fn less(&self, a: usize, b: usize) -> bool {
+        self.sub[self.heap[a]].doc_id() < self.sub[self.heap[b]].doc_id()
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.pos[self.heap[a]] = a;
+        self.pos[self.heap[b]] = b;
+    }
+
+    fn sift_down(&mut self, mut i: usize) {
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < self.heap.len() && self.less(l, m) {
+                m = l;
+            }
+            if r < self.heap.len() && self.less(r, m) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            self.swap(i, m);
+            i = m;
+        }
+    }
+}
+
+impl DocIter for DisjOverDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        loop {
+            // 先把仍停在上一个已返回 doc 的子句推进
+            if self.doc >= 0 {
+                for i in 0..self.sub.len() {
+                    if self.sub[i].doc_id() == self.doc {
+                        self.sub[i].next_doc()?;
+                        self.sift_down(self.pos[i]);
+                    }
+                }
+            }
+            let best = self.sub[self.heap[0]].doc_id();
+            if best == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            // M7 §2.3：对停在 best 的子句逐个 confirmation；至少一个
+            // true → 命中（短路，省掉其余子句的确认成本）。
+            let mut any = false;
+            for i in 0..self.sub.len() {
+                if self.sub[i].doc_id() == best && self.sub[i].matches()? {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                self.doc = best;
+                return Ok(best);
+            }
+            // 全部未命中：推进所有停在 best 的子句并继续
+            for i in 0..self.sub.len() {
+                if self.sub[i].doc_id() == best {
+                    self.sub[i].next_doc()?;
+                    self.sift_down(self.pos[i]);
+                }
+            }
+        }
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target || self.doc == NO_MORE_DOCS {
+            return Ok(self.doc);
+        }
+        for i in 0..self.sub.len() {
+            if self.sub[i].doc_id() < target {
+                self.sub[i].advance(target)?;
+                self.sift_down(self.pos[i]);
+            }
+        }
+        let best = self.sub[self.heap[0]].doc_id();
         self.doc = best;
         Ok(best)
     }

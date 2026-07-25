@@ -1146,4 +1146,217 @@ mod tests {
         assert_eq!(last, 9998);
         assert_eq!(it.next_doc().unwrap(), NO_MORE_DOCS); // 粘滞
     }
+
+    // ── M6 T-B: PointRange ─────────────────────────────────────────
+
+    fn point_schema() -> Schema {
+        let mut s = Schema::new();
+        s.add(FieldSpec::long_point("ts"));
+        s.add(FieldSpec::int_point("lvl"));
+        s.add(FieldSpec::keyword("level"));
+        s
+    }
+
+    /// ts = i*10（LongPoint），lvl = i-50（IntPoint），level 轮转（非 point 字段）
+    fn point_doc(i: u32) -> Document {
+        let mut d = Document::new();
+        d.add("ts", FieldValue::Long(i as i64 * 10));
+        d.add("lvl", FieldValue::Int(i as i32 - 50));
+        d.add(
+            "level",
+            FieldValue::Keyword(if i % 2 == 0 { "INFO" } else { "WARN" }.to_string()),
+        );
+        d
+    }
+
+    /// M6 §3.4: 基本语义——count == 物化 cardinality == 迭代数；边界四类。
+    #[test]
+    fn point_range_query_basic() {
+        let root = temp_dir("ptrange");
+        let mut w =
+            IndexWriter::create(&root, point_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..100u32 {
+            w.add_document(point_doc(i)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+
+        // [100, 250] → docs 10..=25
+        let q = Query::point_range("ts", 100, 250);
+        assert_eq!(s.count(&q).unwrap(), 16);
+        let (total, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(total, 16);
+        assert_eq!(docs, (10..=25).collect::<Vec<i32>>());
+        // 迭代器变体钉死物化路径
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_b, seg) = reader.leaves().next().unwrap();
+        let it = q.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Points(_)),
+            "PointRange must materialize into SegmentDocIter::Points"
+        );
+        drop(reader);
+        // 点查询退化 [v,v]
+        assert_eq!(s.count(&Query::point_range("ts", 250, 250)).unwrap(), 1);
+        // 不相交 → 0
+        assert_eq!(s.count(&Query::point_range("ts", 2000, 3000)).unwrap(), 0);
+        // 全区间 MIN..MAX → 100
+        assert_eq!(
+            s.count(&Query::point_range("ts", i64::MIN, i64::MAX))
+                .unwrap(),
+            100
+        );
+        // 贴 MIN / 贴 MAX
+        assert_eq!(s.count(&Query::point_range("ts", i64::MIN, 0)).unwrap(), 1);
+        assert_eq!(
+            s.count(&Query::point_range("ts", 990, i64::MAX)).unwrap(),
+            1
+        );
+        // 未知字段 / 非 point 字段 → 空命中（不报错）
+        assert_eq!(s.count(&Query::point_range("nope", 0, 1)).unwrap(), 0);
+        assert_eq!(
+            s.count(&Query::point_range("level", 0, i64::MAX)).unwrap(),
+            0
+        );
+        // freq_sum 拒绝 PointRange（needs_freq 恒 false，spec §3.3）
+        let err = s.freq_sum(&Query::point_range("ts", 0, 1)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M6 §3.1: low>high → Err(InvalidInput)（跨任务钉死接口）。
+    /// 注意：Lucene 9.12.3 对 low>high 并不报错（PointRangeQuery.checkArgs
+    /// :100-110 仅查 null，自然走成全 Outside → 0 命中）——Err 是本系统
+    /// 钉死的显式错误面，不进 Java diff 电池。
+    #[test]
+    fn point_range_low_gt_high_errors() {
+        let root = temp_dir("ptrange-err");
+        let mut w =
+            IndexWriter::create(&root, point_schema(), IndexWriterConfig::default()).unwrap();
+        w.add_document(point_doc(0)).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let err = s.count(&Query::point_range("ts", 10, 5)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let mut c = CountCollector::default();
+        let err = s
+            .search(&Query::point_range("ts", 10, 5), &mut c)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M6 §3.2: 多值点——同 doc 多值逐值回调，物化去重后只计一次。
+    #[test]
+    fn point_range_multivalued_dedup() {
+        let root = temp_dir("ptrange-multi");
+        let mut w =
+            IndexWriter::create(&root, point_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            let mut d = point_doc(i);
+            if i == 3 {
+                d.add("ts", FieldValue::Long(10_000));
+                d.add("ts", FieldValue::Long(20_000));
+            }
+            if i == 7 {
+                d.add("ts", FieldValue::Long(5)); // 与主值 70 同 doc
+            }
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // [10_000, 20_000] 只命中 doc 3，一次（两个值都命中也只算一次）
+        let q = Query::point_range("ts", 10_000, 20_000);
+        assert_eq!(s.count(&q).unwrap(), 1);
+        let (total, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!((total, docs), (1, vec![3]));
+        // [0, 70] 命中 docs 0..=7（doc 7 两个值都在区间内）→ 8 docs
+        assert_eq!(s.count(&Query::point_range("ts", 0, 70)).unwrap(), 8);
+        // 全区间 → 仍 10 docs（物化集合去重）
+        assert_eq!(
+            s.count(&Query::point_range("ts", i64::MIN, i64::MAX))
+                .unwrap(),
+            10
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M6 §3.1/§3.4: IntPoint 复用同一变体——按 .fnm point_num_bytes
+    /// 解包 + clamp 规则（4 字节字段，整区间出界 → 空）。
+    #[test]
+    fn point_range_int_field_clamp() {
+        let root = temp_dir("ptrange-int");
+        let mut w =
+            IndexWriter::create(&root, point_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..100u32 {
+            w.add_document(point_doc(i)).unwrap(); // lvl = i-50 ∈ [-50, 49]
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // i64 全域 → clamp 到 i32 全域 → 100
+        assert_eq!(
+            s.count(&Query::point_range("lvl", i64::MIN, i64::MAX))
+                .unwrap(),
+            100
+        );
+        // 部分出界 clamp：[i64::MIN, -40] → lvl ∈ [-50, -40] → docs 0..=10
+        assert_eq!(
+            s.count(&Query::point_range("lvl", i64::MIN, -40)).unwrap(),
+            11
+        );
+        // 整区间出 i32 域 → 0（clamp-to-empty，非错误）
+        assert_eq!(
+            s.count(&Query::point_range("lvl", i32::MAX as i64 + 1, i64::MAX))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            s.count(&Query::point_range("lvl", i64::MIN, i32::MIN as i64 - 1))
+                .unwrap(),
+            0
+        );
+        // 负值边界
+        assert_eq!(s.count(&Query::point_range("lvl", -50, -50)).unwrap(), 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M6 §3.3: 多段 doc base 映射 + 段级空结果。
+    #[test]
+    fn point_range_multi_segment() {
+        let root = temp_dir("ptrange-seg");
+        let mut w =
+            IndexWriter::create(&root, point_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            w.add_document(point_doc(i)).unwrap();
+        }
+        w.commit().unwrap();
+        for i in 10..25u32 {
+            w.add_document(point_doc(i)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // ts = i*10; [50, 200] → docs 5..=20
+        let q = Query::point_range("ts", 50, 200);
+        assert_eq!(s.count(&q).unwrap(), 16);
+        let (total, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(total, 16);
+        assert_eq!(docs, (5..=20).collect::<Vec<i32>>());
+        // 只命中第二段
+        let (total, docs) = s
+            .top_docs(&Query::point_range("ts", 150, 240), 100)
+            .unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(docs, (15..=24).collect::<Vec<i32>>());
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

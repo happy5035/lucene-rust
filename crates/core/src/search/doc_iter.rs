@@ -1121,14 +1121,16 @@ impl DocIter for ConjOverDocIter {
 
 /// T-C bench 原型（M7 §4）：DisjOver 的索引堆版本——堆内只放 sub 下标，
 /// 18.7KB 的 SegmentDocIter 不挪动。堆序 = sub[i].doc_id() 小顶。
-/// 子句恒单阶段故不吸收 matches()；保留为 `pub(crate)` bench 原型，
-/// 使 k=8/32/128 门槛判定可复现。
+/// 子句恒单阶段故不吸收 matches()；仅用于被忽略的 micro bench，
+/// 用 `#[cfg(test)]` 门控避免 release 构建的 dead-code 警告。
+#[cfg(test)]
 pub(crate) struct DisjOverHeapDocIter {
     sub: Vec<SegmentDocIter>,
     heap: Vec<usize>,
     doc: i32,
 }
 
+#[cfg(test)]
 impl DisjOverHeapDocIter {
     pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverHeapDocIter> {
         debug_assert!(sub.len() >= 2);
@@ -1168,6 +1170,7 @@ impl DisjOverHeapDocIter {
     }
 }
 
+#[cfg(test)]
 impl DocIter for DisjOverHeapDocIter {
     fn doc_id(&self) -> i32 {
         self.doc
@@ -1196,14 +1199,15 @@ impl DocIter for DisjOverHeapDocIter {
 
 /// Linear-scan baseline for the M7 T-C micro bench: same semantics as
 /// the heap `DisjOverDocIter` below, but finds the minimum doc ID by
-/// scanning all sub-iterators every step. Kept as a `pub(crate)` bench
-/// prototype so the k=8/32/128 threshold decision remains reproducible
-/// after the production path was heapified.
+/// scanning all sub-iterators every step.仅用于被忽略的 micro bench，
+/// 用 `#[cfg(test)]` 门控避免 release 构建的 dead-code 警告。
+#[cfg(test)]
 pub(crate) struct DisjOverLinearDocIter {
     sub: Vec<SegmentDocIter>,
     doc: i32,
 }
 
+#[cfg(test)]
 impl DisjOverLinearDocIter {
     pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverLinearDocIter> {
         debug_assert!(sub.len() >= 2);
@@ -1215,6 +1219,7 @@ impl DisjOverLinearDocIter {
     }
 }
 
+#[cfg(test)]
 impl DocIter for DisjOverLinearDocIter {
     fn doc_id(&self) -> i32 {
         self.doc
@@ -1395,15 +1400,19 @@ impl DocIter for DisjOverDocIter {
         if self.doc >= target || self.doc == NO_MORE_DOCS {
             return Ok(self.doc);
         }
+        // M7 §2.3 / M7-review：advance 必须先把所有落后于 target 的子句推到
+        // >= target，否则堆顶可能仍 < target（next_doc 只推进等于 self.doc 的
+        // 子句，而 target-1 处未必有子句）。每次 advance 后下滤维持堆序。
         for i in 0..self.sub.len() {
             if self.sub[i].doc_id() < target {
                 self.sub[i].advance(target)?;
                 self.sift_down(self.pos[i]);
             }
         }
-        let best = self.sub[self.heap[0]].doc_id();
-        self.doc = best;
-        Ok(best)
+        // 现在堆顶 >= target；把当前状态设为 target 前一个 doc，
+        // 复用 next_doc() 的 confirmation 循环返回候选。
+        self.doc = target - 1;
+        self.next_doc()
     }
 }
 
@@ -1433,7 +1442,15 @@ impl ExcludingDocIter {
                 self.doc = NO_MORE_DOCS;
                 return Ok(NO_MORE_DOCS);
             }
-            if self.prohibited.advance(d)? != d && self.main.matches()? {
+            // M7 §2.3：prohibited 可能是两阶段迭代器（Phrase），advance(d)==d
+            // 只是 approximation 命中，必须再调 matches() 确认才排除。
+            let prohibited_candidate = self.prohibited.advance(d)? == d;
+            let excluded = if prohibited_candidate {
+                self.prohibited.matches()?
+            } else {
+                false
+            };
+            if !excluded && self.main.matches()? {
                 self.doc = d;
                 return Ok(d);
             }

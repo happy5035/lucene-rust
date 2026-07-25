@@ -1807,6 +1807,158 @@ mod tests {
         fs::remove_dir_all(&root_on).unwrap();
     }
 
+    /// M7 回归：MUST_NOT phrase 子句必须对 approximation 候选调 matches()
+    /// 确认。旧代码在 ExcludingDocIter 里把 prohibited.advance(d)==d 直接当
+    /// 排除，导致含 term 但非真实短语的 doc 被误删。语料 doc 2 含 "y x" 而
+    /// 非 "x y"，是 MUST_NOT phrase("x","y") 的 approximation 命中、
+    /// confirmation 拒绝。
+    #[test]
+    fn must_not_phrase_twophase_confirmation() {
+        let root = temp_dir("mustnotphrase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let docs = [
+            "alpha beta",       // 0: MUST phrase hit, no x/y → keep
+            "alpha beta x y",   // 1: MUST hit, MUST_NOT confirmed → exclude
+            "alpha beta y x",   // 2: MUST hit, MUST_NOT approx-only → keep
+            "x y",              // 3: MUST miss → exclude
+            "alpha x beta",     // 4: MUST miss → exclude
+        ];
+        for (i, m) in docs.iter().enumerate() {
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let q = Query::bool(vec![
+            (Occur::Must, Query::phrase("message", &["alpha", "beta"])),
+            (Occur::MustNot, Query::phrase("message", &["x", "y"])),
+        ]);
+        assert_eq!(
+            s.count(&q).unwrap(),
+            drive_count_reference(&dir, &q),
+            "count vs reference"
+        );
+        assert_eq!(
+            s.top_docs(&q, 100).unwrap(),
+            reference_top_docs(&dir, &q, 100),
+            "top_docs vs reference"
+        );
+        let (_, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(docs, vec![0, 2]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 回归：ConjOverDocIter 调用子 OR 的 advance 时，子 OR 不能泄漏未
+    /// 经 matches() 确认的 phrase approximation。旧 DisjOverDocIter::advance
+    /// 直接返回堆顶 doc，导致 doc 1（"alpha x beta" 含 term 但非相邻）被
+    /// OR(phrase("alpha","beta"), term("zeta")) 误收，再与 term("delta")
+    /// 相交后错误命中。
+    #[test]
+    fn nested_must_or_phrase_twophase_confirmation() {
+        let root = temp_dir("nestedorphrase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let docs = [
+            "alpha beta delta",       // 0: phrase hit, delta hit → keep
+            "alpha x beta delta",     // 1: phrase approx-only, delta hit → exclude
+            "zeta delta",             // 2: zeta hit, delta hit → keep
+            "alpha beta zeta delta",  // 3: phrase hit → keep
+            "alpha beta",             // 4: phrase hit, delta miss → exclude
+            "delta",                  // 5: nothing → exclude
+        ];
+        for (i, m) in docs.iter().enumerate() {
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let inner_or = Query::bool(vec![
+            (Occur::Should, Query::phrase("message", &["alpha", "beta"])),
+            (Occur::Should, Query::term("message", "zeta")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, inner_or),
+            (Occur::Must, Query::term("message", "delta")),
+        ]);
+        assert_eq!(
+            s.count(&q).unwrap(),
+            drive_count_reference(&dir, &q),
+            "count vs reference"
+        );
+        assert_eq!(
+            s.top_docs(&q, 100).unwrap(),
+            reference_top_docs(&dir, &q, 100),
+            "top_docs vs reference"
+        );
+        let (_, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(docs, vec![0, 2, 3]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 最终回归：ExcludingDocIter 的 prohibited 为多子句 DisjOverDocIter。
+    /// 内层 OR 含 Term + Prefix，不可拍平，强制走通用 DisjOver 组合器。
+    #[test]
+    fn must_not_multi_sub_disjunction() {
+        let root = temp_dir("mustnotdisj");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        // doc 0/1/3 含 b 或 c，应被排除；doc 2 只含 a，应命中。
+        w.add_document(doc("INFO", "tid-0", "a b")).unwrap();
+        w.add_document(doc("INFO", "tid-1", "a c")).unwrap();
+        w.add_document(doc("INFO", "tid-2", "a")).unwrap();
+        w.add_document(doc("INFO", "tid-3", "a b c")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let prohibited = Query::bool(vec![
+            (Occur::Should, Query::term("message", "b")),
+            (Occur::Should, Query::prefix("message", "c")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "a")),
+            (Occur::MustNot, prohibited),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 1);
+        let (total, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!((total, docs), (1, vec![2]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 最终回归：ConjOverDocIter 对齐时调用嵌套 DisjOverDocIter 的 advance。
+    /// 若 DisjOverDocIter 只把 self.doc 设为 target-1 就调 next_doc，会漏推进
+    /// 那些 < target-1 的子句，导致返回 < target 的 doc，破坏合取对齐不变量。
+    /// 内层 OR 跨字段（b / level INFO），不可拍平，确保走 DisjOverDocIter。
+    #[test]
+    fn conj_over_advances_behind_disjunction() {
+        let root = temp_dir("conjoverdisj");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        // doc 0 满足内层 OR（有 b 且 level INFO），doc 99 只满足 a。
+        w.add_document(doc("INFO", "tid-0", "a b")).unwrap();
+        for i in 1..99 {
+            w.add_document(doc("WARN", &format!("tid-{i}"), "b")).unwrap();
+        }
+        w.add_document(doc("WARN", "tid-99", "a")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let inner_or = Query::bool(vec![
+            (Occur::Should, Query::term("message", "b")),
+            (Occur::Should, Query::term("level", "INFO")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "a")),
+            (Occur::Must, inner_or),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 1);
+        let (total, docs) = s.top_docs(&q, 200).unwrap();
+        assert_eq!((total, docs), (1, vec![0]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// M7 T-B/T-D 的独立参照：不经任何 count 快路径，纯迭代 + matches
     /// 驱动计数（永远正确，用于钉死各 count 快路径的等价性）。
     fn drive_count_reference(dir: &FSDirectory, q: &Query) -> u64 {

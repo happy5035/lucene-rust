@@ -768,19 +768,6 @@ pub(crate) fn bool_segment_fast_count(
     Ok(None)
 }
 
-/// spec §2.5 Bool per-segment count：快路径（拍平 roaring / 纯 MUST_NOT /
-/// T-B fold）优先，None 回落组合迭代器逐 doc 计数。
-#[allow(dead_code)]
-pub(crate) fn bool_segment_count(
-    seg: &mut SegmentReader,
-    clauses: &[(Occur, Query)],
-) -> io::Result<u64> {
-    if let Some(c) = bool_segment_fast_count(seg, clauses)? {
-        return Ok(c);
-    }
-    drive_count(bool_segment_iterator(seg, clauses, false)?)
-}
-
 /// M7 §5.1 段级 count 快路径统一入口：Some(c) = 快路径结果；None = 无
 /// 快路径（调用方迭代计数）。归并既有全部捷径（Term doc_freq 直读 /
 /// PointRange bitmap cardinality / multi-term bitset popcount / And-Or

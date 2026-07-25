@@ -37,7 +37,7 @@
 
 ### 搜索读路径（`crates/core/src/search`，M2）
 
-- **查询能力**（由写入能力严格限定，全部 ConstantScore、无打分 / norms / impact）：Term、Phrase（slop=0）、Boolean must/should（同字段平铺）、Terms（IN 语义）、Prefix、Wildcard（`*`/`?`，前缀形走 FST 前缀扫）、MatchAll、top-N（INDEXORDER）。嵌套 Boolean / Point 区间 / forceMerge 见 `docs/superpowers/specs/2026-07-24-rust-m6-bool-point-forcemerge-design.md`
+- **查询能力**（由写入能力严格限定，全部 ConstantScore、无打分 / norms / impact）：Term、Phrase（slop=0）、**嵌套 Boolean（MUST/SHOULD/MUST_NOT，跨字段、跨子查询）**、Boolean must/should（同字段平铺保留）、Terms（IN 语义）、Prefix、Wildcard（`*`/`?`，前缀形走 FST 前缀扫）、**1D PointRange（LongPoint/IntPoint）**、MatchAll、top-N（INDEXORDER）。M6 详细设计见 `docs/superpowers/specs/2026-07-24-rust-m6-bool-point-forcemerge-design.md`。
 - **架构**：方案 C——执行语义逐行对照 Lucene 9.12.3 源码（advance 协议、position 合取、BKD 边界、MISSING 排序），对象结构 Rust 化：`enum Query` + `trait DocIter`，不做 Java 式 Query/Weight/Scorer 继承体系
 - **快照语义**：open 即快照，重开即刷新（无 NRT 原地 refresh）；单线程逐段执行
 - 只保证读**本系统写出的**索引（无 delete / `.liv` / norms）；Java 写的索引可读但不做删除语义
@@ -156,20 +156,22 @@ roaring（`--bitmap` 索引）vs 同索引纯 PFOR（`RL_BITMAP=0`）vs Java Luc
 ```bash
 make build          # cargo build --release + javac interop 工具
 make interop-test   # M1 文本链路：Rust 写 → Java CheckIndex + 查询 diff
-make log-test       # 日志 schema 五变体互操作验证（含 --bitmap、forceMerge）
+make log-test       # 日志 schema 七变体互操作验证（含 --bitmap、Rust forceMerge、Java forceMerge）
 make compare INPUT=/path/to/logs NDOCS=500000   # 同语料 Rust/Java 对比
 make log-bench LOGDOCS=1000000 LOGTHREADS=8     # 日志场景写入基准
 # 搜索基准：先建 bitmap 索引，再三路对拍（roaring / RL_BITMAP=0 / Java --no-cache）
 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- logwrite /tmp/idx 1000000 42 --bitmap
 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- searchbench /tmp/idx message --warmup 10 --iter 30
+# forceMerge(1)：把多段压成一个段（bitmap 按配置重建）
+cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- forcemerge /tmp/idx --bitmap
 ```
 
 ## 范围与限制
 
-- 段合并（merge）、delete / 更新不在范围内（`commit_segments` 已预留多段合并提交接口）；写侧仅 CREATE（空目录建索引），暂不支持追加打开已有索引
+- **段合并**：已实现 `forceMerge(1)`，会把当前全部段归并成一个新段、重建 `segments_N`、删除旧段文件；delete / 更新不在范围内。写侧仅 CREATE（空目录建索引），暂不支持追加打开已有索引
 - 无打分：写侧一律 omitNorms、不写 `.nvm/.nvd/.nrm`；读侧全部 ConstantScore
 - 读侧只保证读本系统写出的索引（无 `.liv` / norms / vector）；NRT 为 open 即快照、重开即刷新
-- 暂不支持：SortedSet / Binary / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet
+- 暂不支持：SortedSet / Binary / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet、可配目标段数的 merge 策略
 - bitmap 为实验性写侧开关（`--bitmap` 默认 off）：只加速 docs 维度，phrase / freq 永远落档 postings；multi-term 的 roaring 集成未做
 
-里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲）；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。
+里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲、M6 嵌套 Bool + Point + forceMerge）；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。

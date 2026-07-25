@@ -37,6 +37,7 @@ use crate::points::{
 
 /// One field's `.kdm` entry + fully decoded packed index (BKDReader ctor
 /// :56-113 + BKDPointTree readNodeData :657-717, decoded eagerly at open).
+#[allow(dead_code)]
 struct FieldMeta {
     field_number: i32,
     bytes_per_dim: usize,

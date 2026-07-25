@@ -433,17 +433,16 @@ pub(crate) fn merge_points(
 /// 删除指定 segment 名下所有可能产生的文件（`_N.*` 与 `_N_*`）。
 /// 用于 force_merge 失败/提交失败时的尽力孤儿清理，覆盖子 writer 写到
 /// 一半就失败的 partial 文件（这些文件不会进入 `written` 清单）。
-fn cleanup_segment_files(dir: &FSDirectory, segment_name: &str) {
+fn cleanup_segment_files(dir: &FSDirectory, segment_name: &str) -> io::Result<()> {
     let prefix_dot = format!("{segment_name}.");
     let prefix_underscore = format!("{segment_name}_");
-    let Ok(names) = dir.list_all() else {
-        return;
-    };
+    let names = dir.list_all()?;
     for name in names {
         if name.starts_with(&prefix_dot) || name.starts_with(&prefix_underscore) {
-            let _ = dir.delete(&name);
+            dir.delete(&name)?;
         }
     }
+    Ok(())
 }
 
 /// forceMerge(1)（M6 spec §4.1）：读当前 segments_N → 逐格式归并出一个新段 →
@@ -548,7 +547,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
             for f in &written {
                 let _ = dir.delete(f); // 尽力而为（Java abort 同款）
             }
-            cleanup_segment_files(dir, &new_name); // 同时清理 partial 文件
+            let _ = cleanup_segment_files(dir, &new_name); // 尽力；保留原错误
             return Err(e);
         }
     };
@@ -566,7 +565,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         for f in &written {
             let _ = dir.delete(f);
         }
-        cleanup_segment_files(dir, &new_name);
+        let _ = cleanup_segment_files(dir, &new_name); // 尽力；保留原错误
         return Err(e);
     }
 
@@ -1119,7 +1118,7 @@ mod tests {
         fs::write(root.join("_0_Lucene90_0.dvd"), b"c").unwrap();
         fs::write(root.join("_1.fdt"), b"d").unwrap();
         fs::write(root.join("segments_1"), b"e").unwrap();
-        cleanup_segment_files(&dir, "_0");
+        cleanup_segment_files(&dir, "_0").unwrap();
         let files: std::collections::BTreeSet<String> =
             dir.list_all().unwrap().into_iter().collect();
         assert!(!files.contains("_0.fdt"));

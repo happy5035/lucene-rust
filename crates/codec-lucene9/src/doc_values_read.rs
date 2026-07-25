@@ -203,7 +203,9 @@ impl DocValuesReader {
         let start = (offset as u64)
             .checked_sub(self.header_len)
             .ok_or_else(|| corrupt("DV offset before data"))? as usize;
-        let end = start + length as usize;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or_else(|| corrupt("DV slice end overflow"))?;
         if end > self.dvd.len() {
             return Err(corrupt(format!(
                 "DV slice [{}, {}) exceeds dvd length {}",
@@ -301,7 +303,13 @@ impl DocValuesReader {
                 }
             }
         }
-        debug_assert_eq!(docs.len() as u64, m.num_values);
+        if docs.len() as u64 != m.num_values {
+            return Err(corrupt(format!(
+                "DISI docs count mismatch: expected {}, got {}",
+                m.num_values,
+                docs.len()
+            )));
+        }
         Ok(docs)
     }
 
@@ -313,7 +321,10 @@ impl DocValuesReader {
         }
         let data = self.slice(m.values_offset, m.values_length)?;
         // 校验数据区足够容纳 num_values 个值（bpv 位/值，offset=0）。
-        let bits_needed = m.num_values * m.bpv as u64;
+        let bits_needed = m
+            .num_values
+            .checked_mul(m.bpv as u64)
+            .ok_or_else(|| corrupt("numeric values size overflow"))?;
         let bytes_needed = (bits_needed + 7) / 8;
         if data.len() < bytes_needed as usize {
             return Err(corrupt(format!(
@@ -342,7 +353,13 @@ impl DocValuesReader {
         };
         let docs = self.read_docs_with_field(m)?;
         let values = self.read_values(m)?;
-        debug_assert_eq!(docs.len(), values.len());
+        if docs.len() != values.len() {
+            return Err(corrupt(format!(
+                "numeric docs/values length mismatch: {} vs {}",
+                docs.len(),
+                values.len()
+            )));
+        }
         Ok(docs.into_iter().zip(values).collect())
     }
 
@@ -545,6 +562,26 @@ mod tests {
         bytes[n - 8..].copy_from_slice(&crc.to_be_bytes());
     }
 
+    fn dvm_num_values_offset() -> usize {
+        // header + field_number(i32) + type(u8) + docs_offset(i64) + docs_length(i64)
+        // + jump_table_entry_count(i16) + dense_rank_power(i8)
+        index_header_length(META_CODEC, SUFFIX) + 4 + 1 + 8 + 8 + 2 + 1
+    }
+
+    fn dvm_docs_offset() -> usize {
+        // header + field_number(i32) + type(u8)
+        index_header_length(META_CODEC, SUFFIX) + 4 + 1
+    }
+
+    fn dvm_values_offset_offset() -> usize {
+        // bpv(1) + min(i64) + gcd(i64)
+        dvm_bpv_offset() + 1 + 8 + 8
+    }
+
+    fn dvm_values_length_offset() -> usize {
+        dvm_values_offset_offset() + 8
+    }
+
     #[test]
     fn corrupt_dvd_truncated_open_fails() {
         let root = write_index("corrupt-open", |w| {
@@ -622,6 +659,74 @@ mod tests {
         let dir = FSDirectory::open(&root).unwrap();
         let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
         let err = r.sorted_ords(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_num_values_overflow_fails() {
+        // num_values * bpv 溢出 → read_values 返回 InvalidData 而非 panic。
+        let root = write_index("corrupt-overflow", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        bytes[dvm_docs_offset()..dvm_docs_offset() + 8].copy_from_slice(&(-2i64).to_le_bytes());
+        bytes[dvm_num_values_offset()..dvm_num_values_offset() + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[dvm_bpv_offset()] = 64;
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.numeric_values(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_values_bounds_overflow_fails() {
+        // values_offset/length 极大 → slice end 溢出/越界，返回 InvalidData。
+        let root = write_index("corrupt-bounds", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        bytes[dvm_values_offset_offset()..dvm_values_offset_offset() + 8]
+            .copy_from_slice(&i64::MAX.to_le_bytes());
+        bytes[dvm_values_length_offset()..dvm_values_length_offset() + 8]
+            .copy_from_slice(&i64::MAX.to_le_bytes());
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.numeric_values(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_docs_count_mismatch_fails() {
+        // 稀疏 numeric 字段的 num_values 与实际 DISI docs 数量不符，
+        // read_docs_with_field 运行时检查返回 InvalidData。
+        let root = write_index("corrupt-docs-count", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        bytes[dvm_num_values_offset()..dvm_num_values_offset() + 8]
+            .copy_from_slice(&1u64.to_le_bytes());
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.numeric_values(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(&root).unwrap();
     }

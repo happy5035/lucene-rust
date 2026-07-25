@@ -561,6 +561,25 @@ fn sexpr_node(toks: &[&str], pos: &mut usize) -> Result<Query, String> {
 ///
 /// Uses Java SearchBench --dump-queries output as query source.
 /// Output is tab-separated: query_type freq qps p50_us p90_us p99_us count
+///
+/// Modes: default = count (total hit count, mirrors Java TotalHitCountCollector);
+/// `--topn N` = Sort.INDEXORDER top-N via `Searcher::top_docs` (M7 §5.2
+/// count/topN split: total from the fast count path, iteration stops once
+/// n hits are collected). Counterpart of Java SearchBench `--topn N`
+/// (TopScoreDocCollector, BM25 + BlockMaxWAND) — semantics differ (doc
+/// order vs score order), so topn mode prints the top-N docID list in the
+/// per-query detail lines instead of the count: diffable across the two
+/// Rust bitmap modes, NOT against Java. The group summary's last two
+/// columns stay total_hits min/max.
+///
+/// `--no-fast-count` forces full-iteration counting for every work item
+/// via the search driver (`segment_iterator` + `matches` + `collect`;
+/// `fast_segment_count` is never consulted) — the ITERM mechanism applied
+/// to all items. Counterpart of Java SearchBench `--no-fast-count`
+/// (ForceIterQuery hides Weight.count): both sides visit every hit and
+/// count, no early termination. Models the sort-topN scenario where
+/// neither engine can early-terminate; count is the proxy metric.
+/// Mutually exclusive with `--topn`.
 fn searchbench(
     index_dir: &Path,
     field: &str,
@@ -569,6 +588,8 @@ fn searchbench(
     tasks: usize,
     seed: u64,
     load_queries: Option<String>,
+    topn: Option<usize>,
+    no_fast_count: bool,
 ) -> std::io::Result<()> {
     let dir = FSDirectory::open(index_dir)?;
     let mut searcher = Searcher::open(&dir)?;
@@ -851,15 +872,42 @@ fn searchbench(
     // postings (CountCollector over Searcher::search) instead of the
     // doc_freq O(1) shortcut that Searcher::count takes for term queries —
     // the pure-iteration counterpart of Java SearchBench's iterm type.
-    let run_once = |searcher: &mut Searcher, item: &WorkItem| -> std::io::Result<u64> {
-        match item {
-            WorkItem::ITerm(t) => {
-                let q = Query::term(field, t);
-                let mut c = CountCollector::default();
-                searcher.search(&q, &mut c)?;
-                Ok(c.count)
+    // Returns (metric for group summary, detail-line suffix): count mode =
+    // (count, count); topn mode = (total_hits, "d0,d1,...").
+    let run_once = |searcher: &mut Searcher, item: &WorkItem| -> std::io::Result<(u64, String)> {
+        match topn {
+            None => {
+                // --no-fast-count: force the full-iteration search driver
+                // (fast_segment_count never consulted) for every item —
+                // same mechanism as ITERM below; with the flag set ITERM
+                // degenerates to the same path.
+                if no_fast_count {
+                    let mut c = CountCollector::default();
+                    searcher.search(&build_query(item), &mut c)?;
+                    return Ok((c.count, c.count.to_string()));
+                }
+                match item {
+                    WorkItem::ITerm(t) => {
+                        let q = Query::term(field, t);
+                        let mut c = CountCollector::default();
+                        searcher.search(&q, &mut c)?;
+                        Ok((c.count, c.count.to_string()))
+                    }
+                    _ => {
+                        let count = searcher.count(&build_query(item))?;
+                        Ok((count, count.to_string()))
+                    }
+                }
             }
-            _ => searcher.count(&build_query(item)),
+            Some(n) => {
+                let (total, docs) = searcher.top_docs(&build_query(item), n)?;
+                let suffix = docs
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Ok((total, suffix))
+            }
         }
     };
     // Correctness line matching the Java SearchBench stderr format verbatim.
@@ -901,7 +949,7 @@ fn searchbench(
         let _ = run_once(&mut searcher, item)?;
     }
 
-    let mut query_counts: Vec<(String, u64)> = Vec::with_capacity(work.len());
+    let mut query_counts: Vec<(String, u64, String)> = Vec::with_capacity(work.len());
 
     for (label, item) in &work {
         // Warmup iterations
@@ -914,11 +962,11 @@ fn searchbench(
         let io0 = codec_lucene9::io::io_stats::snapshot();
         for _ in 0..iter {
             let t0 = Instant::now();
-            let count = run_once(&mut searcher, item)?;
+            let (metric, suffix) = run_once(&mut searcher, item)?;
             latencies_ns.push(t0.elapsed().as_nanos() as u64);
-            // Store count from last iteration for correctness check
+            // Store metric + detail suffix from last iteration for correctness check
             if latencies_ns.len() == iter as usize {
-                query_counts.push((detail_of(label, item), count));
+                query_counts.push((detail_of(label, item), metric, suffix));
             }
         }
         let io1 = codec_lucene9::io::io_stats::snapshot();
@@ -969,10 +1017,16 @@ fn searchbench(
         );
     }
 
-    // Print per-query counts for correctness diff (compare with Java SearchBench)
-    eprintln!("\n# Per-query hit counts (for correctness verification vs Java)");
-    for (label, count) in &query_counts {
-        eprintln!("{label}\t{count}");
+    // Per-query correctness lines: count mode = hit count (diffable vs Java
+    // SearchBench); topn mode = top-N docID list (INDEXORDER; diffable across
+    // the two Rust bitmap modes — Java is BM25 score order, not cross-diffable).
+    if topn.is_some() {
+        eprintln!("\n# Per-query top-N docIDs (INDEXORDER; diff Rust roaring vs PFOR — Java is BM25 order, not diffable)");
+    } else {
+        eprintln!("\n# Per-query hit counts (for correctness verification vs Java)");
+    }
+    for (label, _metric, suffix) in &query_counts {
+        eprintln!("{label}\t{suffix}");
     }
 
     // Logical file-read volume per group during measured iterations (IndexInput
@@ -1516,7 +1570,7 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
     eprintln!("  rustlucene-cli searchdump <indexDir> <numDocs> <seed> [--positions]");
-    eprintln!("  rustlucene-cli searchbench <indexDir> <field> [--warmup N] [--iter N] [--tasks N] [--seed S] [--load-queries FILE]");
+    eprintln!("  rustlucene-cli searchbench <indexDir> <field> [--warmup N] [--iter N] [--tasks N] [--seed S] [--load-queries FILE] [--topn N] [--no-fast-count]");
     std::process::exit(2);
 }
 
@@ -1706,6 +1760,8 @@ fn main() -> std::io::Result<()> {
             let mut tasks = 100usize;
             let mut seed = 42u64;
             let mut load_queries: Option<String> = None;
+            let mut topn: Option<usize> = None;
+            let mut no_fast_count = false;
             let mut i = 4;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1729,11 +1785,23 @@ fn main() -> std::io::Result<()> {
                         load_queries = Some(args[i + 1].clone());
                         i += 2;
                     }
+                    "--topn" => {
+                        topn = Some(args[i + 1].parse().unwrap());
+                        i += 2;
+                    }
+                    "--no-fast-count" => {
+                        no_fast_count = true;
+                        i += 1;
+                    }
                     _ => {
                         eprintln!("unknown arg: {}", args[i]);
                         usage();
                     }
                 }
+            }
+            if topn.is_some() && no_fast_count {
+                eprintln!("searchbench: --topn and --no-fast-count are mutually exclusive");
+                std::process::exit(2);
             }
             searchbench(
                 Path::new(&args[2]),
@@ -1743,6 +1811,8 @@ fn main() -> std::io::Result<()> {
                 tasks,
                 seed,
                 load_queries,
+                topn,
+                no_fast_count,
             )
         }
         _ => usage(),

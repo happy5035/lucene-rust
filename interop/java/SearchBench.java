@@ -396,29 +396,39 @@ public class SearchBench {
 
     // --- benchmark ---------------------------------------------------------
 
+    // topn == 0 → count mode (TotalHitCountCollector, mirrors Rust's
+    // searcher.count); topn > 0 → native Lucene top-N: searcher.search(query, n)
+    // = TopScoreDocCollector (BM25 + block-max WAND). Counterpart of Rust
+    // searchbench --topn (Sort.INDEXORDER top_docs) — semantics differ, so the
+    // detail lines print docID lists instead of hit counts.
     @SuppressWarnings("deprecation")
-    static long runOnce(IndexSearcher searcher, Query query) throws Exception {
+    static long runOnce(IndexSearcher searcher, Query query, int topn) throws Exception {
         long t0 = System.nanoTime();
-        TotalHitCountCollector collector = new TotalHitCountCollector();
-        searcher.search(query, collector);
+        if (topn > 0) {
+            searcher.search(query, topn);
+        } else {
+            TotalHitCountCollector collector = new TotalHitCountCollector();
+            searcher.search(query, collector);
+        }
         return System.nanoTime() - t0;
     }
 
-    static Stats measure(IndexSearcher searcher, Query query, int warmup, int iter) throws Exception {
-        for (int i = 0; i < warmup; i++) runOnce(searcher, query);
+    static Stats measure(IndexSearcher searcher, Query query, int warmup, int iter, int topn) throws Exception {
+        for (int i = 0; i < warmup; i++) runOnce(searcher, query, topn);
         long[] lats = new long[iter];
-        for (int i = 0; i < iter; i++) lats[i] = runOnce(searcher, query);
+        for (int i = 0; i < iter; i++) lats[i] = runOnce(searcher, query, topn);
         return new Stats(lats);
     }
 
     // --- main ---------------------------------------------------------------
 
     public static void main(String[] args) throws Exception {
-        int warmup = 10, iterations = 20, tasks = 100;
+        int warmup = 10, iterations = 20, tasks = 100, topn = 0;
         long seed = 42;
         String dumpQueriesFile = null;
         String loadQueriesFile = null;
         boolean noCache = false;
+        boolean noFastCount = false;
         List<String> pos = new ArrayList<>();
 
         for (int i = 0; i < args.length; i++) {
@@ -430,11 +440,17 @@ public class SearchBench {
                 case "--dump-queries": dumpQueriesFile = args[++i]; break;
                 case "--load-queries": loadQueriesFile = args[++i]; break;
                 case "--no-cache":  noCache = true; break;
+                case "--topn":      topn = Integer.parseInt(args[++i]); break;
+                case "--no-fast-count": noFastCount = true; break;
                 default: pos.add(args[i]);
             }
         }
         if (pos.size() < 2) {
-            System.err.println("usage: SearchBench <indexDir> <field> [--tasks N] [--warmup N] [--iter N] [--seed S] [--no-cache] [--dump-queries|--load-queries FILE]");
+            System.err.println("usage: SearchBench <indexDir> <field> [--tasks N] [--warmup N] [--iter N] [--seed S] [--no-cache] [--topn N] [--no-fast-count] [--dump-queries|--load-queries FILE]");
+            System.exit(2);
+        }
+        if (topn > 0 && noFastCount) {
+            System.err.println("SearchBench: --topn and --no-fast-count are mutually exclusive");
             System.exit(2);
         }
 
@@ -726,42 +742,52 @@ public class SearchBench {
                     details.add("range field=" + f + " low=" + low + " high=" + high
                             + " bucket=range\tall");
                 }
-                runAndPrint(searcher, iterSearcher, queries, labels, details, warmup, iterations);
+                runAndPrint(searcher, iterSearcher, queries, labels, details, warmup, iterations, topn, noFastCount);
                 return;
             }
 
             // --- default: build queries from index and benchmark ---
             List<String> labels = new ArrayList<>();
             List<Query> queries = buildQueries(reader, field, tasks, rng, labels);
-            runAndPrint(searcher, queries, labels, warmup, iterations);
+            runAndPrint(searcher, queries, labels, warmup, iterations, topn, noFastCount);
         }
     }
 
     static void runAndPrint(IndexSearcher searcher, List<Query> queries, List<String> labels,
-                            int warmup, int iterations) throws Exception {
-        runAndPrint(searcher, queries, labels, null, warmup, iterations);
+                            int warmup, int iterations, int topn, boolean noFastCount) throws Exception {
+        runAndPrint(searcher, queries, labels, null, warmup, iterations, topn, noFastCount);
     }
 
     static void runAndPrint(IndexSearcher searcher, List<Query> queries, List<String> labels,
-                            List<String> details, int warmup, int iterations) throws Exception {
-        runAndPrint(searcher, null, queries, labels, details, warmup, iterations);
+                            List<String> details, int warmup, int iterations, int topn, boolean noFastCount) throws Exception {
+        runAndPrint(searcher, null, queries, labels, details, warmup, iterations, topn, noFastCount);
     }
 
     static void runAndPrint(IndexSearcher searcher, IndexSearcher iterSearcher,
                             List<Query> queries, List<String> labels,
-                            List<String> details, int warmup, int iterations) throws Exception {
+                            List<String> details, int warmup, int iterations, int topn,
+                            boolean noFastCount) throws Exception {
         // Per-query searcher selection: labels starting with "iterm" run on the
         // cache-free iterSearcher (when provided); everything else uses the
         // main searcher.
         IndexSearcher[] searchers = new IndexSearcher[queries.size()];
+        // --no-fast-count (count mode only): wrap every query once in
+        // ForceIterQuery so Weight.count() returns -1 per leaf and
+        // TotalHitCountCollector must iterate every hit — the full-iteration
+        // counterpart of Rust searchbench --no-fast-count (search driver,
+        // fast_segment_count bypassed). iterm queries are already wrapped;
+        // double-wrapping is harmless (count() still -1, scorer delegates).
+        Query[] effective = new Query[queries.size()];
         for (int i = 0; i < queries.size(); i++) {
             searchers[i] = iterSearcher != null && labels.get(i).startsWith("iterm")
                     ? iterSearcher : searcher;
+            effective[i] = (noFastCount && topn == 0)
+                    ? new ForceIterQuery(queries.get(i)) : queries.get(i);
         }
 
         // Global warmup: run all queries once to prime JIT and page cache
         for (int i = 0; i < queries.size(); i++) {
-            runOnce(searchers[i], queries.get(i));
+            runOnce(searchers[i], effective[i], topn);
         }
 
         // Per-query measurement
@@ -771,18 +797,30 @@ public class SearchBench {
         Map<String, List<Double>> aggP99 = new LinkedHashMap<>();
 
         for (int i = 0; i < queries.size(); i++) {
-            Stats s = measure(searchers[i], queries.get(i), warmup, iterations);
+            Stats s = measure(searchers[i], effective[i], warmup, iterations, topn);
             String group = labels.get(i);
             aggQps.computeIfAbsent(group, k -> new ArrayList<>()).add(s.qps);
             aggP50.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p50us);
             aggP90.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p90us);
             aggP99.computeIfAbsent(group, k -> new ArrayList<>()).add(s.p99us);
             if (details != null) {
-                // Per-query hit count for correctness diffing against the Rust
-                // searchbench (which prints the same lines to stderr).
-                TotalHitCountCollector c = new TotalHitCountCollector();
-                searchers[i].search(queries.get(i), c);
-                System.err.printf(Locale.ROOT, "%s\t%d%n", details.get(i), c.getTotalHits());
+                if (topn > 0) {
+                    // Top-N docID list (BM25 score order — NOT cross-diffable
+                    // against Rust's INDEXORDER list; self-consistency only).
+                    TopDocs td = searchers[i].search(effective[i], topn);
+                    StringBuilder sb = new StringBuilder();
+                    for (int j = 0; j < td.scoreDocs.length; j++) {
+                        if (j > 0) sb.append(',');
+                        sb.append(td.scoreDocs[j].doc);
+                    }
+                    System.err.printf(Locale.ROOT, "%s\t%s%n", details.get(i), sb);
+                } else {
+                    // Per-query hit count for correctness diffing against the Rust
+                    // searchbench (which prints the same lines to stderr).
+                    TotalHitCountCollector c = new TotalHitCountCollector();
+                    searchers[i].search(effective[i], c);
+                    System.err.printf(Locale.ROOT, "%s\t%d%n", details.get(i), c.getTotalHits());
+                }
             }
         }
 

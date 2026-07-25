@@ -5,6 +5,7 @@ use std::io;
 
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
+use codec_lucene9::terms_read::TermEntry;
 
 use super::doc_iter::{
     ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, DocIter,
@@ -507,6 +508,229 @@ fn disj_over(mut its: Vec<SegmentDocIter>) -> io::Result<Option<SegmentDocIter>>
     }
 }
 
+/// M7 §3.2 fold 成本护栏：估计物化成本（各叶子 Σdf；Phrase 叶子 = 各
+/// term df 和；PointRange 叶子 = maxDoc）> FOLD_COST_FACTOR × maxDoc 时
+/// 回落 drive_count（防病态形状回退）。bench 校准后可调。
+const FOLD_COST_FACTOR: u64 = 4;
+
+/// T-B 递归物化结果（spec §3.1）。
+pub(crate) enum MatOutcome {
+    /// 命中集（可为空 bitmap：未知字段 / 缺子句 / 零命中的统一形状）
+    Hits(MaterializedBitmap),
+    /// 估计物化成本超预算——调用方回落 drive_count
+    OverBudget,
+}
+
+/// 单 term 叶子物化：有内联 bitmap → 容器级拷贝；无 → postings 全量
+/// 扫描（O(df)）。cost 累加 df，超 budget → OverBudget。
+fn term_entry_bitmap(
+    seg: &SegmentReader,
+    entry: &TermEntry,
+    has_freqs: bool,
+    budget: u64,
+    cost: &mut u64,
+) -> io::Result<MatOutcome> {
+    *cost += entry.doc_freq as u64;
+    if *cost > budget {
+        return Ok(MatOutcome::OverBudget);
+    }
+    if let Some(f) = seg.open_term_bitmap(entry)? {
+        return Ok(MatOutcome::Hits(f.to_materialized()));
+    }
+    let mut docs = Vec::with_capacity(entry.doc_freq as usize);
+    multi_term::for_each_doc(seg, entry, has_freqs, &mut |d| docs.push(d))?;
+    Ok(MatOutcome::Hits(MaterializedBitmap::of(&docs)))
+}
+
+/// 递归把任意查询物化为段内 doc bitmap（M7 §3.1，**仅服务 count**：无
+/// 提前终止，物化不亏——这是与迭代路径的本质区别）。成本经共享的
+/// `cost` 累加器记账，任一叶子超 budget 全树 OverBudget。
+fn materialize_query_bitmap(
+    seg: &mut SegmentReader,
+    query: &Query,
+    budget: u64,
+    cost: &mut u64,
+) -> io::Result<MatOutcome> {
+    match query {
+        Query::MatchAll => Ok(MatOutcome::Hits(MaterializedBitmap::full(seg.max_doc() as u32))),
+        Query::Term { field, term } => match seg.seek_term(field, term)? {
+            None => Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))),
+            Some((has_freqs, entry)) => {
+                term_entry_bitmap(seg, &entry, has_freqs, budget, cost)
+            }
+        },
+        Query::And { field, terms } | Query::Or { field, terms } => {
+            let is_and = matches!(query, Query::And { .. });
+            let Some((has_freqs, entries)) =
+                roaring_exec::collect_bool_entries(seg, field, terms, is_and)?
+            else {
+                return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+            };
+            fold_term_entries(seg, &entries, has_freqs, is_and, budget, cost)
+        }
+        Query::Bool { clauses } => materialize_bool_bitmap(seg, clauses, budget, cost),
+        Query::Terms { field, terms } => {
+            let Some((has_freqs, collected)) = multi_term::collect_direct(seg, field, terms)?
+            else {
+                return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+            };
+            fold_term_entries(seg, &collected.entries, has_freqs, false, budget, cost)
+        }
+        Query::Prefix { field, prefix } => {
+            let Some((has_freqs, collected)) = multi_term::collect_prefix(seg, field, prefix)?
+            else {
+                return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+            };
+            fold_term_entries(seg, &collected.entries, has_freqs, false, budget, cost)
+        }
+        Query::Wildcard { field, pattern } => {
+            let pat = multi_term::WildcardPattern::parse(pattern);
+            let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)?
+            else {
+                return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+            };
+            fold_term_entries(seg, &collected.entries, has_freqs, false, budget, cost)
+        }
+        Query::PointRange { field, low, high } => {
+            *cost += seg.max_doc() as u64; // BKD 无法预估命中，保守计
+            if *cost > budget {
+                return Ok(MatOutcome::OverBudget);
+            }
+            let bm = point_range_bitmap(seg, field, *low, *high)?;
+            Ok(MatOutcome::Hits(bm.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+        }
+        Query::Phrase { field, terms } => {
+            // 成本近似 = 各 term df 和（doc 合取扫描量）；缺 term → 空
+            for t in terms {
+                match seg.seek_term(field, t)? {
+                    None => return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))),
+                    Some((_, entry)) => {
+                        *cost += entry.doc_freq as u64;
+                        if *cost > budget {
+                            return Ok(MatOutcome::OverBudget);
+                        }
+                    }
+                }
+            }
+            drive_materialize(seg, query)
+        }
+    }
+}
+
+/// 驱动查询的 segment_iterator 全量收集 docs 物化（Phrase 叶子用；
+/// 必须调 matches()——T-A 协议）。
+fn drive_materialize(seg: &mut SegmentReader, query: &Query) -> io::Result<MatOutcome> {
+    let mut docs = Vec::new();
+    if let Some(mut it) = query.segment_iterator(seg, false)? {
+        loop {
+            let d = it.next_doc()?;
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            if !it.matches()? {
+                continue;
+            }
+            docs.push(d as u32);
+        }
+    }
+    Ok(MatOutcome::Hits(MaterializedBitmap::of(&docs)))
+}
+
+/// term 集 fold：is_and → 交（零 cardinality 短路），否则 → 并。
+fn fold_term_entries(
+    seg: &SegmentReader,
+    entries: &[(u32, TermEntry)],
+    has_freqs: bool,
+    is_and: bool,
+    budget: u64,
+    cost: &mut u64,
+) -> io::Result<MatOutcome> {
+    let mut acc: Option<MaterializedBitmap> = None;
+    for (_, entry) in entries {
+        let child = match term_entry_bitmap(seg, entry, has_freqs, budget, cost)? {
+            MatOutcome::OverBudget => return Ok(MatOutcome::OverBudget),
+            MatOutcome::Hits(bm) => bm,
+        };
+        acc = Some(match (acc, is_and) {
+            (None, _) => child,
+            (Some(a), true) => a.and(&child),
+            (Some(a), false) => a.or(&child),
+        });
+        if is_and && acc.as_ref().unwrap().cardinality() == 0 {
+            return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))); // 交集已空，短路
+        }
+    }
+    Ok(MatOutcome::Hits(acc.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+}
+
+/// Bool 子句 fold（M7 §3.1）：正集三态与迭代语义逐条对应——MUST 交 /
+/// 纯 SHOULD 并 / 纯 MUST_NOT 的 MatchAll；排除集先并后 andnot。
+/// 任一子树 OverBudget → 全树 OverBudget。
+pub(crate) fn materialize_bool_bitmap(
+    seg: &mut SegmentReader,
+    clauses: &[(Occur, Query)],
+    budget: u64,
+    cost: &mut u64,
+) -> io::Result<MatOutcome> {
+    let mut musts: Vec<&Query> = Vec::new();
+    let mut shoulds: Vec<&Query> = Vec::new();
+    let mut nots: Vec<&Query> = Vec::new();
+    for (occur, q) in clauses {
+        match occur {
+            Occur::Must => musts.push(q),
+            Occur::Should => shoulds.push(q),
+            Occur::MustNot => nots.push(q),
+        }
+    }
+    fn fold_group(
+        seg: &mut SegmentReader,
+        group: &[&Query],
+        is_and: bool,
+        budget: u64,
+        cost: &mut u64,
+    ) -> io::Result<MatOutcome> {
+        let mut acc: Option<MaterializedBitmap> = None;
+        for q in group {
+            let child = match materialize_query_bitmap(seg, q, budget, cost)? {
+                MatOutcome::OverBudget => return Ok(MatOutcome::OverBudget),
+                MatOutcome::Hits(bm) => bm,
+            };
+            acc = Some(match (acc, is_and) {
+                (None, _) => child,
+                (Some(a), true) => a.and(&child),
+                (Some(a), false) => a.or(&child),
+            });
+            if is_and && acc.as_ref().unwrap().cardinality() == 0 {
+                return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+            }
+        }
+        Ok(MatOutcome::Hits(acc.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+    }
+    let mut positive = if !musts.is_empty() {
+        match fold_group(seg, &musts, true, budget, cost)? {
+            MatOutcome::OverBudget => return Ok(MatOutcome::OverBudget),
+            MatOutcome::Hits(bm) => bm,
+        }
+    } else if !shoulds.is_empty() {
+        match fold_group(seg, &shoulds, false, budget, cost)? {
+            MatOutcome::OverBudget => return Ok(MatOutcome::OverBudget),
+            MatOutcome::Hits(bm) => bm,
+        }
+    } else if !nots.is_empty() {
+        MaterializedBitmap::full(seg.max_doc() as u32)
+    } else {
+        return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
+    };
+    if !nots.is_empty() {
+        let prohibited = match fold_group(seg, &nots, false, budget, cost)? {
+            MatOutcome::OverBudget => return Ok(MatOutcome::OverBudget),
+            MatOutcome::Hits(bm) => bm,
+        };
+        positive = positive.andnot(&prohibited);
+    }
+    Ok(MatOutcome::Hits(positive))
+}
+
 /// spec §2.5 Bool per-segment count：与迭代同一结构——拍平形命中
 /// roaring count 快路径（档 1 cardinality 折叠 / 档 2 驱动计数）；纯
 /// MUST_NOT 走 maxDoc − prohibited count（避免全量迭代）；其余形状驱动
@@ -534,6 +758,16 @@ pub(crate) fn bool_segment_count(
     if !clauses.is_empty() && clauses.iter().all(|(o, _)| *o == Occur::MustNot) {
         let prohibited = prohibited_count(seg, clauses)?;
         return Ok(seg.max_doc() as u64 - prohibited);
+    }
+    // T-B（M7 §3）：通用形状 count 的 bitmap fold——count-only 无提前
+    // 终止，全量物化 + roaring fold 稳赢逐 doc 对齐；超预算回落迭代。
+    if !clauses.is_empty() {
+        let budget = FOLD_COST_FACTOR * seg.max_doc() as u64;
+        let mut cost = 0u64;
+        match materialize_bool_bitmap(seg, clauses, budget, &mut cost)? {
+            MatOutcome::Hits(bm) => return Ok(bm.cardinality()),
+            MatOutcome::OverBudget => {} // 回落 drive_count
+        }
     }
     // 通用：组合迭代器逐 doc 计数。
     drive_count(bool_segment_iterator(seg, clauses, false)?)

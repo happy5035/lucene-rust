@@ -1806,4 +1806,120 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
+
+    /// M7 T-B/T-D 的独立参照：不经任何 count 快路径，纯迭代 + matches
+    /// 驱动计数（永远正确，用于钉死各 count 快路径的等价性）。
+    fn drive_count_reference(dir: &FSDirectory, q: &Query) -> u64 {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        let mut reader = Reader::open(dir).unwrap();
+        let mut n = 0u64;
+        for (_b, seg) in reader.leaves() {
+            if let Some(mut it) = q.segment_iterator(seg, false).unwrap() {
+                loop {
+                    if it.next_doc().unwrap() == NO_MORE_DOCS {
+                        break;
+                    }
+                    if !it.matches().unwrap() {
+                        continue;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// M7 T-B：通用 Bool 形状的 count fold 与逐 doc 迭代完全一致
+    /// （跨字段 / MUST_NOT / 嵌套 / phrase 叶子 / 多 term 叶子）。
+    #[test]
+    fn bool_count_fold_matches_drive() {
+        let root = temp_dir("foldbool");
+        write_phrase_bitmap_corpus(&root, true); // Task 3 的 helper，bitmap on
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let hot_warm = Query::phrase("message", &["hot", "warm"]);
+        let battery: Vec<Query> = vec![
+            // 跨字段 AND（不可拍平 → 通用路径 fold）
+            Query::bool(vec![
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::Must, Query::term("tid", "tid-7")),
+            ]),
+            // MUST + MUST_NOT
+            Query::bool(vec![
+                (Occur::Must, Query::term("message", "hot")),
+                (Occur::MustNot, Query::term("message", "x")),
+            ]),
+            // 混合 occur（SHOULD + MUST_NOT）
+            Query::bool(vec![
+                (Occur::Should, Query::term("message", "warm")),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            // 嵌套（外层 MUST + 内层 SHOULD → 不可拍平）
+            Query::bool(vec![
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::Must, Query::bool(vec![
+                    (Occur::Should, Query::term("message", "hot")),
+                    (Occur::Should, Query::term("tid", "tid-8")),
+                ])),
+            ]),
+            // 短语叶子 + MUST_NOT
+            Query::bool(vec![
+                (Occur::Must, hot_warm.clone()),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            // 纯 MUST_NOT（既有 maxDoc − prohibited 路径，钉死防回归）
+            Query::bool(vec![(Occur::MustNot, Query::term("message", "hot"))]),
+            // Terms 叶子
+            Query::bool(vec![
+                (Occur::Must, Query::terms("message", &["hot", "x", "nosuch"])),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+        ];
+        for q in &battery {
+            assert_eq!(
+                s.count(q).unwrap(),
+                drive_count_reference(&dir, q),
+                "fold == drive {q:?}"
+            );
+        }
+        // bitmap off 索引同 battery（postings 物化叶子）
+        let root_off = temp_dir("foldbooloff");
+        write_phrase_bitmap_corpus(&root_off, false);
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        for q in &battery {
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                drive_count_reference(&dir_off, q),
+                "fold(off) == drive {q:?}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root_off).unwrap();
+    }
+
+    /// M7 §3.2 成本护栏：budget=0 必 OverBudget；budget=u64::MAX 必 Hits。
+    #[test]
+    fn fold_cost_guard_triggers() {
+        let root = temp_dir("foldguard");
+        write_bitmap_corpus(&root, true);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_b, seg) = reader.leaves().next().unwrap();
+        let clauses = vec![
+            (Occur::Must, Query::term("message", "hot")),
+            (Occur::Must, Query::term("message", "t3")),
+        ];
+        let mut cost = 0u64;
+        let out = query::materialize_bool_bitmap(seg, &clauses, 0, &mut cost).unwrap();
+        assert!(matches!(out, query::MatOutcome::OverBudget));
+        let mut cost = 0u64;
+        let out = query::materialize_bool_bitmap(seg, &clauses, u64::MAX, &mut cost).unwrap();
+        match out {
+            query::MatOutcome::Hits(bm) => assert_eq!(bm.cardinality(), 714), // hot∧t3 = i%7==3
+            query::MatOutcome::OverBudget => panic!("u64::MAX budget must not be over"),
+        }
+        drop(reader);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

@@ -27,11 +27,11 @@ use crate::io::ChecksumIndexOutput;
 pub const DATA_EXTENSION: &str = "kdd";
 pub const INDEX_EXTENSION: &str = "kdi";
 pub const META_EXTENSION: &str = "kdm";
-const DATA_CODEC_NAME: &str = "Lucene90PointsFormatData";
-const INDEX_CODEC_NAME: &str = "Lucene90PointsFormatIndex";
-const META_CODEC_NAME: &str = "Lucene90PointsFormatMeta";
+pub(crate) const DATA_CODEC_NAME: &str = "Lucene90PointsFormatData";
+pub(crate) const INDEX_CODEC_NAME: &str = "Lucene90PointsFormatIndex";
+pub(crate) const META_CODEC_NAME: &str = "Lucene90PointsFormatMeta";
 /// VERSION_START == VERSION_CURRENT (:61-62).
-const FORMAT_VERSION: u32 = 0;
+pub(crate) const FORMAT_VERSION: u32 = 0;
 
 /// BKDConfig.DEFAULT_MAX_POINTS_IN_LEAF_NODE (BKDConfig.java:26). The reader
 /// derives per-leaf sizes from this value (BKDReader.size, :519-521), so it
@@ -40,8 +40,8 @@ pub const MAX_POINTS_IN_LEAF_NODE: usize = 512;
 
 /// BKDWriter.CODEC_NAME / VERSION_CURRENT == VERSION_META_FILE (:82-89),
 /// written as a `CodecUtil.writeHeader` inside each `.kdm` field entry (:1244).
-const BKD_CODEC_NAME: &str = "BKD";
-const BKD_VERSION: u32 = 9;
+pub(crate) const BKD_CODEC_NAME: &str = "BKD";
+pub(crate) const BKD_VERSION: u32 = 9;
 
 // DocIdsWriter branch flags (DocIdsWriter.java:30-34).
 const CONTINUOUS_IDS: u8 = (-2i8) as u8;
@@ -444,7 +444,7 @@ fn write_ids_as_bitset(out: &mut ChecksumIndexOutput, doc_ids: &[u32]) -> io::Re
 
 /// BKDWriter.getNumLeftLeafNodes (:831-847): fixed tree-shape contract shared
 /// with the reader (BKDReader.size, :519-521).
-fn get_num_left_leaf_nodes(num_leaves: usize) -> usize {
+pub(crate) fn get_num_left_leaf_nodes(num_leaves: usize) -> usize {
     debug_assert!(num_leaves > 1);
     let last_full_level = usize::BITS - 1 - num_leaves.leading_zeros();
     let leaves_full_level = 1usize << last_full_level;

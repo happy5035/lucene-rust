@@ -21,6 +21,7 @@ pub mod fst;
 pub mod io;
 pub mod packed;
 pub mod points;
+pub mod points_read;
 pub mod postings;
 pub mod postings_ll;
 pub mod postings_read;

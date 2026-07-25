@@ -13,8 +13,10 @@ use std::io;
 use crate::io::{DataInput, DataOutput, IndexInput, IndexOutput};
 
 mod frozen;
+mod materialized;
 
 pub use frozen::{FrozenBitmap, and_cardinality, intersect_docs, or_cardinality, union_docs};
+pub use materialized::MaterializedBitmap;
 
 /// Bitmap-source read gate (spec §5): only terms with df >= this threshold
 /// attempt the inline-bitmap path.

@@ -196,6 +196,37 @@ fn searchdump(index_dir: &Path, num_docs: u32, seed: u64, positions: bool) -> st
     let (_, docs) = searcher.top_docs(&Query::MatchAll, 20)?;
     out.push_str(&format!("matchall first20={}\n", doc_csv(&docs)));
 
+    // M6 §3.4 range battery (timestamp = LongPoint)：边界确定性推导——
+    // ts(doc i) ∈ [TS_BASE + i*1000, TS_BASE + i*1000 + 999]
+    // (gen_log_document :132)，所以 [base+100000, base+199999] 恰好命中
+    // docs 100..=199。逐行镜像在 VerifySearchIndex.java。
+    if num_docs >= 200 {
+        let range_battery: [(i64, i64); 5] = [
+            (TS_BASE + 100_000, TS_BASE + 199_999), // docs 100..=199 → 100
+            (TS_BASE - 1_000_000, TS_BASE - 1),     // 不相交 → 0
+            (i64::MIN, i64::MAX),                   // 全区间 → num_docs
+            (i64::MIN, TS_BASE + 49_999),           // 贴 MIN → docs 0..=49 → 50
+            (TS_BASE + 150_000, i64::MAX),          // 贴 MAX → docs 150.. → num_docs-150
+        ];
+        for (low, high) in range_battery {
+            let q = Query::point_range("timestamp", low, high);
+            let count = searcher.count(&q)?;
+            let (_, docs) = searcher.top_docs(&q, 20)?;
+            out.push_str(&format!(
+                "range timestamp=[{low},{high}] count={count} first20={}\n",
+                doc_csv(&docs)
+            ));
+        }
+        // 点查询退化 [v,v] 恰好命中 doc 100
+        let q = Query::point_range("timestamp", TS_BASE + 100_000, TS_BASE + 100_999);
+        let count = searcher.count(&q)?;
+        out.push_str(&format!(
+            "range timestamp=[{},{}] count={count}\n",
+            TS_BASE + 100_000,
+            TS_BASE + 100_999
+        ));
+    }
+
     // Boolean battery (search spec phase 3): "and" = BooleanQuery MUST+MUST,
     // "or" = SHOULD+SHOULD. The message pair has a non-empty intersection in
     // the log corpus (co-occurring tokens); level is single-valued per doc so

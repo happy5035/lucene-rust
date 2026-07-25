@@ -1,6 +1,8 @@
 //! DocIdSetIterator semantics (docID starts at -1, ascends, ends at
 //! NO_MORE_DOCS) with a Rust object shape (search spec §3: enum Query +
-//! trait DocIter, no inheritance). M1 adds AND/OR Boolean iterators.
+//! trait DocIter, no inheritance). M1 adds AND/OR Boolean iterators; M6
+//! §2.3 adds the generic SegmentDocIter combinators (ConjOver/DisjOver/
+//! Excluding) for nested Bool.
 
 use std::io;
 
@@ -924,6 +926,231 @@ impl DocIter for RoaringOrDocIter {
     }
 }
 
+// ── Generic Boolean combinators over SegmentDocIter (M6 §2.3) ─────────
+
+/// Conjunction over arbitrary per-segment iterators (spec M6 §2.3):
+/// the ConjunctionDocIter alignment dance (Lucene ConjunctionDISI
+/// protocol) lifted from postings-only PostingsIter to SegmentDocIter
+/// children. Children live in a heap Vec — SegmentDocIter is 18.7KB,
+/// so no inline child array ever lands in a stack frame.
+pub struct ConjOverDocIter {
+    sub: Vec<SegmentDocIter>,
+    doc: i32,
+    lead: usize,
+}
+
+impl ConjOverDocIter {
+    /// Primes every child (same contract as ConjunctionDocIter::new); any
+    /// exhausted child empties the whole conjunction.
+    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<ConjOverDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let mut it = ConjOverDocIter {
+            sub,
+            doc: -1,
+            lead: 0,
+        };
+        for s in &mut it.sub {
+            if s.next_doc()? == NO_MORE_DOCS {
+                it.doc = NO_MORE_DOCS;
+                return Ok(it);
+            }
+        }
+        Ok(it)
+    }
+}
+
+impl DocIter for ConjOverDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 {
+            // move every child sitting on the last emitted doc past it
+            for i in 0..self.sub.len() {
+                if self.sub[i].doc_id() == self.doc && self.sub[i].next_doc()? == NO_MORE_DOCS {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+            }
+        }
+        loop {
+            let candidate = self.sub[self.lead].doc_id();
+            if candidate == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            let mut matched = true;
+            for i in 0..self.sub.len() {
+                if i == self.lead {
+                    continue;
+                }
+                let d = self.sub[i].advance(candidate)?;
+                if d == NO_MORE_DOCS {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+                if d > candidate {
+                    self.lead = i;
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                self.doc = candidate;
+                return Ok(candidate);
+            }
+        }
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.sub[self.lead].advance(target)?;
+        self.doc = -1;
+        self.next_doc()
+    }
+    // freq: 1（ConstantScore，spec §2.3 Bool 路径恒 needs_freq=false）
+}
+
+/// Disjunction over arbitrary per-segment iterators (spec M6 §2.3):
+/// DisjunctionDocIter 同款线性最小值 k 路归并（spec 提到"参照堆实现"——
+/// 现有 DisjunctionDocIter 实为线性扫描，doc_iter.rs:255-312；k = 子句
+/// 数，沿用线性，不引堆）。
+pub struct DisjOverDocIter {
+    sub: Vec<SegmentDocIter>,
+    doc: i32,
+}
+
+impl DisjOverDocIter {
+    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let mut it = DisjOverDocIter { sub, doc: -1 };
+        for s in &mut it.sub {
+            s.next_doc()?;
+        }
+        Ok(it)
+    }
+}
+
+impl DocIter for DisjOverDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.doc >= 0 {
+            for s in &mut self.sub {
+                if s.doc_id() == self.doc {
+                    s.next_doc()?;
+                }
+            }
+        }
+        let mut best = NO_MORE_DOCS;
+        for s in &self.sub {
+            let d = s.doc_id();
+            if d != NO_MORE_DOCS && d < best {
+                best = d;
+            }
+        }
+        self.doc = best;
+        Ok(best)
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        for s in &mut self.sub {
+            if s.doc_id() < target {
+                s.advance(target)?;
+            }
+        }
+        let mut best = NO_MORE_DOCS;
+        for s in &self.sub {
+            let d = s.doc_id();
+            if d != NO_MORE_DOCS && d < best {
+                best = d;
+            }
+        }
+        self.doc = best;
+        Ok(best)
+    }
+}
+
+/// Exclusion (spec M6 §2.3, Lucene ReqExclScorer two-pointer): main
+/// candidates are probe-advanced against prohibited; a collision drops
+/// the candidate. 多个 MUST_NOT 由装配方先 DisjOver 合成一个 prohibited。
+pub struct ExcludingDocIter {
+    main: Box<SegmentDocIter>,
+    prohibited: Box<SegmentDocIter>,
+    doc: i32,
+}
+
+impl ExcludingDocIter {
+    pub fn new(main: SegmentDocIter, prohibited: SegmentDocIter) -> ExcludingDocIter {
+        ExcludingDocIter {
+            main: Box::new(main),
+            prohibited: Box::new(prohibited),
+            doc: -1,
+        }
+    }
+    /// Emit main's current doc if not prohibited; else advance main past
+    /// the collision and retry.
+    fn next_non_excluded(&mut self) -> io::Result<i32> {
+        loop {
+            let d = self.main.doc_id();
+            if d == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            if self.prohibited.advance(d)? != d {
+                self.doc = d;
+                return Ok(d);
+            }
+            if self.main.next_doc()? == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+        }
+    }
+}
+
+impl DocIter for ExcludingDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        if self.main.next_doc()? == NO_MORE_DOCS {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.next_non_excluded()
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.main.advance(target)?;
+        self.next_non_excluded()
+    }
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
@@ -938,6 +1165,11 @@ pub enum SegmentDocIter {
     RoaringAnd(RoaringAndDocIter),
     RoaringOr(RoaringOrDocIter),
     Points(PointsDocIter),
+    // M6 §2.3 通用组合器：全是 Vec/Box 小 payload（≤40B），enum 尺寸
+    // 不变（仍由 Freqs 的 18.7KB 决定），栈预算不受新变体影响。
+    ConjOver(ConjOverDocIter),
+    DisjOver(DisjOverDocIter),
+    Excluding(ExcludingDocIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -954,6 +1186,9 @@ impl DocIter for SegmentDocIter {
             Self::RoaringAnd(a) => a.doc_id(),
             Self::RoaringOr(o) => o.doc_id(),
             Self::Points(p) => p.doc_id(),
+            Self::ConjOver(c) => c.doc_id(),
+            Self::DisjOver(d) => d.doc_id(),
+            Self::Excluding(e) => e.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -969,6 +1204,9 @@ impl DocIter for SegmentDocIter {
             Self::RoaringAnd(a) => a.next_doc(),
             Self::RoaringOr(o) => o.next_doc(),
             Self::Points(p) => p.next_doc(),
+            Self::ConjOver(c) => c.next_doc(),
+            Self::DisjOver(d) => d.next_doc(),
+            Self::Excluding(e) => e.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -984,6 +1222,9 @@ impl DocIter for SegmentDocIter {
             Self::RoaringAnd(a) => a.advance(t),
             Self::RoaringOr(o) => o.advance(t),
             Self::Points(p) => p.advance(t),
+            Self::ConjOver(c) => c.advance(t),
+            Self::DisjOver(d) => d.advance(t),
+            Self::Excluding(e) => e.advance(t),
         }
     }
     fn freq(&self) -> u32 {

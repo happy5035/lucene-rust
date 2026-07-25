@@ -6,8 +6,8 @@ use std::io;
 use codec_lucene9::roaring::MaterializedBitmap;
 
 use super::doc_iter::{
-    ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, PointsDocIter,
-    RoaringDocIter, SegmentDocIter,
+    ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, ExcludingDocIter,
+    MatchAllIter, PhraseDocIter, PointsDocIter, RoaringDocIter, SegmentDocIter,
 };
 use super::multi_term;
 use super::roaring_exec;
@@ -259,7 +259,7 @@ impl Query {
                 };
                 Ok(Some(SegmentDocIter::Points(PointsDocIter::new(bm))))
             }
-            Query::Bool { .. } => unimplemented!("Bool segment_iterator lands in Task A Step 4"),
+            Query::Bool { clauses } => bool_segment_iterator(seg, clauses, needs_freq),
         }
     }
 }
@@ -420,4 +420,88 @@ fn or_segment_iterator<T: AsRef<[u8]>>(
     Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(
         seg, field, &entries, needs_freq,
     )?)))
+}
+
+/// Bool 分派体（outline 自由函数，与 and/or_segment_iterator 同因：
+/// SegmentDocIter 18.7KB，分派帧内联多分支临时量会在 debug build 溢出
+/// 2MiB 测试线程栈——见 and_segment_iterator 上方注释）。needs_freq 按
+/// spec §2.3 恒 false 处理：freq_sum 已拒绝 Bool，组合语义下 freq 无
+/// 定义，子句一律按 no-freq 打开（bitmap/roaring 路径不受限）。
+fn bool_segment_iterator(
+    seg: &mut SegmentReader,
+    clauses: &[(Occur, Query)],
+    _needs_freq: bool,
+) -> io::Result<Option<SegmentDocIter>> {
+    if clauses.is_empty() {
+        return Ok(None);
+    }
+    // 拍平（spec §2.4）：纯 MUST / 纯 SHOULD 同字段 Term 子树 → And/Or
+    // 三档（roaring 档 1/2、PFOR 档 3），与平铺变体同一引擎。
+    let refs: Vec<(Occur, &Query)> = clauses.iter().map(|(o, q)| (*o, q)).collect();
+    if let Some((is_and, field, terms)) = flatten_bool(&refs) {
+        return if is_and {
+            and_segment_iterator(seg, field, &terms, false)
+        } else {
+            or_segment_iterator(seg, field, &terms, false)
+        };
+    }
+    // 通用装配（spec §2.2 三态 + §2.3 组合器）。
+    let mut musts: Vec<SegmentDocIter> = Vec::new();
+    let mut shoulds: Vec<SegmentDocIter> = Vec::new();
+    let mut nots: Vec<SegmentDocIter> = Vec::new();
+    let mut has_must_not = false;
+    for (occur, q) in clauses {
+        let it = q.segment_iterator(seg, false)?;
+        match (occur, it) {
+            (Occur::Must, Some(it)) => musts.push(it),
+            // MUST 子句段内缺失 → 全段空（spec §2.2/§2.4 collect 同款语义）
+            (Occur::Must, None) => return Ok(None),
+            (Occur::Should, it) => {
+                if let Some(it) = it {
+                    shoulds.push(it);
+                }
+            }
+            (Occur::MustNot, it) => {
+                has_must_not = true;
+                if let Some(it) = it {
+                    nots.push(it);
+                }
+            }
+        }
+    }
+    // 正集三态：MUST 合取 / 纯 SHOULD 并集 / 纯 MUST_NOT 的 MatchAll。
+    // 注意用 has_must_not 而非 nots.is_empty()：NOT 一个段内缺失的 term
+    // 语义是 MatchAll − ∅ = MatchAll（Lucene 同款），不是空。
+    let positive = if !musts.is_empty() {
+        conj_over(musts)?.expect("musts non-empty")
+    } else if !shoulds.is_empty() {
+        disj_over(shoulds)?.expect("shoulds non-empty")
+    } else if has_must_not {
+        SegmentDocIter::All(MatchAllIter::new(seg.max_doc()))
+    } else {
+        return Ok(None); // SHOULD 全缺且无 MUST/MUST_NOT → 段内空
+    };
+    // 排除集：多个 MUST_NOT 先析取合成一个 prohibited（spec §2.3）。
+    Ok(Some(match disj_over(nots)? {
+        Some(prohibited) => SegmentDocIter::Excluding(ExcludingDocIter::new(positive, prohibited)),
+        None => positive,
+    }))
+}
+
+/// Vec 装配：≥2 子句包 ConjOver，单子句直接返回（零包装税），空 → None。
+fn conj_over(mut its: Vec<SegmentDocIter>) -> io::Result<Option<SegmentDocIter>> {
+    match its.len() {
+        0 => Ok(None),
+        1 => Ok(its.pop()),
+        _ => Ok(Some(SegmentDocIter::ConjOver(ConjOverDocIter::new(its)?))),
+    }
+}
+
+/// Vec 装配：≥2 子句包 DisjOver，单子句直接返回，空 → None。
+fn disj_over(mut its: Vec<SegmentDocIter>) -> io::Result<Option<SegmentDocIter>> {
+    match its.len() {
+        0 => Ok(None),
+        1 => Ok(its.pop()),
+        _ => Ok(Some(SegmentDocIter::DisjOver(DisjOverDocIter::new(its)?))),
+    }
 }

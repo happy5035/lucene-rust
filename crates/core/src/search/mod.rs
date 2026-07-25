@@ -1428,4 +1428,90 @@ mod tests {
         let q = vec![must(Query::bool(vec![]))];
         assert!(flatten_bool(&refs(&q)).is_none());
     }
+
+    /// M6 Bool 语义语料：与 and_or_single_segment 同一形状——
+    /// w0={0,5,8,10,15,16} w1={0,1,6,8,11,16} w2={2,7,12,17}
+    /// w3={3,13,18} w4={4,9,14,19}；level INFO={0,4,8,12,16}。
+    fn write_bool_corpus(root: &std::path::Path) {
+        let mut w = IndexWriter::create(root, schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..20 {
+            let level = match i % 4 {
+                0 => "INFO",
+                1 => "WARN",
+                2 => "ERROR",
+                _ => "DEBUG",
+            };
+            let message = if i % 8 == 0 {
+                "w0 w1".to_string()
+            } else {
+                format!("w{}", i % 5)
+            };
+            w.add_document(doc(level, &format!("tid-{i}"), &message))
+                .unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    /// spec §2.2 三态执行语义 + 嵌套 + 跨字段 + 段缺失（无 bitmap 语料，
+    /// 拍平形走档 3 PFOR，通用形走新组合器——两路径同一测试锚定）。
+    #[test]
+    fn bool_query_three_state_semantics() {
+        let root = temp_dir("bool3state");
+        write_bool_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let w = |t: &str| Query::term("message", t);
+
+        // 纯 MUST == And（拍平形）：w0 ∩ w1 = {0,8,16}
+        let q = Query::bool(vec![(Occur::Must, w("w0")), (Occur::Must, w("w1"))]);
+        assert_eq!(s.count(&q).unwrap(), 3);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!((total, docs), (3, vec![0, 8, 16]));
+        // 纯 SHOULD == Or（拍平形）：|w0 ∪ w1| = 9
+        let q = Query::bool(vec![(Occur::Should, w("w0")), (Occur::Should, w("w1"))]);
+        assert_eq!(s.count(&q).unwrap(), 9);
+        // MUST+SHOULD：SHOULD 被丢弃（spec §2.2）——hits == MUST 单项 w0
+        let q = Query::bool(vec![(Occur::Must, w("w0")), (Occur::Should, w("w1"))]);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!((total, docs), (6, vec![0, 5, 8, 10, 15, 16]));
+        // MUST+MUST_NOT：w0 − w1 = {5,10,15}
+        let q = Query::bool(vec![(Occur::Must, w("w0")), (Occur::MustNot, w("w1"))]);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!((total, docs), (3, vec![5, 10, 15]));
+        // 纯 MUST_NOT = MatchAll 排除（spec §2.2）：20 − |w1| = 14
+        let q = Query::bool(vec![(Occur::MustNot, w("w1"))]);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!(
+            (total, docs),
+            (14, vec![2, 3, 4, 5, 7, 9, 10, 12, 13, 14, 15, 17, 18, 19])
+        );
+        // 纯 MUST_NOT 且 term 缺失 → MatchAll（Lucene 同款语义，钉死）
+        let q = Query::bool(vec![(Occur::MustNot, w("nosuch"))]);
+        assert_eq!(s.count(&q).unwrap(), 20);
+        // 三层嵌套：(w0∪w2) − w1 = {2,5,7,10,12,15,17}
+        let q = Query::bool(vec![
+            (
+                Occur::Must,
+                Query::bool(vec![(Occur::Should, w("w0")), (Occur::Should, w("w2"))]),
+            ),
+            (Occur::MustNot, Query::bool(vec![(Occur::Must, w("w1"))])),
+        ]);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!((total, docs), (7, vec![2, 5, 7, 10, 12, 15, 17]));
+        // 跨字段：INFO ∩ w0 = {0,8,16}
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("level", "INFO")),
+            (Occur::Must, w("w0")),
+        ]);
+        let (total, docs) = s.top_docs(&q, 20).unwrap();
+        assert_eq!((total, docs), (3, vec![0, 8, 16]));
+        // 空 clauses / SHOULD 全缺 / MUST 缺失 → 0
+        assert_eq!(s.count(&Query::bool(vec![])).unwrap(), 0);
+        let q = Query::bool(vec![(Occur::Should, w("nosuch"))]);
+        assert_eq!(s.count(&q).unwrap(), 0);
+        let q = Query::bool(vec![(Occur::Must, w("w0")), (Occur::Must, w("nosuch"))]);
+        assert_eq!(s.count(&q).unwrap(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

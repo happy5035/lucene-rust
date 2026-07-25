@@ -1514,4 +1514,140 @@ mod tests {
         assert_eq!(s.count(&q).unwrap(), 0);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// spec §2.6 形状覆盖：Phrase/Prefix/Wildcard 子句进 Bool 组合器。
+    #[test]
+    fn bool_query_mixed_clause_types() {
+        // Phrase 子句（positions 语料）：phrase(quick brown)={0,2} − {2} = {0}
+        let root = temp_dir("boolphrase");
+        write_phrase_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let q = Query::bool(vec![
+            (Occur::Must, Query::phrase("message", &["quick", "brown"])),
+            (Occur::MustNot, Query::term("tid", "tid-2")),
+        ]);
+        let (total, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!((total, docs), (1, vec![0]));
+        fs::remove_dir_all(&root).unwrap();
+
+        // Prefix / Wildcard 子句（terms 语料：doc i 带 t(i%20) 与 t((i+7)%20)）
+        let root = temp_dir("boolmt");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        // prefix t1 → t10..t19 命中 {3..19, 23..39}（34 doc）；NOT t07
+        // （t07={0,7,20,27}，7/27 在并集内）→ 34 − 2 = 32
+        let q = Query::bool(vec![
+            (Occur::Must, Query::prefix("message", "t1")),
+            (Occur::MustNot, Query::term("message", "t07")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 32);
+        // wildcard t?7 → t07 ∪ t17（8 doc）；SHOULD t00 被丢弃（spec §2.2）
+        let q = Query::bool(vec![
+            (Occur::Must, Query::wildcard("message", "t?7")),
+            (Occur::Should, Query::term("message", "t00")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 8);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// spec §2.4 拍平路径：bitmap 索引上拍平形命中 roaring 三档（变体断言
+    /// 钉死），非拍平形走通用组合器；bitmap off/on 全量结果逐位一致
+    /// （RL_BITMAP=0 等价物的单测形态——同语料双索引 A/B）。
+    #[test]
+    fn bool_query_flatten_roaring_paths() {
+        let root_off = temp_dir("bflatoff");
+        let root_on = temp_dir("bflaton");
+        write_tier_corpus(&root_off, false, 1);
+        write_tier_corpus(&root_on, true, 1);
+        let must = |q: Query| (Occur::Must, q);
+        let should = |q: Query| (Occur::Should, q);
+        let t = |s: &str| Query::term("message", s);
+        // 拍平 AND（嵌套同形）：hot ∧ scorching ∧ warm5
+        let flat_and = Query::bool(vec![
+            must(t("hot")),
+            must(Query::bool(vec![must(t("scorching")), must(t("warm5"))])),
+        ]);
+        // 拍平 OR：scorching ∨ warm3
+        let flat_or = Query::bool(vec![should(t("scorching")), should(t("warm3"))]);
+        // 非拍平：AND 内嵌 OR → ConjOver；hits = hot ∧ (scorching∨warm3)
+        let nested_or = Query::bool(vec![
+            must(t("hot")),
+            must(Query::bool(vec![
+                should(t("scorching")),
+                should(t("warm3")),
+            ])),
+        ]);
+        // SHOULD+MUST_NOT → 顶层 Excluding；(warm1∨warm3) − warm5
+        let excluding = Query::bool(vec![
+            should(t("warm1")),
+            should(t("warm3")),
+            (Occur::MustNot, t("warm5")),
+        ]);
+        // 纯 MUST_NOT → Excluding(MatchAll, term)
+        let pure_not = Query::bool(vec![(Occur::MustNot, t("warm3"))]);
+
+        // —— 路径断言（bitmap 索引）——
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut reader = Reader::open(&dir_on).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        let it = flat_and.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
+            "flat nested AND must take the roaring three-tier path"
+        );
+        let it = flat_or.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::RoaringOr(_)),
+            "flat OR must take the roaring three-tier path"
+        );
+        // needs_freq=true 也走 roaring：Bool 路径恒 needs_freq=false
+        // （spec §2.3，ConstantScore 化简）
+        let it = flat_and.segment_iterator(seg, true).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::RoaringAnd(_)),
+            "Bool ignores needs_freq (freq undefined under combination)"
+        );
+        let it = nested_or.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::ConjOver(_)),
+            "AND(OR) is not a flat shape: generic combinator"
+        );
+        let it = excluding.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Excluding(_)),
+            "SHOULD + MUST_NOT: top-level Excluding"
+        );
+        let it = pure_not.segment_iterator(seg, false).unwrap().unwrap();
+        assert!(
+            matches!(it, SegmentDocIter::Excluding(_)),
+            "pure MUST_NOT: Excluding over MatchAll"
+        );
+        drop(reader);
+
+        // —— on/off 全量等价（count + 完整 doc 序列）——
+        let mut s_off = Searcher::open(&FSDirectory::open(&root_off).unwrap()).unwrap();
+        let mut s_on = Searcher::open(&FSDirectory::open(&root_on).unwrap()).unwrap();
+        let battery: Vec<Query> = vec![flat_and, flat_or, nested_or, excluding, pure_not];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
+        }
+        // 数值锚点（独立推演，防 on/off 同错）：
+        let mut s = Searcher::open(&FSDirectory::open(&root_on).unwrap()).unwrap();
+        assert_eq!(s.count(&battery[0]).unwrap(), 643); // scorching ∧ warm5: d≥500 ∧ d%7==5
+        assert_eq!(s.count(&battery[1]).unwrap(), 4571); // scorching ∨ warm3
+        assert_eq!(s.count(&battery[2]).unwrap(), 4571); // hot ∧ (scorching∨warm3)
+        assert_eq!(s.count(&battery[3]).unwrap(), 1429); // (warm1∨warm3) − warm5（互不相交）
+        assert_eq!(s.count(&battery[4]).unwrap(), 4286); // 5000 − |warm3|
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
 }

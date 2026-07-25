@@ -9,7 +9,7 @@ use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
 use super::doc_iter::DocIter;
-use super::query::Query;
+use super::query::{self, Query};
 use super::reader::Reader;
 use super::roaring_exec;
 
@@ -66,6 +66,17 @@ impl Searcher {
             for (_doc_base, seg) in self.reader.leaves() {
                 if let Some((_, entry)) = seg.seek_term(field, term)? {
                     total += entry.doc_freq as u64;
+                }
+            }
+            return Ok(total);
+        }
+        // M6 §3.3: PointRange count = 物化 bitmap cardinality 直读（与迭代
+        // 同一物化；Lucene PointRangeQuery 对 count 同样是 visitor 全量收集）。
+        if let Query::PointRange { field, low, high } = query {
+            let mut total = 0u64;
+            for (_doc_base, seg) in self.reader.leaves() {
+                if let Some(bm) = query::point_range_bitmap(seg, field, *low, *high)? {
+                    total += bm.cardinality();
                 }
             }
             return Ok(total);
@@ -135,11 +146,17 @@ impl Searcher {
     /// where it degenerates to the doc count); multi-term and Boolean
     /// queries have no well-defined freq sum and are rejected.
     pub fn freq_sum(&mut self, query: &Query) -> io::Result<u64> {
-        if query.is_multi_term() || matches!(query, Query::And { .. } | Query::Or { .. }) {
+        if query.is_multi_term()
+            || matches!(
+                query,
+                Query::And { .. } | Query::Or { .. } | Query::PointRange { .. }
+            )
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "freq_sum is only defined for Term queries (MatchAll degenerates to \
-                 doc count); multi-term and And/Or queries have no well-defined freq sum",
+                 doc count); multi-term, And/Or and PointRange queries have no \
+                 well-defined freq sum",
             ));
         }
         if let Query::Term { field, term } = query {

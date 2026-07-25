@@ -6,6 +6,7 @@ use std::io;
 
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
+use codec_lucene9::points_read::PointsReader;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
 use codec_lucene9::roaring::FrozenBitmap;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
@@ -16,6 +17,7 @@ pub struct SegmentReader {
     field_infos: FieldInfos,
     terms: TermsDict,
     postings: PostingsReader,
+    points: Option<PointsReader>,
 }
 
 impl SegmentReader {
@@ -25,11 +27,13 @@ impl SegmentReader {
         let field_infos = FieldInfos::read(dir, segment, segment_id, "")?;
         let terms = TermsDict::open(dir, segment, segment_id, &field_infos)?;
         let postings = PostingsReader::open(dir, segment, segment_id)?;
+        let points = PointsReader::open(dir, segment, segment_id, &field_infos)?;
         Ok(SegmentReader {
             max_doc: sci.info.doc_count,
             field_infos,
             terms,
             postings,
+            points,
         })
     }
 
@@ -108,6 +112,12 @@ impl SegmentReader {
     pub(crate) fn terms_iter(&mut self, field: &str) -> Option<TermsIter<'_>> {
         let fi = self.field_infos.by_name(field)?;
         Some(self.terms.terms_iter(fi))
+    }
+
+    /// Per-segment points reader (M6 §3.2); `None` when the segment has no
+    /// points files (segment_builder.rs:240-245).
+    pub(crate) fn points_reader(&self) -> Option<&PointsReader> {
+        self.points.as_ref()
     }
 }
 

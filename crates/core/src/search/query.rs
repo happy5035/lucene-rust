@@ -3,9 +3,11 @@
 
 use std::io;
 
+use codec_lucene9::roaring::MaterializedBitmap;
+
 use super::doc_iter::{
-    ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, RoaringDocIter,
-    SegmentDocIter,
+    ConjunctionDocIter, DisjunctionDocIter, MatchAllIter, PhraseDocIter, PointsDocIter,
+    RoaringDocIter, SegmentDocIter,
 };
 use super::multi_term;
 use super::roaring_exec;
@@ -13,14 +15,43 @@ use super::segment_reader::SegmentReader;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
-    Term { field: String, term: Vec<u8> },
+    Term {
+        field: String,
+        term: Vec<u8>,
+    },
     MatchAll,
-    And { field: String, terms: Vec<Vec<u8>> },
-    Or { field: String, terms: Vec<Vec<u8>> },
-    Terms { field: String, terms: Vec<Vec<u8>> },
-    Prefix { field: String, prefix: Vec<u8> },
-    Wildcard { field: String, pattern: Vec<u8> },
-    Phrase { field: String, terms: Vec<Vec<u8>> },
+    And {
+        field: String,
+        terms: Vec<Vec<u8>>,
+    },
+    Or {
+        field: String,
+        terms: Vec<Vec<u8>>,
+    },
+    Terms {
+        field: String,
+        terms: Vec<Vec<u8>>,
+    },
+    Prefix {
+        field: String,
+        prefix: Vec<u8>,
+    },
+    Wildcard {
+        field: String,
+        pattern: Vec<u8>,
+    },
+    Phrase {
+        field: String,
+        terms: Vec<Vec<u8>>,
+    },
+    /// 1D point range (M6 spec §3.1), LongPoint/IntPoint `newRangeQuery`
+    /// semantics: both ends inclusive; `low > high` is rejected with
+    /// `Err(InvalidInput)` at execution (跨任务钉死接口).
+    PointRange {
+        field: String,
+        low: i64,
+        high: i64,
+    },
 }
 
 impl Query {
@@ -73,6 +104,16 @@ impl Query {
         Query::Phrase {
             field: field.to_string(),
             terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect(),
+        }
+    }
+
+    /// 1D point range query (M6 §3.1): inclusive both ends. 排他边界由
+    /// 调用方 ±1 调整（避免 MIN/MAX 溢出特例）。
+    pub fn point_range(field: &str, low: i64, high: i64) -> Query {
+        Query::PointRange {
+            field: field.to_string(),
+            low,
+            high,
         }
     }
 
@@ -192,8 +233,48 @@ impl Query {
                 }
                 Ok(PhraseDocIter::new(seg, field, terms)?.map(SegmentDocIter::Phrase))
             }
+            Query::PointRange { field, low, high } => {
+                let Some(bm) = point_range_bitmap(seg, field, *low, *high)? else {
+                    return Ok(None);
+                };
+                Ok(Some(SegmentDocIter::Points(PointsDocIter::new(bm))))
+            }
         }
     }
+}
+
+/// PointRange 共享物化入口（`segment_iterator` 与 `Searcher::count` 同一
+/// 物化，spec §3.3）：`low > high` → `Err(InvalidInput)`（跨任务钉死接口；
+/// Lucene 9.12.3 对该情形不报错而返回 0 命中，PointRangeQuery.checkArgs
+/// :100-110——此处是钉死的 Rust 显式错误面）。段内命中经 visitor 收集、
+/// sort + dedup 后建 `MaterializedBitmap`；`None` = 未知字段 / 非 point
+/// 字段 / 段无 points / 空命中。
+pub(crate) fn point_range_bitmap(
+    seg: &mut SegmentReader,
+    field: &str,
+    low: i64,
+    high: i64,
+) -> io::Result<Option<MaterializedBitmap>> {
+    if low > high {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("point range low ({low}) > high ({high})"),
+        ));
+    }
+    let Some(points) = seg.points_reader() else {
+        return Ok(None);
+    };
+    let mut docs: Vec<u32> = Vec::new();
+    // 多值点逐值回调（spec §3.2）；BKD 访问序按 (value, doc) 非 doc 序，
+    // 统一 sort + dedup 再建 bitmap（Bitmap::of 快路径要求升序，去重同时
+    // 解决多值点重复计数）。
+    points.intersect(field, low, high, &mut |_value, doc| docs.push(doc as u32))?;
+    docs.sort_unstable();
+    docs.dedup();
+    if docs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MaterializedBitmap::of(&docs)))
 }
 
 /// And/Or arm bodies of `Query::segment_iterator`, outlined into their own

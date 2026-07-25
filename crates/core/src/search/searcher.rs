@@ -7,11 +7,10 @@ use std::io;
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 
-use super::collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
+use super::collector::{Collector, FreqSumCollector};
 use super::doc_iter::DocIter;
-use super::query::{self, bool_segment_count, Query};
+use super::query::{self, Query};
 use super::reader::Reader;
-use super::roaring_exec;
 
 pub struct Searcher {
     reader: Reader,
@@ -46,6 +45,9 @@ impl Searcher {
                 if doc == NO_MORE_DOCS {
                     break;
                 }
+                if !iter.matches()? {
+                    continue;
+                }
                 let freq = if needs_freq { iter.freq() } else { 1 };
                 collector.collect(doc_base + doc, freq);
             }
@@ -53,101 +55,70 @@ impl Searcher {
         Ok(())
     }
 
-    /// ConstantScore TermQuery: count = sum of per-segment doc_freq (no
-    /// postings iteration needed — doc_freq is in the TermEntry after
-    /// seek_exact; M4 §6 用户指令③: the bitmap header read is gone —
-    /// validation ③ guarantees cardinality == doc_freq, so the two
-    /// values could never differ). Fallback to iteration for MatchAll
-    /// and unknown terms. Multi-term queries count per segment: popcount
-    /// on the bitset path (spec §4), plain iteration on the OR path.
+    /// 逐段 count：段级快路径（fast_segment_count，M7 §5.1）优先，
+    /// None 回落迭代计数。各形状语义与重构前逐条一致。
     pub fn count(&mut self, query: &Query) -> io::Result<u64> {
-        if let Query::Term { field, term } = query {
-            let mut total = 0u64;
-            for (_doc_base, seg) in self.reader.leaves() {
-                if let Some((_, entry)) = seg.seek_term(field, term)? {
-                    total += entry.doc_freq as u64;
-                }
+        let mut total = 0u64;
+        for (_doc_base, seg) in self.reader.leaves() {
+            if let Some(c) = query::fast_segment_count(seg, query)? {
+                total += c;
+                continue;
             }
-            return Ok(total);
-        }
-        // M6 §3.3: PointRange count = 物化 bitmap cardinality 直读（与迭代
-        // 同一物化；Lucene PointRangeQuery 对 count 同样是 visitor 全量收集）。
-        if let Query::PointRange { field, low, high } = query {
-            let mut total = 0u64;
-            for (_doc_base, seg) in self.reader.leaves() {
-                if let Some(bm) = query::point_range_bitmap(seg, field, *low, *high)? {
-                    total += bm.cardinality();
-                }
-            }
-            return Ok(total);
-        }
-        if query.is_multi_term() {
-            let mut total = 0u64;
-            for (_doc_base, seg) in self.reader.leaves() {
-                if let Some(c) = query.bitset_count(seg)? {
-                    total += c;
-                    continue;
-                }
-                if let Some(mut iter) = query.segment_iterator(seg, false)? {
-                    loop {
-                        let doc = iter.next_doc()?;
-                        if doc == NO_MORE_DOCS {
-                            break;
-                        }
-                        total += 1;
+            if let Some(mut iter) = query.segment_iterator(seg, false)? {
+                loop {
+                    if iter.next_doc()? == NO_MORE_DOCS {
+                        break;
                     }
-                }
-            }
-            return Ok(total);
-        }
-        // M6 §2.5: Bool count 与迭代同一结构——拍平形 roaring 快路径、纯
-        // MUST_NOT 走 maxDoc − prohibited、其余组合迭代计数（按段独立）。
-        if let Query::Bool { clauses } = query {
-            let mut total = 0u64;
-            for (_doc_base, seg) in self.reader.leaves() {
-                total += bool_segment_count(seg, clauses)?;
-            }
-            return Ok(total);
-        }
-        // M4 §5: And/Or count 与迭代共用同一视图引擎——任一子句有 bitmap
-        // 即驱动同一迭代器计数（档 1/2），否则按段迭代（档 3，既有行为）。
-        if let Query::And { field, terms } | Query::Or { field, terms } = query {
-            if terms.len() >= 2 {
-                let is_and = matches!(query, Query::And { .. });
-                let mut total = 0u64;
-                for (_doc_base, seg) in self.reader.leaves() {
-                    let Some((has_freqs, entries)) =
-                        roaring_exec::collect_bool_entries(seg, field, terms, is_and)?
-                    else {
-                        continue; // 空段结果（未知字段 / AND 缺子句 / OR 全缺）
-                    };
-                    if let Some(c) = roaring_exec::count(seg, &entries, has_freqs, is_and)? {
-                        total += c;
+                    if !iter.matches()? {
                         continue;
                     }
-                    if let Some(mut iter) = query.segment_iterator(seg, false)? {
-                        loop {
-                            let doc = iter.next_doc()?;
-                            if doc == NO_MORE_DOCS {
-                                break;
-                            }
-                            total += 1;
-                        }
-                    }
+                    total += 1;
                 }
-                return Ok(total);
             }
         }
-        let mut c = CountCollector::default();
-        self.search(query, &mut c)?;
-        Ok(c.count)
+        Ok(total)
     }
 
-    /// (total hits, first `n` docIDs ascending) — Sort.INDEXORDER topN.
+    /// (total hits, first `n` docIDs ascending) — Sort.INDEXORDER topN。
+    /// M7 §5.2：count/topN 分离——段级 count 有快路径时 total 直读
+    /// （µs 级），迭代只到收满 n 个命中即停；无快路径的形状回落全程
+    /// 迭代（与旧实现一致）。(total, docs) 与旧实现逐字节一致。
     pub fn top_docs(&mut self, query: &Query, n: usize) -> io::Result<(u64, Vec<i32>)> {
-        let mut c = TopDocCollector::new(n);
-        self.search(query, &mut c)?;
-        Ok((c.total, c.docs))
+        let mut total = 0u64;
+        let mut docs: Vec<i32> = Vec::with_capacity(n.min(1024));
+        for (doc_base, seg) in self.reader.leaves() {
+            let fast = query::fast_segment_count(seg, query)?;
+            if let Some(c) = fast {
+                total += c;
+            }
+            // 段按 docBase 升序（INDEXORDER）：收满 n 且 count 已直读 →
+            // 后续段只取 count 不再迭代（全局短路）。
+            if docs.len() >= n && fast.is_some() {
+                continue;
+            }
+            let Some(mut iter) = query.segment_iterator(seg, false)? else {
+                continue; // 段内空（fast=Some(0) 或 None 时均无命中可计）
+            };
+            loop {
+                if docs.len() >= n && fast.is_some() {
+                    break; // 段内提前终止
+                }
+                let doc = iter.next_doc()?;
+                if doc == NO_MORE_DOCS {
+                    break;
+                }
+                if !iter.matches()? {
+                    continue;
+                }
+                if fast.is_none() {
+                    total += 1;
+                }
+                if docs.len() < n {
+                    docs.push(doc_base + doc);
+                }
+            }
+        }
+        Ok((total, docs))
     }
 
     /// ConstantScore TermQuery: freq_sum = total_term_freq from TermEntry

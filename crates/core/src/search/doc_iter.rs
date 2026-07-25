@@ -31,6 +31,13 @@ pub trait DocIter {
     fn freq(&self) -> u32 {
         1
     }
+    /// 两阶段确认（M7 §2.1，Lucene TwoPhaseIterator.matches）：对
+    /// next_doc/advance 返回的当前候选做昂贵验证；默认 Ok(true) = 单阶段
+    /// 迭代器。返回 false 后调用方以 next_doc() 推进（候选已消费）；
+    /// 对同一候选 doc 至多调用一次。
+    fn matches(&mut self) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 // ── MatchAll ──────────────────────────────────────────────────────────
@@ -357,6 +364,13 @@ impl DocIter for BitsetDocIter {
 
 // ── Phrase (slop=0) ─────────────────────────────────────────────────────
 
+/// phrase approximation 源（M7 §2.2）：全 term 有内联 bitmap 时 roaring
+/// AND 物化候选序列（µs 级，比 PFOR 合取快）；否则 postings 合取舞蹈。
+enum PhraseApprox {
+    Postings,
+    Bitmap { docs: Vec<u32>, cursor: usize },
+}
+
 /// One phrase term occurrence: an independent EverythingEnum + its offset
 /// in the phrase. Repeated terms get independent enums, which makes them
 /// naturally correct (spec M2 §6; PhrasePositions :24-58).
@@ -371,6 +385,7 @@ struct Occurrence {
 /// occurrence's positions (ExactPhraseMatcher :138-167).
 pub struct PhraseDocIter {
     occ: Vec<Occurrence>, // df-ascending (conjunction cost order)
+    approx: PhraseApprox,
     doc: i32,
     lead: usize,
 }
@@ -405,22 +420,46 @@ impl PhraseDocIter {
                 ),
             ));
         }
-        let mut sought: Vec<(u32, u32, PositionsEnum)> = Vec::with_capacity(terms.len());
+        let mut sought: Vec<(u32, u32, TermEntry)> = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
             let Some((_, entry)) = seg.seek_term(field, t)? else {
                 return Ok(None); // absent term: no hits (PhraseWeight null scorer)
             };
-            sought.push((entry.doc_freq, i as u32, seg.positions_enum(&entry)?));
+            sought.push((entry.doc_freq, i as u32, entry));
         }
-        // conjunction lead = cheapest enum first; offsets travel with their
-        // enum, so phrase semantics are unaffected
         sought.sort_by_key(|(df, _, _)| *df);
-        let occ = sought
-            .into_iter()
-            .map(|(_, offset, en)| Occurrence { en, offset })
-            .collect();
+        // M7 §2.2 bitmap 候选快路径：全部 term 有内联 bitmap → roaring
+        // AND 物化候选序列；任一缺失 → postings 合取 approximation。
+        let mut views: Vec<FrozenBitmap> = Vec::with_capacity(sought.len());
+        let mut all_bitmap = true;
+        for (_, _, entry) in &sought {
+            match seg.open_term_bitmap(entry)? {
+                Some(v) => views.push(v),
+                None => {
+                    all_bitmap = false;
+                    break;
+                }
+            }
+        }
+        let approx = if all_bitmap {
+            let refs: Vec<&FrozenBitmap> = views.iter().collect();
+            PhraseApprox::Bitmap {
+                docs: codec_lucene9::roaring::intersect_docs(&refs),
+                cursor: 0,
+            }
+        } else {
+            PhraseApprox::Postings
+        };
+        let mut occ: Vec<Occurrence> = Vec::with_capacity(sought.len());
+        for (_, offset, entry) in sought {
+            occ.push(Occurrence {
+                en: seg.positions_enum(&entry)?,
+                offset,
+            });
+        }
         Ok(Some(PhraseDocIter {
             occ,
+            approx,
             doc: -1,
             lead: 0,
         }))
@@ -454,15 +493,12 @@ impl PhraseDocIter {
     }
 }
 
-impl DocIter for PhraseDocIter {
-    fn doc_id(&self) -> i32 {
-        self.doc
-    }
-
-    fn next_doc(&mut self) -> io::Result<i32> {
-        if self.doc == NO_MORE_DOCS {
-            return Ok(NO_MORE_DOCS);
-        }
+impl PhraseDocIter {
+    /// approximation 推进（M7 §2.2）：只做 postings 合取对齐
+    /// （ConjunctionDISI 舞蹈），**不解码位置**——候选直接返回，位置
+    /// 验证推迟到 matches()。
+    fn next_candidate(&mut self) -> io::Result<i32> {
+        debug_assert!(matches!(self.approx, PhraseApprox::Postings));
         if self.doc >= 0 {
             for o in &mut self.occ {
                 if o.en.doc_id() == self.doc && o.en.next_doc()? == NO_MORE_DOCS {
@@ -472,12 +508,22 @@ impl DocIter for PhraseDocIter {
             }
         }
         loop {
-            // conjunction over the position enums (ConjunctionScorer shape,
-            // same dance as ConjunctionDocIter)
             let candidate = self.occ[self.lead].en.doc_id();
             if candidate == NO_MORE_DOCS {
                 self.doc = NO_MORE_DOCS;
                 return Ok(NO_MORE_DOCS);
+            }
+            if candidate < 0 {
+                // lead enum 尚未定位（初始状态）：推进一次，让合取舞蹈
+                // 在真实 doc ID 上工作。旧实现在此会 positions_match() 失败
+                // 并自动把全部 occurrence 移过 -1；拆分后由驱动方重试，
+                // 因此这里直接定位到首个真实 doc。
+                let d = self.occ[self.lead].en.next_doc()?;
+                if d == NO_MORE_DOCS {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+                continue;
             }
             let mut matched = true;
             for i in 0..self.occ.len() {
@@ -495,24 +541,61 @@ impl DocIter for PhraseDocIter {
                     break;
                 }
             }
-            if !matched {
-                continue;
-            }
-            if self.positions_match()? {
+            if matched {
                 self.doc = candidate;
                 return Ok(candidate);
             }
-            // no positional match in this doc: move every occurrence past it
-            for o in &mut self.occ {
-                if o.en.doc_id() == candidate && o.en.next_doc()? == NO_MORE_DOCS {
-                    self.doc = NO_MORE_DOCS;
-                    return Ok(NO_MORE_DOCS);
+        }
+    }
+}
+
+impl DocIter for PhraseDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        match &mut self.approx {
+            PhraseApprox::Postings => self.next_candidate(),
+            PhraseApprox::Bitmap { docs, cursor } => {
+                if self.doc >= 0 {
+                    *cursor += 1;
+                }
+                match docs.get(*cursor) {
+                    Some(&d) => {
+                        self.doc = d as i32;
+                        Ok(self.doc)
+                    }
+                    None => {
+                        self.doc = NO_MORE_DOCS;
+                        Ok(NO_MORE_DOCS)
+                    }
                 }
             }
         }
     }
-    // advance: trait default (linear next_doc loop) — the search drive only
-    // calls next_doc; freq: 1 (ConstantScore, trait default).
+
+    /// 两阶段确认（M7 §2.2）：对当前候选解码位置并验证
+    /// （ExactPhraseMatcher :138-167，逻辑从旧 next_doc 原样搬入）。
+    fn matches(&mut self) -> io::Result<bool> {
+        debug_assert!(self.doc >= 0 && self.doc != NO_MORE_DOCS);
+        for o in &mut self.occ {
+            if o.en.doc_id() != self.doc {
+                // bitmap approximation：positions enum 尚未定位——advance
+                // 对齐（跳表，非逐 doc）；近似集 ⊆ 各 term doc 集，必命中。
+                let d = o.en.advance(self.doc)?;
+                if d != self.doc {
+                    return Ok(false); // 防御（不变量破坏时宁可漏不可错）
+                }
+            }
+        }
+        self.positions_match()
+    }
+    // advance: trait default（线性 next_candidate 循环，approximation
+    // 语义）；freq: 1（ConstantScore，trait default）。
 }
 
 // ── Roaring (inline term bitmap, M5 §2 croaring frozen view) ─────────
@@ -999,8 +1082,26 @@ impl DocIter for ConjOverDocIter {
                 }
             }
             if matched {
-                self.doc = candidate;
-                return Ok(candidate);
+                // M7 §2.3：approximation 对齐后逐个 confirmation（Lucene
+                // ConjunctionScorer 同款）；任一 false → 推进停在
+                // candidate 的子句（含已确认的）后重新对齐。
+                let mut all_match = true;
+                for s in &mut self.sub {
+                    if !s.matches()? {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    self.doc = candidate;
+                    return Ok(candidate);
+                }
+                for s in &mut self.sub {
+                    if s.doc_id() == candidate && s.next_doc()? == NO_MORE_DOCS {
+                        self.doc = NO_MORE_DOCS;
+                        return Ok(NO_MORE_DOCS);
+                    }
+                }
             }
         }
     }
@@ -1018,19 +1119,99 @@ impl DocIter for ConjOverDocIter {
     // freq: 1（ConstantScore，spec §2.3 Bool 路径恒 needs_freq=false）
 }
 
-/// Disjunction over arbitrary per-segment iterators (spec M6 §2.3):
-/// DisjunctionDocIter 同款线性最小值 k 路归并（spec 提到"参照堆实现"——
-/// 现有 DisjunctionDocIter 实为线性扫描，doc_iter.rs:255-312；k = 子句
-/// 数，沿用线性，不引堆）。
-pub struct DisjOverDocIter {
+/// T-C bench 原型（M7 §4）：DisjOver 的索引堆版本——堆内只放 sub 下标，
+/// 18.7KB 的 SegmentDocIter 不挪动。堆序 = sub[i].doc_id() 小顶。
+/// 子句恒单阶段故不吸收 matches()；仅用于被忽略的 micro bench，
+/// 用 `#[cfg(test)]` 门控避免 release 构建的 dead-code 警告。
+#[cfg(test)]
+pub(crate) struct DisjOverHeapDocIter {
+    sub: Vec<SegmentDocIter>,
+    heap: Vec<usize>,
+    doc: i32,
+}
+
+#[cfg(test)]
+impl DisjOverHeapDocIter {
+    pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverHeapDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let n = sub.len();
+        let mut it = DisjOverHeapDocIter {
+            sub,
+            heap: (0..n).collect(),
+            doc: -1,
+        };
+        for s in &mut it.sub {
+            s.next_doc()?;
+        }
+        for i in (0..it.heap.len() / 2).rev() {
+            it.sift_down(i); // heapify
+        }
+        Ok(it)
+    }
+    fn less(&self, a: usize, b: usize) -> bool {
+        self.sub[self.heap[a]].doc_id() < self.sub[self.heap[b]].doc_id()
+    }
+    fn sift_down(&mut self, mut i: usize) {
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < self.heap.len() && self.less(l, m) {
+                m = l;
+            }
+            if r < self.heap.len() && self.less(r, m) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            self.heap.swap(i, m);
+            i = m;
+        }
+    }
+}
+
+#[cfg(test)]
+impl DocIter for DisjOverHeapDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        loop {
+            let top = self.heap[0];
+            let d = self.sub[top].doc_id();
+            if d == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            if self.doc < d {
+                self.doc = d;
+                return Ok(d);
+            }
+            // 堆顶停在已消费的 doc → 推进并下滤（NO_MORE_DOCS 自然沉底）
+            self.sub[top].next_doc()?;
+            self.sift_down(0);
+        }
+    }
+}
+
+/// Linear-scan baseline for the M7 T-C micro bench: same semantics as
+/// the heap `DisjOverDocIter` below, but finds the minimum doc ID by
+/// scanning all sub-iterators every step.仅用于被忽略的 micro bench，
+/// 用 `#[cfg(test)]` 门控避免 release 构建的 dead-code 警告。
+#[cfg(test)]
+pub(crate) struct DisjOverLinearDocIter {
     sub: Vec<SegmentDocIter>,
     doc: i32,
 }
 
-impl DisjOverDocIter {
-    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverDocIter> {
+#[cfg(test)]
+impl DisjOverLinearDocIter {
+    pub(crate) fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverLinearDocIter> {
         debug_assert!(sub.len() >= 2);
-        let mut it = DisjOverDocIter { sub, doc: -1 };
+        let mut it = DisjOverLinearDocIter { sub, doc: -1 };
         for s in &mut it.sub {
             s.next_doc()?;
         }
@@ -1038,7 +1219,8 @@ impl DisjOverDocIter {
     }
 }
 
-impl DocIter for DisjOverDocIter {
+#[cfg(test)]
+impl DocIter for DisjOverLinearDocIter {
     fn doc_id(&self) -> i32 {
         self.doc
     }
@@ -1053,15 +1235,37 @@ impl DocIter for DisjOverDocIter {
                 }
             }
         }
-        let mut best = NO_MORE_DOCS;
-        for s in &self.sub {
-            let d = s.doc_id();
-            if d != NO_MORE_DOCS && d < best {
-                best = d;
+        loop {
+            let mut best = NO_MORE_DOCS;
+            for s in &self.sub {
+                let d = s.doc_id();
+                if d != NO_MORE_DOCS && d < best {
+                    best = d;
+                }
+            }
+            if best == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            // M7 §2.3：对停在 best 的子句逐个 confirmation；至少一个
+            // true → 命中（短路，省掉其余子句的确认成本）。
+            let mut any = false;
+            for s in &mut self.sub {
+                if s.doc_id() == best && s.matches()? {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                self.doc = best;
+                return Ok(best);
+            }
+            for s in &mut self.sub {
+                if s.doc_id() == best {
+                    s.next_doc()?;
+                }
             }
         }
-        self.doc = best;
-        Ok(best)
     }
     fn advance(&mut self, target: i32) -> io::Result<i32> {
         if self.doc >= target {
@@ -1084,6 +1288,131 @@ impl DocIter for DisjOverDocIter {
         }
         self.doc = best;
         Ok(best)
+    }
+}
+
+/// Disjunction over arbitrary per-segment iterators (spec M6 §2.3):
+/// k 路最小值归并，使用索引堆：堆内只存 sub 下标，18.7KB 的
+/// SegmentDocIter 不挪动；堆顶即当前最小 doc。保留 M7 §2.3 的
+/// matches() 吸收逻辑——停在 best 的子句逐个 confirmation，任一命中
+/// 即返回（短路）。
+pub struct DisjOverDocIter {
+    sub: Vec<SegmentDocIter>,
+    heap: Vec<usize>, // heap[h] = index into sub
+    pos: Vec<usize>,  // pos[i] = heap position of sub i
+    doc: i32,
+}
+
+impl DisjOverDocIter {
+    pub fn new(sub: Vec<SegmentDocIter>) -> io::Result<DisjOverDocIter> {
+        debug_assert!(sub.len() >= 2);
+        let n = sub.len();
+        let mut it = DisjOverDocIter {
+            sub,
+            heap: (0..n).collect(),
+            pos: (0..n).collect(),
+            doc: -1,
+        };
+        for s in &mut it.sub {
+            s.next_doc()?;
+        }
+        for i in (0..it.heap.len() / 2).rev() {
+            it.sift_down(i); // heapify
+        }
+        Ok(it)
+    }
+
+    fn less(&self, a: usize, b: usize) -> bool {
+        self.sub[self.heap[a]].doc_id() < self.sub[self.heap[b]].doc_id()
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.pos[self.heap[a]] = a;
+        self.pos[self.heap[b]] = b;
+    }
+
+    fn sift_down(&mut self, mut i: usize) {
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut m = i;
+            if l < self.heap.len() && self.less(l, m) {
+                m = l;
+            }
+            if r < self.heap.len() && self.less(r, m) {
+                m = r;
+            }
+            if m == i {
+                break;
+            }
+            self.swap(i, m);
+            i = m;
+        }
+    }
+}
+
+impl DocIter for DisjOverDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        loop {
+            // 先把仍停在上一个已返回 doc 的子句推进
+            if self.doc >= 0 {
+                for i in 0..self.sub.len() {
+                    if self.sub[i].doc_id() == self.doc {
+                        self.sub[i].next_doc()?;
+                        self.sift_down(self.pos[i]);
+                    }
+                }
+            }
+            let best = self.sub[self.heap[0]].doc_id();
+            if best == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            // M7 §2.3：对停在 best 的子句逐个 confirmation；至少一个
+            // true → 命中（短路，省掉其余子句的确认成本）。
+            let mut any = false;
+            for i in 0..self.sub.len() {
+                if self.sub[i].doc_id() == best && self.sub[i].matches()? {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                self.doc = best;
+                return Ok(best);
+            }
+            // 全部未命中：推进所有停在 best 的子句并继续
+            for i in 0..self.sub.len() {
+                if self.sub[i].doc_id() == best {
+                    self.sub[i].next_doc()?;
+                    self.sift_down(self.pos[i]);
+                }
+            }
+        }
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target || self.doc == NO_MORE_DOCS {
+            return Ok(self.doc);
+        }
+        // M7 §2.3 / M7-review：advance 必须先把所有落后于 target 的子句推到
+        // >= target，否则堆顶可能仍 < target（next_doc 只推进等于 self.doc 的
+        // 子句，而 target-1 处未必有子句）。每次 advance 后下滤维持堆序。
+        for i in 0..self.sub.len() {
+            if self.sub[i].doc_id() < target {
+                self.sub[i].advance(target)?;
+                self.sift_down(self.pos[i]);
+            }
+        }
+        // 现在堆顶 >= target；把当前状态设为 target 前一个 doc，
+        // 复用 next_doc() 的 confirmation 循环返回候选。
+        self.doc = target - 1;
+        self.next_doc()
     }
 }
 
@@ -1113,7 +1442,15 @@ impl ExcludingDocIter {
                 self.doc = NO_MORE_DOCS;
                 return Ok(NO_MORE_DOCS);
             }
-            if self.prohibited.advance(d)? != d {
+            // M7 §2.3：prohibited 可能是两阶段迭代器（Phrase），advance(d)==d
+            // 只是 approximation 命中，必须再调 matches() 确认才排除。
+            let prohibited_candidate = self.prohibited.advance(d)? == d;
+            let excluded = if prohibited_candidate {
+                self.prohibited.matches()?
+            } else {
+                false
+            };
+            if !excluded && self.main.matches()? {
                 self.doc = d;
                 return Ok(d);
             }
@@ -1233,6 +1570,12 @@ impl DocIter for SegmentDocIter {
             Self::And(a) => a.freq(),
             Self::Or(o) => o.freq(),
             _ => 1,
+        }
+    }
+    fn matches(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Phrase(p) => p.matches(),
+            _ => Ok(true),
         }
     }
 }

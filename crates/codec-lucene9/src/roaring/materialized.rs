@@ -33,6 +33,40 @@ impl MaterializedBitmap {
         it.reset_at_or_after(from);
         it.next_many(dst)
     }
+
+    /// Owned 构造（codec 内部：frozen 容器级拷贝与 set ops 的出口）。
+    pub(crate) fn from_bitmap(bm: croaring::Bitmap) -> MaterializedBitmap {
+        MaterializedBitmap { bm }
+    }
+
+    /// 全位 bitmap [0, max_doc)（M7 §3.1：Bool 内嵌纯 MUST_NOT 子树的
+    /// MatchAll 正集防御）。
+    pub fn full(max_doc: u32) -> MaterializedBitmap {
+        let mut bm = croaring::Bitmap::new();
+        bm.add_range(0..max_doc);
+        MaterializedBitmap { bm }
+    }
+
+    /// 容器级交（M7 §3.1 fold 原语）：新分配 owned 结果。
+    pub fn and(&self, other: &MaterializedBitmap) -> MaterializedBitmap {
+        MaterializedBitmap {
+            bm: self.bm.and(&other.bm),
+        }
+    }
+
+    /// 容器级并。
+    pub fn or(&self, other: &MaterializedBitmap) -> MaterializedBitmap {
+        MaterializedBitmap {
+            bm: self.bm.or(&other.bm),
+        }
+    }
+
+    /// 容器级差（MUST_NOT 排除）。
+    pub fn andnot(&self, other: &MaterializedBitmap) -> MaterializedBitmap {
+        MaterializedBitmap {
+            bm: self.bm.andnot(&other.bm),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +105,31 @@ mod tests {
         assert_eq!(bm.cardinality(), 0);
         let mut buf = [0u32; 8];
         assert_eq!(bm.docs_from(0, &mut buf), 0);
+    }
+
+    #[test]
+    fn set_ops_full_and_andnot() {
+        let a = MaterializedBitmap::of(&[1, 2, 3, 5, 8]);
+        let b = MaterializedBitmap::of(&[2, 3, 4, 8, 13]);
+        let inter = a.and(&b);
+        assert_eq!(inter.cardinality(), 3); // {2,3,8}
+        let uni = a.or(&b);
+        assert_eq!(uni.cardinality(), 7); // {1,2,3,4,5,8,13}
+        let diff = a.andnot(&b);
+        assert_eq!(diff.cardinality(), 2); // {1,5}
+        let mut buf = [0u32; 8];
+        let n = diff.docs_from(0, &mut buf);
+        assert_eq!(&buf[..n], [1, 5]);
+        // full：0..max_doc 全位
+        let full = MaterializedBitmap::full(100);
+        assert_eq!(full.cardinality(), 100);
+        let n = full.docs_from(98, &mut buf);
+        assert_eq!(&buf[..n], [98, 99]);
+        // 与空集运算
+        let empty = MaterializedBitmap::of(&[]);
+        assert_eq!(a.and(&empty).cardinality(), 0);
+        assert_eq!(a.or(&empty).cardinality(), 5);
+        assert_eq!(a.andnot(&empty).cardinality(), 5);
+        assert_eq!(empty.andnot(&a).cardinality(), 0);
     }
 }

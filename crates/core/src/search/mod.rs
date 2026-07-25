@@ -1708,4 +1708,512 @@ mod tests {
         assert_eq!(s.freq_sum(&Query::term("message", "t00")).unwrap(), 4);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// M7 T-A2：phrase 两阶段拆分的语义钉死——单用 / 嵌套 MUST / 嵌套
+    /// SHOULD / MUST_NOT 组合的结果集。语料含 co-occur 非相邻 doc
+    /// （approximation 命中但 confirmation 拒绝），覆盖组合器吸收路径。
+    #[test]
+    fn phrase_nested_bool_twophase_equivalence() {
+        let root = temp_dir("twophase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        // t1 命中；t2 非相邻；t3 逆序；t4 命中(WARN)；t5 alpha@1+beta@2 命中；t6 命中(WARN)
+        let docs = [
+            ("INFO", "t1", "alpha beta gamma"),
+            ("INFO", "t2", "alpha gamma beta"),
+            ("WARN", "t3", "beta alpha gamma"),
+            ("WARN", "t4", "alpha beta"),
+            ("INFO", "t5", "alpha alpha beta"),
+            ("WARN", "t6", "gamma alpha beta delta"),
+        ];
+        for (l, t, m) in docs {
+            w.add_document(pos_doc(l, t, m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let phrase = Query::phrase("message", &["alpha", "beta"]);
+        assert_eq!(s.count(&phrase).unwrap(), 4); // t1,t4,t5,t6
+        // MUST[phrase, level=INFO] → t1,t5（跨字段合取，confirmation 后于对齐）
+        let q = Query::bool(vec![
+            (Occur::Must, phrase.clone()),
+            (Occur::Must, Query::term("level", "INFO")),
+        ]);
+        let (total, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(docs.len(), 2);
+        // SHOULD[phrase, tid=t2] → phrase 4 + t2 = 5
+        let q = Query::bool(vec![
+            (Occur::Should, phrase.clone()),
+            (Occur::Should, Query::term("tid", "t2")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 5);
+        // MUST phrase + MUST_NOT level=INFO → t4,t6
+        let q = Query::bool(vec![
+            (Occur::Must, phrase.clone()),
+            (Occur::MustNot, Query::term("level", "INFO")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 T-A3：phrase bitmap 候选快路径等价——hot/warm df=5000 ≥ 4096
+    /// （bitmap 索引上两者都有内联 bitmap → roaring AND approximation），
+    /// 与 bitmap off 索引（postings 合取 approximation）逐位一致。
+    fn write_phrase_bitmap_corpus(root: &std::path::Path, bitmap: bool) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema_pos(), cfg).unwrap();
+        for i in 0..5000u32 {
+            let msg = if i % 3 == 0 { "hot warm" } else { "hot x warm" };
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), msg)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    #[test]
+    fn phrase_bitmap_approx_equivalence() {
+        let root_off = temp_dir("phbmoff");
+        let root_on = temp_dir("phbmon");
+        write_phrase_bitmap_corpus(&root_off, false);
+        write_phrase_bitmap_corpus(&root_on, true);
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut s_on = Searcher::open(&dir_on).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::phrase("message", &["hot", "warm"]),          // 1667（i%3==0）
+            Query::phrase("message", &["hot", "x"]),             // 3333
+            Query::bool(vec![
+                (Occur::Must, Query::phrase("message", &["hot", "warm"])),
+                (Occur::Must, Query::term("level", "INFO")),
+            ]),
+            Query::bool(vec![
+                (Occur::Must, Query::phrase("message", &["hot", "warm"])),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(s_off.count(q).unwrap(), s_on.count(q).unwrap(), "count {q:?}");
+        }
+        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "warm"])).unwrap(), 1667);
+        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "x"])).unwrap(), 3333);
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
+
+    /// M7 回归：MUST_NOT phrase 子句必须对 approximation 候选调 matches()
+    /// 确认。旧代码在 ExcludingDocIter 里把 prohibited.advance(d)==d 直接当
+    /// 排除，导致含 term 但非真实短语的 doc 被误删。语料 doc 2 含 "y x" 而
+    /// 非 "x y"，是 MUST_NOT phrase("x","y") 的 approximation 命中、
+    /// confirmation 拒绝。
+    #[test]
+    fn must_not_phrase_twophase_confirmation() {
+        let root = temp_dir("mustnotphrase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let docs = [
+            "alpha beta",       // 0: MUST phrase hit, no x/y → keep
+            "alpha beta x y",   // 1: MUST hit, MUST_NOT confirmed → exclude
+            "alpha beta y x",   // 2: MUST hit, MUST_NOT approx-only → keep
+            "x y",              // 3: MUST miss → exclude
+            "alpha x beta",     // 4: MUST miss → exclude
+        ];
+        for (i, m) in docs.iter().enumerate() {
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let q = Query::bool(vec![
+            (Occur::Must, Query::phrase("message", &["alpha", "beta"])),
+            (Occur::MustNot, Query::phrase("message", &["x", "y"])),
+        ]);
+        assert_eq!(
+            s.count(&q).unwrap(),
+            drive_count_reference(&dir, &q),
+            "count vs reference"
+        );
+        assert_eq!(
+            s.top_docs(&q, 100).unwrap(),
+            reference_top_docs(&dir, &q, 100),
+            "top_docs vs reference"
+        );
+        let (_, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(docs, vec![0, 2]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 回归：ConjOverDocIter 调用子 OR 的 advance 时，子 OR 不能泄漏未
+    /// 经 matches() 确认的 phrase approximation。旧 DisjOverDocIter::advance
+    /// 直接返回堆顶 doc，导致 doc 1（"alpha x beta" 含 term 但非相邻）被
+    /// OR(phrase("alpha","beta"), term("zeta")) 误收，再与 term("delta")
+    /// 相交后错误命中。
+    #[test]
+    fn nested_must_or_phrase_twophase_confirmation() {
+        let root = temp_dir("nestedorphrase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let docs = [
+            "alpha beta delta",       // 0: phrase hit, delta hit → keep
+            "alpha x beta delta",     // 1: phrase approx-only, delta hit → exclude
+            "zeta delta",             // 2: zeta hit, delta hit → keep
+            "alpha beta zeta delta",  // 3: phrase hit → keep
+            "alpha beta",             // 4: phrase hit, delta miss → exclude
+            "delta",                  // 5: nothing → exclude
+        ];
+        for (i, m) in docs.iter().enumerate() {
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let inner_or = Query::bool(vec![
+            (Occur::Should, Query::phrase("message", &["alpha", "beta"])),
+            (Occur::Should, Query::term("message", "zeta")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, inner_or),
+            (Occur::Must, Query::term("message", "delta")),
+        ]);
+        assert_eq!(
+            s.count(&q).unwrap(),
+            drive_count_reference(&dir, &q),
+            "count vs reference"
+        );
+        assert_eq!(
+            s.top_docs(&q, 100).unwrap(),
+            reference_top_docs(&dir, &q, 100),
+            "top_docs vs reference"
+        );
+        let (_, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(docs, vec![0, 2, 3]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 最终回归：ExcludingDocIter 的 prohibited 为多子句 DisjOverDocIter。
+    /// 内层 OR 含 Term + Prefix，不可拍平，强制走通用 DisjOver 组合器。
+    #[test]
+    fn must_not_multi_sub_disjunction() {
+        let root = temp_dir("mustnotdisj");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        // doc 0/1/3 含 b 或 c，应被排除；doc 2 只含 a，应命中。
+        w.add_document(doc("INFO", "tid-0", "a b")).unwrap();
+        w.add_document(doc("INFO", "tid-1", "a c")).unwrap();
+        w.add_document(doc("INFO", "tid-2", "a")).unwrap();
+        w.add_document(doc("INFO", "tid-3", "a b c")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let prohibited = Query::bool(vec![
+            (Occur::Should, Query::term("message", "b")),
+            (Occur::Should, Query::prefix("message", "c")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "a")),
+            (Occur::MustNot, prohibited),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 1);
+        let (total, docs) = s.top_docs(&q, 10).unwrap();
+        assert_eq!((total, docs), (1, vec![2]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 最终回归：ConjOverDocIter 对齐时调用嵌套 DisjOverDocIter 的 advance。
+    /// 若 DisjOverDocIter 只把 self.doc 设为 target-1 就调 next_doc，会漏推进
+    /// 那些 < target-1 的子句，导致返回 < target 的 doc，破坏合取对齐不变量。
+    /// 内层 OR 跨字段（b / level INFO），不可拍平，确保走 DisjOverDocIter。
+    #[test]
+    fn conj_over_advances_behind_disjunction() {
+        let root = temp_dir("conjoverdisj");
+        let mut w = IndexWriter::create(&root, schema(), IndexWriterConfig::default()).unwrap();
+        // doc 0 满足内层 OR（有 b 且 level INFO），doc 99 只满足 a。
+        w.add_document(doc("INFO", "tid-0", "a b")).unwrap();
+        for i in 1..99 {
+            w.add_document(doc("WARN", &format!("tid-{i}"), "b")).unwrap();
+        }
+        w.add_document(doc("WARN", "tid-99", "a")).unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let inner_or = Query::bool(vec![
+            (Occur::Should, Query::term("message", "b")),
+            (Occur::Should, Query::term("level", "INFO")),
+        ]);
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "a")),
+            (Occur::Must, inner_or),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 1);
+        let (total, docs) = s.top_docs(&q, 200).unwrap();
+        assert_eq!((total, docs), (1, vec![0]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 T-B/T-D 的独立参照：不经任何 count 快路径，纯迭代 + matches
+    /// 驱动计数（永远正确，用于钉死各 count 快路径的等价性）。
+    fn drive_count_reference(dir: &FSDirectory, q: &Query) -> u64 {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        let mut reader = Reader::open(dir).unwrap();
+        let mut n = 0u64;
+        for (_b, seg) in reader.leaves() {
+            if let Some(mut it) = q.segment_iterator(seg, false).unwrap() {
+                loop {
+                    if it.next_doc().unwrap() == NO_MORE_DOCS {
+                        break;
+                    }
+                    if !it.matches().unwrap() {
+                        continue;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// M7 T-B：通用 Bool 形状的 count fold 与逐 doc 迭代完全一致
+    /// （跨字段 / MUST_NOT / 嵌套 / phrase 叶子 / 多 term 叶子）。
+    #[test]
+    fn bool_count_fold_matches_drive() {
+        let root = temp_dir("foldbool");
+        write_phrase_bitmap_corpus(&root, true); // Task 3 的 helper，bitmap on
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let hot_warm = Query::phrase("message", &["hot", "warm"]);
+        let battery: Vec<Query> = vec![
+            // 跨字段 AND（不可拍平 → 通用路径 fold）
+            Query::bool(vec![
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::Must, Query::term("tid", "tid-7")),
+            ]),
+            // MUST + MUST_NOT
+            Query::bool(vec![
+                (Occur::Must, Query::term("message", "hot")),
+                (Occur::MustNot, Query::term("message", "x")),
+            ]),
+            // 混合 occur（SHOULD + MUST_NOT）
+            Query::bool(vec![
+                (Occur::Should, Query::term("message", "warm")),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            // 嵌套（外层 MUST + 内层 SHOULD → 不可拍平）
+            Query::bool(vec![
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::Must, Query::bool(vec![
+                    (Occur::Should, Query::term("message", "hot")),
+                    (Occur::Should, Query::term("tid", "tid-8")),
+                ])),
+            ]),
+            // 短语叶子 + MUST_NOT
+            Query::bool(vec![
+                (Occur::Must, hot_warm.clone()),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            // 纯 MUST_NOT（既有 maxDoc − prohibited 路径，钉死防回归）
+            Query::bool(vec![(Occur::MustNot, Query::term("message", "hot"))]),
+            // Terms 叶子
+            Query::bool(vec![
+                (Occur::Must, Query::terms("message", &["hot", "x", "nosuch"])),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+        ];
+        for q in &battery {
+            assert_eq!(
+                s.count(q).unwrap(),
+                drive_count_reference(&dir, q),
+                "fold == drive {q:?}"
+            );
+        }
+        // bitmap off 索引同 battery（postings 物化叶子）
+        let root_off = temp_dir("foldbooloff");
+        write_phrase_bitmap_corpus(&root_off, false);
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        for q in &battery {
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                drive_count_reference(&dir_off, q),
+                "fold(off) == drive {q:?}"
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root_off).unwrap();
+    }
+
+    /// M7 T-D：top-N 新旧行为钉死——(total, docs) 与"全程迭代 + 前 N"
+    /// 参照逐字节一致；N ∈ {0,1,7,100,6000}，含跨段与无快路径形状。
+    fn reference_top_docs(dir: &FSDirectory, q: &Query, n: usize) -> (u64, Vec<i32>) {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        let mut reader = Reader::open(dir).unwrap();
+        let mut total = 0u64;
+        let mut docs = Vec::new();
+        for (base, seg) in reader.leaves() {
+            if let Some(mut it) = q.segment_iterator(seg, false).unwrap() {
+                loop {
+                    let d = it.next_doc().unwrap();
+                    if d == NO_MORE_DOCS {
+                        break;
+                    }
+                    if !it.matches().unwrap() {
+                        continue;
+                    }
+                    total += 1;
+                    if docs.len() < n {
+                        docs.push(base + d);
+                    }
+                }
+            }
+        }
+        (total, docs)
+    }
+
+    #[test]
+    fn topn_early_termination_equivalence() {
+        let root = temp_dir("topn");
+        write_phrase_bitmap_corpus(&root, true);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::MatchAll,
+            Query::term("message", "hot"),            // doc_freq 直读快路径
+            Query::term("message", "nosuch"),         // 空
+            Query::phrase("message", &["hot", "warm"]), // 无快路径（Phrase）→ 全程迭代
+            Query::terms("message", &["hot", "x"]),   // ≤16 OR 路径
+            Query::prefix("message", "ho"),           // bitset popcount
+            Query::bool(vec![                          // fold 快路径
+                (Occur::Must, Query::term("level", "INFO")),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+            Query::bool(vec![(Occur::MustNot, Query::term("message", "x"))]), // maxDoc−prohibited
+            Query::point_range("nope", 0, 1),         // 未知 point 字段 → 0
+        ];
+        for q in &battery {
+            for n in [0usize, 1, 7, 100, 6000] {
+                assert_eq!(
+                    s.top_docs(q, n).unwrap(),
+                    reference_top_docs(&dir, q, n),
+                    "top_docs({n}) {q:?}"
+                );
+            }
+        }
+        fs::remove_dir_all(&root).unwrap();
+        // 跨段边界：bitmap tier 语料（3 段）
+        let root_ms = temp_dir("topnms");
+        write_tier_corpus(&root_ms, true, 3);
+        let dir_ms = FSDirectory::open(&root_ms).unwrap();
+        let mut s_ms = Searcher::open(&dir_ms).unwrap();
+        let q = Query::or("message", &["hot", "scorching"]); // 以 write_tier_corpus 实际 term 为准
+        for n in [0usize, 1, 7, 100, 100_000] {
+            assert_eq!(
+                s_ms.top_docs(&q, n).unwrap(),
+                reference_top_docs(&dir_ms, &q, n),
+                "multi-segment top_docs({n})"
+            );
+        }
+        fs::remove_dir_all(&root_ms).unwrap();
+    }
+
+    /// M7 §3.2 成本护栏：budget=0 必 OverBudget；budget=u64::MAX 必 Hits。
+    #[test]
+    fn fold_cost_guard_triggers() {
+        let root = temp_dir("foldguard");
+        write_bitmap_corpus(&root, true);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_b, seg) = reader.leaves().next().unwrap();
+        let clauses = vec![
+            (Occur::Must, Query::term("message", "hot")),
+            (Occur::Must, Query::term("message", "t3")),
+        ];
+        let mut cost = 0u64;
+        let out = query::materialize_bool_bitmap(seg, &clauses, 0, &mut cost).unwrap();
+        assert!(matches!(out, query::MatOutcome::OverBudget));
+        let mut cost = 0u64;
+        let out = query::materialize_bool_bitmap(seg, &clauses, u64::MAX, &mut cost).unwrap();
+        match out {
+            query::MatOutcome::Hits(bm) => assert_eq!(bm.cardinality(), 714), // hot∧t3 = i%7==3
+            query::MatOutcome::OverBudget => panic!("u64::MAX budget must not be over"),
+        }
+        drop(reader);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M7 T-C：多子句 OR 线性扫描 vs 索引堆 micro bench。
+    /// cargo test -p rustlucene-core --lib disj_over_heap_micro -- --ignored --nocapture
+    #[test]
+    #[ignore = "T-C micro bench"]
+    fn disj_over_heap_micro() {
+        use codec_lucene9::postings_read::NO_MORE_DOCS;
+        use std::time::Instant;
+        const DOCS: u32 = 200_000;
+        const K_TERMS: u32 = 256; // term 池 t0..t255；df ≈ 3×200k/256 ≈ 2.3k（无 bitmap）
+        let root = temp_dir("orheap");
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = false;
+        let mut w = IndexWriter::create(&root, schema(), cfg).unwrap();
+        for i in 0..DOCS {
+            let m = format!("t{} t{} t{}", i % K_TERMS, (i / 3) % K_TERMS, (i / 7) % K_TERMS);
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        for k in [8usize, 32, 128] {
+            let terms: Vec<String> = (0..k as u32).map(|j| format!("t{j}")).collect();
+            // 同一批子句构造两种 DisjOver，驱动到穷尽计时（5 轮取最小）
+            let run = |heap: bool| -> u128 {
+                let dir = FSDirectory::open(&root).unwrap();
+                let mut reader = Reader::open(&dir).unwrap();
+                let (_b, seg) = reader.leaves().next().unwrap();
+                let mut sub = Vec::new();
+                for t in &terms {
+                    if let Some(it) =
+                        Query::term("message", t).segment_iterator(seg, false).unwrap()
+                    {
+                        sub.push(it);
+                    }
+                }
+                let start = Instant::now();
+                let mut n = 0u64;
+                if heap {
+                    let mut it = doc_iter::DisjOverHeapDocIter::new(sub).unwrap();
+                    loop {
+                        if it.next_doc().unwrap() == NO_MORE_DOCS {
+                            break;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    let mut it = doc_iter::DisjOverLinearDocIter::new(sub).unwrap();
+                    loop {
+                        if it.next_doc().unwrap() == NO_MORE_DOCS {
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+                assert!(n > 0);
+                start.elapsed().as_nanos()
+            };
+            let (mut lin, mut hp) = (u128::MAX, u128::MAX);
+            for _ in 0..5 {
+                lin = lin.min(run(false));
+                hp = hp.min(run(true));
+            }
+            println!(
+                "k={k}: linear={lin}ns heap={hp}ns heap/linear={:.2}",
+                hp as f64 / lin as f64
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

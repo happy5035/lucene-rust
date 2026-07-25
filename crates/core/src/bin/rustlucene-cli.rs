@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
 use codec_lucene9::FSDirectory;
-use rustlucene_core::search::{CountCollector, Query, Searcher};
+use rustlucene_core::search::{CountCollector, Occur, Query, Searcher};
 use rustlucene_core::{
     commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
     JsonBinder, Schema, SegmentBuilder,
@@ -373,6 +373,133 @@ fn doc_csv(docs: &[i32]) -> String {
     s
 }
 
+/// M6 §2.6 BOOL 行 S 表达式解析（grammar 见 M6 计划 Task A「查询文件
+/// 格式」一节；与 SearchBench.parseBoolSexpr 同一 grammar）。单行、行内
+/// 无 tab、节点间恰一个空格；AND/OR/NOT 是同形 BOOL 的语法糖，BOOL 节点
+/// 支持混合 occur。RANGE 叶子（T-B PointRange）在 T-B 合入后接入。
+fn parse_bool_sexpr(s: &str) -> Result<Query, String> {
+    let spaced = s.replace('(', " ( ").replace(')', " ) ");
+    let toks: Vec<&str> = spaced.split_whitespace().collect();
+    let mut pos = 0;
+    let q = sexpr_node(&toks, &mut pos)?;
+    if pos != toks.len() {
+        return Err(format!("trailing tokens at {pos} of {}", toks.len()));
+    }
+    Ok(q)
+}
+
+fn sexpr_atom<'t>(toks: &[&'t str], pos: &mut usize) -> Result<&'t str, String> {
+    let t = toks
+        .get(*pos)
+        .copied()
+        .ok_or_else(|| "unexpected end of sexpr".to_string())?;
+    if t == "(" || t == ")" {
+        return Err(format!("expected atom, found '{t}'"));
+    }
+    *pos += 1;
+    Ok(t)
+}
+
+fn sexpr_close(toks: &[&str], pos: &mut usize) -> Result<(), String> {
+    if toks.get(*pos) != Some(&")") {
+        return Err(format!("expected ')' at token {pos}"));
+    }
+    *pos += 1;
+    Ok(())
+}
+
+fn sexpr_node(toks: &[&str], pos: &mut usize) -> Result<Query, String> {
+    if toks.get(*pos) != Some(&"(") {
+        return Err(format!("expected '(' at token {pos}"));
+    }
+    *pos += 1;
+    let head = sexpr_atom(toks, pos)?;
+    match head {
+        "TERM" => {
+            let field = sexpr_atom(toks, pos)?;
+            let term = sexpr_atom(toks, pos)?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::term(field, term))
+        }
+        "PREFIX" => {
+            let field = sexpr_atom(toks, pos)?;
+            let prefix = sexpr_atom(toks, pos)?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::prefix(field, prefix))
+        }
+        "WILDCARD" => {
+            let field = sexpr_atom(toks, pos)?;
+            let pattern = sexpr_atom(toks, pos)?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::wildcard(field, pattern))
+        }
+        "PHRASE" => {
+            let field = sexpr_atom(toks, pos)?;
+            let t1 = sexpr_atom(toks, pos)?;
+            let t2 = sexpr_atom(toks, pos)?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::phrase(field, &[t1, t2]))
+        }
+        "AND" | "OR" => {
+            let occur = if head == "AND" {
+                Occur::Must
+            } else {
+                Occur::Should
+            };
+            let mut clauses = Vec::new();
+            loop {
+                match toks.get(*pos) {
+                    Some(&")") => break,
+                    Some(_) => clauses.push((occur, sexpr_node(toks, pos)?)),
+                    None => return Err(format!("unclosed {head} node")),
+                }
+            }
+            sexpr_close(toks, pos)?;
+            if clauses.is_empty() {
+                return Err(format!("{head} needs at least one child"));
+            }
+            Ok(Query::bool(clauses))
+        }
+        "NOT" => {
+            let sub = sexpr_node(toks, pos)?;
+            sexpr_close(toks, pos)?;
+            Ok(Query::bool(vec![(Occur::MustNot, sub)]))
+        }
+        "BOOL" => {
+            let mut clauses = Vec::new();
+            loop {
+                match toks.get(*pos) {
+                    Some(&")") => break,
+                    Some(&"(") => {
+                        *pos += 1;
+                        let occ = match sexpr_atom(toks, pos)? {
+                            "MUST" => Occur::Must,
+                            "SHOULD" => Occur::Should,
+                            "NOT" => Occur::MustNot,
+                            other => {
+                                return Err(format!(
+                                    "BOOL clause occur must be MUST/SHOULD/NOT, found '{other}'"
+                                ))
+                            }
+                        };
+                        let sub = sexpr_node(toks, pos)?;
+                        sexpr_close(toks, pos)?;
+                        clauses.push((occ, sub));
+                    }
+                    Some(t) => return Err(format!("expected clause, found '{t}'")),
+                    None => return Err("unclosed BOOL node".to_string()),
+                }
+            }
+            sexpr_close(toks, pos)?;
+            if clauses.is_empty() {
+                return Err("BOOL needs at least one clause".to_string());
+            }
+            Ok(Query::bool(clauses))
+        }
+        other => Err(format!("unknown node head '{other}'")),
+    }
+}
+
 /// Search benchmark following luceneutil methodology: open index, run term
 /// queries against sampled terms (bucketed by docFreq), measure QPS and
 /// latency percentiles. AND/OR term pairs recorded by Java SearchBench
@@ -503,6 +630,26 @@ fn searchbench(
         })
         .collect();
 
+    // M6 BOOL 行（S 表达式单行，与 Java SearchBench 同格式逐条重放）：
+    // (bucket, sexpr, parsed)。解析失败即 fail-fast（查询文件两侧同源，
+    // 坏行是电池 bug 不是数据问题）。
+    let bool_sexpr_tasks: Vec<(String, String, Query)> = content
+        .lines()
+        .filter(|l| l.starts_with("BOOL\t"))
+        .map(|l| {
+            let parts: Vec<&str> = l.splitn(3, '\t').collect();
+            if parts.len() < 3 {
+                eprintln!("searchbench: malformed BOOL line: {l}");
+                std::process::exit(2);
+            }
+            let q = parse_bool_sexpr(parts[2]).unwrap_or_else(|e| {
+                eprintln!("searchbench: bad BOOL sexpr '{}': {e}", parts[2]);
+                std::process::exit(2);
+            });
+            (parts[1].to_string(), parts[2].to_string(), q)
+        })
+        .collect();
+
     // M6 RANGE lines (same file, replayed verbatim like AND/OR/PHRASE):
     // RANGE\t<field>\t<low>\t<high>；low>high 行会让查询在执行期
     // Err(InvalidInput)（跨任务钉死接口），dump 侧不写这种行。
@@ -561,6 +708,7 @@ fn searchbench(
         Terms(Vec<String>),
         Phrase(String, String),
         Range(String, i64, i64),
+        Bool(String, Query), // (sexpr, parsed)——sexpr 进 correctness detail 行
     }
     let mut work: Vec<(String, WorkItem)> = Vec::new();
     for t in &low_terms {
@@ -614,6 +762,12 @@ fn searchbench(
             WorkItem::Phrase(t1.clone(), t2.clone()),
         ));
     }
+    for (bucket, sexpr, q) in &bool_sexpr_tasks {
+        work.push((
+            format!("bool\t{bucket}"),
+            WorkItem::Bool(sexpr.clone(), q.clone()),
+        ));
+    }
     // RANGE lines: replayed verbatim, appended after the M2 line types.
     for (f, low, high) in &range_tasks {
         work.push((
@@ -640,6 +794,7 @@ fn searchbench(
             }
             WorkItem::Phrase(t1, t2) => Query::phrase(field, &[t1.as_str(), t2.as_str()]),
             WorkItem::Range(f, low, high) => Query::point_range(f, *low, *high),
+            WorkItem::Bool(_, q) => q.clone(),
         }
     };
     // One measured execution. ITERM forces a full DocIter walk through the
@@ -671,6 +826,7 @@ fn searchbench(
             WorkItem::Range(f, low, high) => {
                 format!("range field={f} low={low} high={high} bucket={label}")
             }
+            WorkItem::Bool(sexpr, _) => format!("bool={sexpr} bucket={label}"),
         }
     };
 
@@ -1500,5 +1656,81 @@ fn main() -> std::io::Result<()> {
             )
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6 §2.6 BOOL 行 S 表达式解析：叶子/同形节点/嵌套/混合 BOOL/错误。
+    #[test]
+    fn parse_bool_sexpr_shapes() {
+        // TERM 叶子 + AND（全 Must）
+        let q = parse_bool_sexpr("(AND (TERM message error) (TERM level INFO))").unwrap();
+        let Query::Bool { clauses } = &q else {
+            panic!("top must be Bool");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|(o, _)| *o == Occur::Must));
+        assert_eq!(clauses[0].1, Query::term("message", "error"));
+        assert_eq!(clauses[1].1, Query::term("level", "INFO"));
+        // OR（全 Should）+ 三层嵌套 + NOT
+        let q = parse_bool_sexpr(
+            "(OR (TERM message a) (AND (TERM level INFO) (NOT (TERM source tmp))))",
+        )
+        .unwrap();
+        let Query::Bool { clauses } = &q else {
+            panic!("top must be Bool");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses.iter().all(|(o, _)| *o == Occur::Should));
+        let Query::Bool {
+            clauses: and_clauses,
+        } = &clauses[1].1
+        else {
+            panic!("second child must be Bool");
+        };
+        assert_eq!(and_clauses[1].0, Occur::Must);
+        let Query::Bool {
+            clauses: not_clauses,
+        } = &and_clauses[1].1
+        else {
+            panic!("NOT child must be Bool");
+        };
+        assert_eq!(not_clauses.len(), 1);
+        assert_eq!(not_clauses[0].0, Occur::MustNot);
+        assert_eq!(not_clauses[0].1, Query::term("source", "tmp"));
+        // PREFIX / WILDCARD / PHRASE 叶子
+        let q = parse_bool_sexpr(
+            "(AND (PREFIX message conn) (WILDCARD message c*n) (PHRASE message quick brown))",
+        )
+        .unwrap();
+        let Query::Bool { clauses } = &q else {
+            panic!("top must be Bool");
+        };
+        assert_eq!(clauses[0].1, Query::prefix("message", "conn"));
+        assert_eq!(clauses[1].1, Query::wildcard("message", "c*n"));
+        assert_eq!(clauses[2].1, Query::phrase("message", &["quick", "brown"]));
+        // BOOL 混合 occur 节点
+        let q = parse_bool_sexpr(
+            "(BOOL (MUST (TERM message a)) (SHOULD (TERM level INFO)) (NOT (TERM message b)))",
+        )
+        .unwrap();
+        let Query::Bool { clauses } = &q else {
+            panic!("top must be Bool");
+        };
+        assert_eq!(
+            clauses.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+            vec![Occur::Must, Occur::Should, Occur::MustNot]
+        );
+        // 错误：未闭合 / 未知头 / 空 AND / 空 BOOL / 多余 token / NOT 多子句 / 非法 occur
+        assert!(parse_bool_sexpr("(AND (TERM f a)").is_err());
+        assert!(parse_bool_sexpr("(XOR (TERM f a))").is_err());
+        assert!(parse_bool_sexpr("(AND)").is_err());
+        assert!(parse_bool_sexpr("(BOOL)").is_err());
+        assert!(parse_bool_sexpr("(TERM f a) junk").is_err());
+        assert!(parse_bool_sexpr("(NOT (TERM f a) (TERM f b))").is_err());
+        assert!(parse_bool_sexpr("(BOOL (FILTER (TERM f a)))").is_err());
     }
 }

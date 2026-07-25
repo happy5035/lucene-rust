@@ -75,6 +75,31 @@ public class VerifySearchIndex {
                 out.append("matchall first20=").append(b).append('\n');
             }
 
+            // M6 §3.4 range battery — 与 rustlucene-cli searchdump 逐行镜像；
+            // ts(doc i) ∈ [TS_BASE + i*1000, TS_BASE + i*1000 + 999]
+            if (r.maxDoc() >= 200) {
+                long TS = 1_700_000_000_000L;
+                long[][] ranges = {
+                    {TS + 100_000, TS + 199_999},   // docs 100..=199 → 100
+                    {TS - 1_000_000, TS - 1},       // 不相交 → 0
+                    {Long.MIN_VALUE, Long.MAX_VALUE}, // 全区间 → maxDoc
+                    {Long.MIN_VALUE, TS + 49_999},  // 贴 MIN → docs 0..=49 → 50
+                    {TS + 150_000, Long.MAX_VALUE}, // 贴 MAX
+                };
+                for (long[] rg : ranges) {
+                    Query q = LongPoint.newRangeQuery("timestamp", rg[0], rg[1]);
+                    TopDocs td = s.search(q, 20, Sort.INDEXORDER);
+                    StringBuilder b = new StringBuilder();
+                    for (ScoreDoc sd : td.scoreDocs) b.append(sd.doc).append(',');
+                    out.append("range timestamp=[").append(rg[0]).append(',').append(rg[1])
+                       .append("] count=").append(s.count(q))
+                       .append(" first20=").append(b).append('\n');
+                }
+                Query q = LongPoint.newRangeQuery("timestamp", TS + 100_000, TS + 100_999);
+                out.append("range timestamp=[").append(TS + 100_000).append(',')
+                   .append(TS + 100_999).append("] count=").append(s.count(q)).append('\n');
+            }
+
             // Boolean battery (search spec phase 3): "and" = MUST+MUST,
             // "or" = SHOULD+SHOULD. Same items/format as the boolean_battery
             // in rustlucene-cli searchdump.

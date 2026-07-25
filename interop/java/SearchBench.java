@@ -3,6 +3,8 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.*;
 import org.apache.lucene.store.*;
@@ -413,6 +415,7 @@ public class SearchBench {
                 List<String[]> loadedWildcard = new ArrayList<>();
                 List<String[]> loadedTermSets = new ArrayList<>();
                 List<String[]> loadedPhrase = new ArrayList<>();
+                List<String[]> loadedRange = new ArrayList<>();
                 for (String line : Files.readAllLines(Paths.get(loadQueriesFile))) {
                     String[] parts = line.split("\t");
                     if (parts[0].equals("TERM") && parts.length >= 3) {
@@ -429,6 +432,8 @@ public class SearchBench {
                         loadedTermSets.add(new String[]{parts[1], parts[2]});
                     } else if (parts[0].equals("PHRASE") && parts.length >= 4) {
                         loadedPhrase.add(new String[]{parts[1], parts[2], parts[3]});
+                    } else if (parts[0].equals("RANGE") && parts.length >= 4) {
+                        loadedRange.add(new String[]{parts[1], parts[2], parts[3]});
                     }
                 }
                 // Build queries using the loaded terms
@@ -525,6 +530,31 @@ public class SearchBench {
                     queries.add(new ConstantScoreQuery(new PhraseQuery(field, p[1], p[2])));
                     labels.add("phrase\t" + p[0]);
                     details.add("phrase t1=" + p[1] + " t2=" + p[2] + " bucket=phrase\t" + p[0]);
+                }
+                // M6 RANGE lines: LongPoint/IntPoint newRangeQuery chosen by
+                // the field's point width (IntPoint clamp mirrors the Rust
+                // codec rule; a range fully outside the int domain matches
+                // nothing on both sides).
+                for (String[] p : loadedRange) {
+                    String f = p[0];
+                    long low = Long.parseLong(p[1]), high = Long.parseLong(p[2]);
+                    FieldInfo fi = FieldInfos.getMergedFieldInfos(reader).fieldInfo(f);
+                    Query q;
+                    if (fi != null && fi.getPointNumBytes() == Integer.BYTES) {
+                        if (low > Integer.MAX_VALUE || high < Integer.MIN_VALUE) {
+                            q = new MatchNoDocsQuery("range fully outside int domain");
+                        } else {
+                            int lo = (int) Math.max(low, (long) Integer.MIN_VALUE);
+                            int hi = (int) Math.min(high, (long) Integer.MAX_VALUE);
+                            q = IntPoint.newRangeQuery(f, lo, hi);
+                        }
+                    } else {
+                        q = LongPoint.newRangeQuery(f, low, high);
+                    }
+                    queries.add(q);
+                    labels.add("range\tall");
+                    details.add("range field=" + f + " low=" + low + " high=" + high
+                            + " bucket=range\tall");
                 }
                 runAndPrint(searcher, iterSearcher, queries, labels, details, warmup, iterations);
                 return;

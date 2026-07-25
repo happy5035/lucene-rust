@@ -1379,4 +1379,53 @@ mod tests {
         let q2 = q.clone();
         assert_eq!(q, q2);
     }
+
+    /// M6 §2.4 拍平形状判定：纯 MUST/纯 SHOULD 同字段 Term 子树（递归展开
+    /// 同形嵌套 Bool）→ Some；混合 occur / 跨字段 / 非 Term 叶子 / 异形
+    /// 嵌套 / 空子树 → None。
+    #[test]
+    fn flatten_bool_shape_detection() {
+        use crate::search::query::flatten_bool;
+        let must = |q: Query| (Occur::Must, q);
+        let should = |q: Query| (Occur::Should, q);
+        let t = |f: &str, s: &str| Query::term(f, s);
+        fn refs(v: &[(Occur, Query)]) -> Vec<(Occur, &Query)> {
+            v.iter().map(|(o, q)| (*o, q)).collect()
+        }
+        // 纯 MUST 同字段 → AND 拍平
+        let q = vec![must(t("message", "a")), must(t("message", "b"))];
+        let (is_and, field, terms) = flatten_bool(&refs(&q)).unwrap();
+        assert!(is_and);
+        assert_eq!(field, "message");
+        assert_eq!(terms, vec![b"a".as_slice(), b"b".as_slice()]);
+        // 纯 SHOULD 且嵌套同形 → OR 拍平（递归展开，3 叶子）
+        let inner = Query::bool(vec![should(t("message", "b")), should(t("message", "c"))]);
+        let q = vec![should(t("message", "a")), should(inner)];
+        let (is_and, field, terms) = flatten_bool(&refs(&q)).unwrap();
+        assert!(!is_and);
+        assert_eq!(field, "message");
+        assert_eq!(
+            terms,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
+        // 混合 occur → None
+        let q = vec![must(t("message", "a")), should(t("message", "b"))];
+        assert!(flatten_bool(&refs(&q)).is_none());
+        // 跨字段 → None
+        let q = vec![must(t("message", "a")), must(t("level", "INFO"))];
+        assert!(flatten_bool(&refs(&q)).is_none());
+        // 非 Term 叶子（Prefix）→ None
+        let q = vec![must(t("message", "a")), must(Query::prefix("message", "a"))];
+        assert!(flatten_bool(&refs(&q)).is_none());
+        // MUST_NOT → None
+        let q = vec![(Occur::MustNot, t("message", "a"))];
+        assert!(flatten_bool(&refs(&q)).is_none());
+        // AND 内嵌 OR（异形嵌套）→ None
+        let inner_or = Query::bool(vec![should(t("message", "b")), should(t("message", "c"))]);
+        let q = vec![must(t("message", "a")), must(inner_or)];
+        assert!(flatten_bool(&refs(&q)).is_none());
+        // 空子树 → None
+        let q = vec![must(Query::bool(vec![]))];
+        assert!(flatten_bool(&refs(&q)).is_none());
+    }
 }

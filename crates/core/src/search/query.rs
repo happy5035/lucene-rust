@@ -264,6 +264,56 @@ impl Query {
     }
 }
 
+/// spec §2.4 拍平形状判定：全部子句同一 occur（全 MUST 或全 SHOULD），
+/// 且递归展开**同形**嵌套 Bool 后全部叶子是同字段 Term →
+/// Some((is_and, field, terms))（field/terms 借自原查询，零克隆）；
+/// 其余形状（混合 occur / 跨字段 / 非 Term 叶子 / 异形嵌套 / 空子树 /
+/// 首子句 MUST_NOT）→ None。嵌套 Bool 的 occur 必须与外层一致：
+/// `(AND t1 (OR t2 t3))` 是 t1 ∧ (t2∨t3)，不是平 AND，不得拍平。
+pub(crate) fn flatten_bool<'q>(
+    clauses: &[(Occur, &'q Query)],
+) -> Option<(bool, &'q str, Vec<&'q [u8]>)> {
+    let is_and = match clauses.first()?.0 {
+        Occur::Must => true,
+        Occur::Should => false,
+        Occur::MustNot => return None,
+    };
+    let mut field: Option<&'q str> = None;
+    let mut terms: Vec<&'q [u8]> = Vec::new();
+    for &(occur, q) in clauses {
+        let same = matches!(
+            (occur, is_and),
+            (Occur::Must, true) | (Occur::Should, false)
+        );
+        if !same {
+            return None;
+        }
+        match q {
+            Query::Term { field: f, term } => {
+                if field.is_some_and(|hf| hf != f.as_str()) {
+                    return None;
+                }
+                field = Some(f.as_str());
+                terms.push(term.as_slice());
+            }
+            Query::Bool { clauses: sub } => {
+                let sub_refs: Vec<(Occur, &Query)> = sub.iter().map(|(o, q)| (*o, q)).collect();
+                let (sub_and, sub_field, sub_terms) = flatten_bool(&sub_refs)?;
+                if sub_and != is_and {
+                    return None;
+                }
+                if field.is_some_and(|hf| hf != sub_field) {
+                    return None;
+                }
+                field = Some(sub_field);
+                terms.extend(sub_terms);
+            }
+            _ => return None,
+        }
+    }
+    Some((is_and, field?, terms))
+}
+
 /// PointRange 共享物化入口（`segment_iterator` 与 `Searcher::count` 同一
 /// 物化，spec §3.3）：`low > high` → `Err(InvalidInput)`（跨任务钉死接口；
 /// Lucene 9.12.3 对该情形不报错而返回 0 命中，PointRangeQuery.checkArgs

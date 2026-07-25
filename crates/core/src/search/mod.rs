@@ -1708,4 +1708,53 @@ mod tests {
         assert_eq!(s.freq_sum(&Query::term("message", "t00")).unwrap(), 4);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// M7 T-A2：phrase 两阶段拆分的语义钉死——单用 / 嵌套 MUST / 嵌套
+    /// SHOULD / MUST_NOT 组合的结果集。语料含 co-occur 非相邻 doc
+    /// （approximation 命中但 confirmation 拒绝），覆盖组合器吸收路径。
+    #[test]
+    fn phrase_nested_bool_twophase_equivalence() {
+        let root = temp_dir("twophase");
+        let mut w =
+            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        // t1 命中；t2 非相邻；t3 逆序；t4 命中(WARN)；t5 alpha@1+beta@2 命中；t6 命中(WARN)
+        let docs = [
+            ("INFO", "t1", "alpha beta gamma"),
+            ("INFO", "t2", "alpha gamma beta"),
+            ("WARN", "t3", "beta alpha gamma"),
+            ("WARN", "t4", "alpha beta"),
+            ("INFO", "t5", "alpha alpha beta"),
+            ("WARN", "t6", "gamma alpha beta delta"),
+        ];
+        for (l, t, m) in docs {
+            w.add_document(pos_doc(l, t, m)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let phrase = Query::phrase("message", &["alpha", "beta"]);
+        assert_eq!(s.count(&phrase).unwrap(), 4); // t1,t4,t5,t6
+        // MUST[phrase, level=INFO] → t1,t5（跨字段合取，confirmation 后于对齐）
+        let q = Query::bool(vec![
+            (Occur::Must, phrase.clone()),
+            (Occur::Must, Query::term("level", "INFO")),
+        ]);
+        let (total, docs) = s.top_docs(&q, 100).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(docs.len(), 2);
+        // SHOULD[phrase, tid=t2] → phrase 4 + t2 = 5
+        let q = Query::bool(vec![
+            (Occur::Should, phrase.clone()),
+            (Occur::Should, Query::term("tid", "t2")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 5);
+        // MUST phrase + MUST_NOT level=INFO → t4,t6
+        let q = Query::bool(vec![
+            (Occur::Must, phrase.clone()),
+            (Occur::MustNot, Query::term("level", "INFO")),
+        ]);
+        assert_eq!(s.count(&q).unwrap(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

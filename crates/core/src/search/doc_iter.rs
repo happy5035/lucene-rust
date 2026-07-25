@@ -461,15 +461,11 @@ impl PhraseDocIter {
     }
 }
 
-impl DocIter for PhraseDocIter {
-    fn doc_id(&self) -> i32 {
-        self.doc
-    }
-
-    fn next_doc(&mut self) -> io::Result<i32> {
-        if self.doc == NO_MORE_DOCS {
-            return Ok(NO_MORE_DOCS);
-        }
+impl PhraseDocIter {
+    /// approximation 推进（M7 §2.2）：只做 postings 合取对齐
+    /// （ConjunctionDISI 舞蹈），**不解码位置**——候选直接返回，位置
+    /// 验证推迟到 matches()。
+    fn next_candidate(&mut self) -> io::Result<i32> {
         if self.doc >= 0 {
             for o in &mut self.occ {
                 if o.en.doc_id() == self.doc && o.en.next_doc()? == NO_MORE_DOCS {
@@ -479,12 +475,22 @@ impl DocIter for PhraseDocIter {
             }
         }
         loop {
-            // conjunction over the position enums (ConjunctionScorer shape,
-            // same dance as ConjunctionDocIter)
             let candidate = self.occ[self.lead].en.doc_id();
             if candidate == NO_MORE_DOCS {
                 self.doc = NO_MORE_DOCS;
                 return Ok(NO_MORE_DOCS);
+            }
+            if candidate < 0 {
+                // lead enum 尚未定位（初始状态）：推进一次，让合取舞蹈
+                // 在真实 doc ID 上工作。旧实现在此会 positions_match() 失败
+                // 并自动把全部 occurrence 移过 -1；拆分后由驱动方重试，
+                // 因此这里直接定位到首个真实 doc。
+                let d = self.occ[self.lead].en.next_doc()?;
+                if d == NO_MORE_DOCS {
+                    self.doc = NO_MORE_DOCS;
+                    return Ok(NO_MORE_DOCS);
+                }
+                continue;
             }
             let mut matched = true;
             for i in 0..self.occ.len() {
@@ -502,24 +508,34 @@ impl DocIter for PhraseDocIter {
                     break;
                 }
             }
-            if !matched {
-                continue;
-            }
-            if self.positions_match()? {
+            if matched {
                 self.doc = candidate;
                 return Ok(candidate);
             }
-            // no positional match in this doc: move every occurrence past it
-            for o in &mut self.occ {
-                if o.en.doc_id() == candidate && o.en.next_doc()? == NO_MORE_DOCS {
-                    self.doc = NO_MORE_DOCS;
-                    return Ok(NO_MORE_DOCS);
-                }
-            }
         }
     }
-    // advance: trait default (linear next_doc loop) — the search drive only
-    // calls next_doc; freq: 1 (ConstantScore, trait default).
+}
+
+impl DocIter for PhraseDocIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc == NO_MORE_DOCS {
+            return Ok(NO_MORE_DOCS);
+        }
+        self.next_candidate()
+    }
+
+    /// 两阶段确认（M7 §2.2）：对当前候选解码位置并验证
+    /// （ExactPhraseMatcher :138-167，逻辑从旧 next_doc 原样搬入）。
+    fn matches(&mut self) -> io::Result<bool> {
+        debug_assert!(self.doc >= 0 && self.doc != NO_MORE_DOCS);
+        self.positions_match()
+    }
+    // advance: trait default（线性 next_candidate 循环，approximation
+    // 语义）；freq: 1（ConstantScore，trait default）。
 }
 
 // ── Roaring (inline term bitmap, M5 §2 croaring frozen view) ─────────

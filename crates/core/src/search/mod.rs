@@ -1650,4 +1650,44 @@ mod tests {
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
+
+    /// spec §2.5：Bool count 与迭代同结构——对每个形状 count == 逐 doc
+    /// 迭代总数；纯 MUST_NOT 锚点钉死 maxDoc − prohibited 捷径。
+    #[test]
+    fn bool_count_matches_iteration() {
+        let root = temp_dir("boolcount");
+        write_bool_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let w = |t: &str| Query::term("message", t);
+        let battery: Vec<Query> = vec![
+            Query::bool(vec![]),
+            Query::bool(vec![(Occur::Must, w("w0"))]),
+            Query::bool(vec![(Occur::Must, w("w0")), (Occur::Must, w("w1"))]),
+            Query::bool(vec![(Occur::Should, w("w0")), (Occur::Should, w("w1"))]),
+            Query::bool(vec![(Occur::Must, w("w0")), (Occur::Should, w("w1"))]),
+            Query::bool(vec![(Occur::Must, w("w0")), (Occur::MustNot, w("w1"))]),
+            Query::bool(vec![(Occur::MustNot, w("w1"))]),
+            Query::bool(vec![(Occur::MustNot, w("w1")), (Occur::MustNot, w("w2"))]),
+            Query::bool(vec![(Occur::MustNot, w("nosuch"))]),
+            Query::bool(vec![(Occur::Should, w("w0")), (Occur::MustNot, w("w1"))]),
+            Query::bool(vec![
+                (
+                    Occur::Must,
+                    Query::bool(vec![(Occur::Should, w("w0")), (Occur::Should, w("w2"))]),
+                ),
+                (Occur::MustNot, Query::bool(vec![(Occur::Must, w("w1"))])),
+            ]),
+        ];
+        for q in &battery {
+            let (total, _) = s.top_docs(q, 100).unwrap();
+            assert_eq!(s.count(q).unwrap(), total, "count == iteration for {q:?}");
+        }
+        // 纯 MUST_NOT 锚点：|w1|=6 → 14；|w1∪w2|=10（不相交）→ 10
+        let q = Query::bool(vec![(Occur::MustNot, w("w1"))]);
+        assert_eq!(s.count(&q).unwrap(), 14);
+        let q = Query::bool(vec![(Occur::MustNot, w("w1")), (Occur::MustNot, w("w2"))]);
+        assert_eq!(s.count(&q).unwrap(), 10);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

@@ -9,7 +9,7 @@ use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
 use super::doc_iter::DocIter;
-use super::query::{self, Query};
+use super::query::{self, bool_segment_count, Query};
 use super::reader::Reader;
 use super::roaring_exec;
 
@@ -97,6 +97,15 @@ impl Searcher {
                         total += 1;
                     }
                 }
+            }
+            return Ok(total);
+        }
+        // M6 §2.5: Bool count 与迭代同一结构——拍平形 roaring 快路径、纯
+        // MUST_NOT 走 maxDoc − prohibited、其余组合迭代计数（按段独立）。
+        if let Query::Bool { clauses } = query {
+            let mut total = 0u64;
+            for (_doc_base, seg) in self.reader.leaves() {
+                total += bool_segment_count(seg, clauses)?;
             }
             return Ok(total);
         }

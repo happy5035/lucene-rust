@@ -3,11 +3,12 @@
 
 use std::io;
 
+use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
 
 use super::doc_iter::{
-    ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, ExcludingDocIter,
-    MatchAllIter, PhraseDocIter, PointsDocIter, RoaringDocIter, SegmentDocIter,
+    ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, DocIter,
+    ExcludingDocIter, MatchAllIter, PhraseDocIter, PointsDocIter, RoaringDocIter, SegmentDocIter,
 };
 use super::multi_term;
 use super::roaring_exec;
@@ -504,4 +505,75 @@ fn disj_over(mut its: Vec<SegmentDocIter>) -> io::Result<Option<SegmentDocIter>>
         1 => Ok(its.pop()),
         _ => Ok(Some(SegmentDocIter::DisjOver(DisjOverDocIter::new(its)?))),
     }
+}
+
+/// spec §2.5 Bool per-segment count：与迭代同一结构——拍平形命中
+/// roaring count 快路径（档 1 cardinality 折叠 / 档 2 驱动计数）；纯
+/// MUST_NOT 走 maxDoc − prohibited count（避免全量迭代）；其余形状驱动
+/// 组合迭代器逐 doc 计数。
+pub(crate) fn bool_segment_count(
+    seg: &mut SegmentReader,
+    clauses: &[(Occur, Query)],
+) -> io::Result<u64> {
+    // 拍平快路径（§2.4 同形状）：roaring count；档 3 落档（None）与非
+    // 拍平形继续向下走通用路径。
+    let refs: Vec<(Occur, &Query)> = clauses.iter().map(|(o, q)| (*o, q)).collect();
+    if let Some((is_and, field, terms)) = flatten_bool(&refs) {
+        if terms.len() >= 2 {
+            let Some((has_freqs, entries)) =
+                roaring_exec::collect_bool_entries(seg, field, &terms, is_and)?
+            else {
+                return Ok(0); // 未知字段 / AND 缺子句 / OR 全缺 → 段内空
+            };
+            if let Some(c) = roaring_exec::count(seg, &entries, has_freqs, is_and)? {
+                return Ok(c);
+            }
+        }
+    }
+    // 纯 MUST_NOT（§2.2/§2.5）：MatchAll 排除，count = maxDoc − prohibited。
+    if !clauses.is_empty() && clauses.iter().all(|(o, _)| *o == Occur::MustNot) {
+        let prohibited = prohibited_count(seg, clauses)?;
+        return Ok(seg.max_doc() as u64 - prohibited);
+    }
+    // 通用：组合迭代器逐 doc 计数。
+    drive_count(bool_segment_iterator(seg, clauses, false)?)
+}
+
+/// 纯 MUST_NOT 的 prohibited 侧 count：子句换 SHOULD 视角取并集——拍平
+/// OR 形命中 roaring count 快路径，否则驱动 DisjOver（单子句直接驱动）。
+fn prohibited_count(seg: &mut SegmentReader, clauses: &[(Occur, Query)]) -> io::Result<u64> {
+    let as_should: Vec<(Occur, &Query)> = clauses.iter().map(|(_, q)| (Occur::Should, q)).collect();
+    if let Some((_, field, terms)) = flatten_bool(&as_should) {
+        if terms.len() >= 2 {
+            let Some((has_freqs, entries)) =
+                roaring_exec::collect_bool_entries(seg, field, &terms, false)?
+            else {
+                return Ok(0);
+            };
+            if let Some(c) = roaring_exec::count(seg, &entries, has_freqs, false)? {
+                return Ok(c);
+            }
+        }
+    }
+    let mut nots: Vec<SegmentDocIter> = Vec::new();
+    for (_, q) in clauses {
+        if let Some(it) = q.segment_iterator(seg, false)? {
+            nots.push(it);
+        }
+    }
+    drive_count(disj_over(nots)?)
+}
+
+/// 驱动迭代器到穷尽计数（None = 段内空）。
+fn drive_count(it: Option<SegmentDocIter>) -> io::Result<u64> {
+    let mut n = 0u64;
+    if let Some(mut it) = it {
+        loop {
+            if it.next_doc()? == NO_MORE_DOCS {
+                break;
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
 }

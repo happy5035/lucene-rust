@@ -355,17 +355,19 @@ pub(crate) fn point_range_bitmap(
 /// the M3 roaring temporaries into both arms pushed the
 /// Terms/Prefix/Wildcard → Or → Term rewrite chain over the 2MiB default
 /// test-thread stack. The bodies are the spec §5 three-tier rule, per arm.
-fn and_segment_iterator(
+/// M6 T-A：泛型化 `T: AsRef<[u8]>`——Bool 拍平（spec §2.4）借引用 terms
+/// 与 And/Or 的 `Vec<u8>` 共用同一函数体。
+fn and_segment_iterator<T: AsRef<[u8]>>(
     seg: &mut SegmentReader,
-    field: &String,
-    terms: &[Vec<u8>],
+    field: &str,
+    terms: &[T],
     needs_freq: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
     if terms.len() < 2 {
         return if let Some(t) = terms.first() {
             Query::Term {
-                field: field.clone(),
-                term: t.clone(),
+                field: field.to_string(),
+                term: t.as_ref().to_vec(),
             }
             .segment_iterator(seg, needs_freq)
         } else {
@@ -388,17 +390,17 @@ fn and_segment_iterator(
 }
 
 /// See `and_segment_iterator` — the Or half of the same rule.
-fn or_segment_iterator(
+fn or_segment_iterator<T: AsRef<[u8]>>(
     seg: &mut SegmentReader,
-    field: &String,
-    terms: &[Vec<u8>],
+    field: &str,
+    terms: &[T],
     needs_freq: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
     if terms.len() < 2 {
         return if let Some(t) = terms.first() {
             Query::Term {
-                field: field.clone(),
-                term: t.clone(),
+                field: field.to_string(),
+                term: t.as_ref().to_vec(),
             }
             .segment_iterator(seg, needs_freq)
         } else {

@@ -37,11 +37,13 @@ pub(crate) const SKEW_RATIO: u64 = 256; // bench-calibrated (T5): fold wins all 
 /// Collects the (df, entry) pairs of an And/Or's term clauses, df-sorted
 /// (conjunction cost order, same as the existing query.rs inline code).
 /// Returns (has_freqs, entries); None = empty segment result: unknown
-/// field, an absent AND clause, or no OR clause present.
-pub(crate) fn collect_bool_entries(
+/// field, an absent AND clause, or no OR clause present. M6 T-A：泛型化
+/// 到 `AsRef<[u8]>`——`Vec<u8>`（And/Or 平铺变体）与 `&[u8]`（Bool 拍平
+/// 的借引用 terms）同入口，单态化零成本。
+pub(crate) fn collect_bool_entries<T: AsRef<[u8]>>(
     seg: &mut SegmentReader,
     field: &str,
-    terms: &[Vec<u8>],
+    terms: &[T],
     is_and: bool,
 ) -> io::Result<Option<(bool, Vec<(u32, TermEntry)>)>> {
     let Some(has_freqs) = seg.field_has_freqs(field) else {
@@ -49,7 +51,7 @@ pub(crate) fn collect_bool_entries(
     };
     let mut entries = Vec::with_capacity(terms.len());
     for t in terms {
-        match seg.seek_term(field, t)? {
+        match seg.seek_term(field, t.as_ref())? {
             Some((_, entry)) => entries.push((entry.doc_freq, entry)),
             None => {
                 if is_and {

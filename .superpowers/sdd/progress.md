@@ -49,3 +49,7 @@ Task 8 (M7 终验): DONE
       * roaring/pfor phrase & bool QPS within ±3%, no regression between bitmap modes
   note: pre-M7 main baseline for phrase/bool count QPS is unavailable (phrase two-phase/bitmap and generic Bool count fold were introduced in M7); regression vs main could not be measured and is noted in the task report.
   deferred Minor (carried forward): cleanup error swallowed in abort paths (acceptable best-effort); RUST_MIN_STACK=4M global; SearchBench loadedBool naming; doc_values_read.rs other usize casts; postings::file_name pub; cleanup_segment_files prefix broad; no fsync after stale deletion; DisjOverHeapDocIter/DisjOverLinearDocIter dead-code warnings in release build.
+
+M7 final verification: complete (commits f8781f6..371d2f0, final whole-branch review approved)
+  verified: codec-lucene9 182 passed / 1 ignored; rustlucene-core 85 passed / 1 ignored; make log-test 7 variants green / 15 INTEROP_OK; searchbench three-way diff empty; release build clean
+  critical fixes resolved: DisjOverDocIter::advance two-phase confirmation; ExcludingDocIter prohibited matches confirmation

@@ -12,6 +12,7 @@ pub mod doc_writer;
 pub mod document;
 pub mod index_writer;
 pub mod json;
+pub mod merge;
 pub mod schema;
 pub mod search;
 pub mod segment_builder;

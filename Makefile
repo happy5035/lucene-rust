@@ -13,13 +13,16 @@ java-classes:
 interop-test: build java-classes
 	interop/verify-index.sh 2000 200 42
 
-# M2 log-schema interop: Rust logwrite vs JavaLogBench, CheckIndex + query diff
+# M2/M6 log-schema interop: Rust logwrite vs JavaLogBench, CheckIndex + query diff;
+# forcemerge variants write multi-segment indexes and merge them to one segment.
 log-test: build java-classes
 	interop/verify-log.sh 200000 42
 	interop/verify-log.sh 200000 43 --positions
 	interop/verify-log.sh 200000 44 --sparse
 	interop/verify-log.sh 200000 45 --bigdict
 	interop/verify-log.sh 200000 46 --bitmap
+	interop/verify-log.sh 200000 47 --forcemerge
+	interop/verify-log.sh 200000 48 --forcemerge-bitmap
 
 # M4 log-scenario benchmark: same corpus on both sides
 LOGDOCS ?= 1000000

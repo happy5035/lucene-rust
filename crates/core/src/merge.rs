@@ -6,7 +6,6 @@ use std::io;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos};
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::segment_info::SegmentInfo;
-use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
 use codec_lucene9::{DocValuesType, FSDirectory, IndexOptions};
 
 use crate::IndexWriterConfig;
@@ -18,11 +17,7 @@ use crate::search::{Query, Searcher};
 #[cfg(test)]
 use crate::{Document, FieldSpec, FieldValue, IndexWriter, Schema};
 #[cfg(test)]
-use codec_lucene9::segment_infos::random_id;
-#[cfg(test)]
 use std::fs;
-#[cfg(test)]
-use std::path::PathBuf;
 
 /// 多路已序字典归并：各自无符号字节序升序、段内无重复的输入 → 全局升序去重字典。
 /// （SortedDocValuesWriter 全局 ord 分配的对偶操作；Lucene 由
@@ -108,7 +103,6 @@ pub(crate) fn assert_field_infos_consistent(all: &[FieldInfos]) -> io::Result<()
 pub(crate) struct SegmentMergeSource {
     pub(crate) name: String,
     pub(crate) id: [u8; 16],
-    pub(crate) max_doc: i32,
     pub(crate) doc_base: u32,
     pub(crate) field_infos: FieldInfos,
 }
@@ -458,7 +452,6 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         sources.push(SegmentMergeSource {
             name: sci.info.name.clone(),
             id: sci.info.id,
-            max_doc: sci.info.doc_count,
             doc_base,
             field_infos: FieldInfos::new(fis.fields.clone()),
         });
@@ -698,7 +691,7 @@ mod tests {
     }
 
     use codec_lucene9::postings_read::PostingsReader;
-    use codec_lucene9::segment_infos::{random_id, SegmentInfos};
+    use codec_lucene9::segment_infos::{random_id, SegmentCommitInfo, SegmentInfos};
     use codec_lucene9::terms_read::TermsDict;
     use codec_lucene9::FieldInfos;
 
@@ -731,7 +724,6 @@ mod tests {
                 let s = SegmentMergeSource {
                     name: sci.info.name.clone(),
                     id: sci.info.id,
-                    max_doc: sci.info.doc_count,
                     doc_base,
                     field_infos: FieldInfos::read(dir, &sci.info.name, &sci.info.id, "").unwrap(),
                 };
@@ -1083,7 +1075,7 @@ mod tests {
             files.iter().all(|f| !f.starts_with("_2")),
             "orphans: {files:?}"
         );
-        let mut s = Searcher::open(&dir).unwrap();
+        let s = Searcher::open(&dir).unwrap();
         assert_eq!(s.segment_count(), 2);
         assert_eq!(s.max_doc(), 2);
         fs::remove_dir_all(&root).unwrap();

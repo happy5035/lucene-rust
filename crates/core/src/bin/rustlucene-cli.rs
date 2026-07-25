@@ -1129,6 +1129,8 @@ fn logbench(
 
 /// Single-writer log-schema indexing (the interop counterpart of JavaLogBench).
 /// `bitmap` = Some(threshold) → M3 §4 inline roaring bitmaps (experimental).
+/// `flush_every` = Some(n) → flush the active segment every n buffered docs
+/// (forces multi-segment commits, used by the forcemerge interop battery).
 fn logwrite(
     index_dir: &Path,
     num_docs: u32,
@@ -1137,12 +1139,16 @@ fn logwrite(
     sparse: bool,
     bigdict: bool,
     bitmap: Option<u32>,
+    flush_every: Option<u32>,
 ) -> std::io::Result<()> {
     let vocab = vocab();
     let mut config = IndexWriterConfig::default();
     if let Some(t) = bitmap {
         config.bitmap = true;
         config.bitmap_threshold = t;
+    }
+    if let Some(n) = flush_every {
+        config.max_buffered_docs = n.max(1);
     }
     let mut w = IndexWriter::create(index_dir, log_schema(positions, bigdict), config)?;
     let mut rng = XorShift::new(seed);
@@ -1504,7 +1510,8 @@ fn usage() -> ! {
     eprintln!("  rustlucene-cli write <indexDir> <numDocs> <docBytes> <seed> [goldenFile]");
     eprintln!("  rustlucene-cli bench <indexDir> <numDocs> <docBytes> <seed> [threads]");
     eprintln!("  rustlucene-cli index <inputFileOrDir> <indexDir> [--positions] [--docs N]");
-    eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions] [--sparse] [--bigdict] [--bitmap [--bitmap-threshold N]]");
+    eprintln!("  rustlucene-cli logwrite <indexDir> <numDocs> <seed> [--positions] [--sparse] [--bigdict] [--bitmap [--bitmap-threshold N]] [--flush-every N]");
+    eprintln!("  rustlucene-cli forcemerge <indexDir> [--bitmap] [--bitmap-threshold N]");
     eprintln!("  rustlucene-cli logbench <indexDir> <numDocs> <seed> [threads] [--positions]");
     eprintln!("  rustlucene-cli jsonindex <jsonlFile> <indexDir> <schemaSpec> [--docs N]");
     eprintln!("  rustlucene-cli jsongen <outFile> <numDocs> <seed>");
@@ -1575,25 +1582,34 @@ fn main() -> std::io::Result<()> {
             if args.len() < 5 {
                 usage();
             }
-            let positions = args[5..].iter().any(|a| a == "--positions");
-            let sparse = args[5..].iter().any(|a| a == "--sparse");
-            let bigdict = args[5..].iter().any(|a| a == "--bigdict");
-            let bitmap = if args[5..].iter().any(|a| a == "--bitmap") {
-                let threshold = args[5..]
-                    .windows(2)
-                    .find_map(|w| {
-                        (w[0] == "--bitmap-threshold")
-                            .then(|| w[1].parse::<u32>().unwrap_or_else(|_| usage()))
-                    })
-                    .unwrap_or(4096)
-                    // 读侧门槛固定 BITMAP_MIN_DF=4096：低于它的阈值只产永不探测的
-                    // 死字节（终审 Minor 1）；clamp 到 >=4096。高于 4096 会放宽档 2
-                    // 物化上界（df∈[4096,t) 的子句），正确性不受影响。
-                    .max(4096);
-                Some(threshold)
-            } else {
-                None
-            };
+            let mut positions = false;
+            let mut sparse = false;
+            let mut bigdict = false;
+            let mut bitmap_flag = false;
+            let mut bitmap_threshold: u32 = 4096;
+            let mut flush_every: Option<u32> = None;
+            let mut rest = args[5..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--positions" => positions = true,
+                    "--sparse" => sparse = true,
+                    "--bigdict" => bigdict = true,
+                    "--bitmap" => bitmap_flag = true,
+                    "--bitmap-threshold" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        bitmap_threshold = v.parse::<u32>().unwrap_or_else(|_| usage());
+                    }
+                    "--flush-every" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        flush_every = Some(v.parse::<u32>().unwrap_or_else(|_| usage()));
+                    }
+                    _ => usage(),
+                }
+            }
+            // 读侧门槛固定 BITMAP_MIN_DF=4096：低于它的阈值只产永不探测的
+            // 死字节（终审 Minor 1）；clamp 到 >=4096。高于 4096 会放宽档 2
+            // 物化上界（df∈[4096,t) 的子句），正确性不受影响。
+            let bitmap = bitmap_flag.then(|| bitmap_threshold.max(4096));
             logwrite(
                 Path::new(&args[2]),
                 args[3].parse().unwrap(),
@@ -1602,6 +1618,7 @@ fn main() -> std::io::Result<()> {
                 sparse,
                 bigdict,
                 bitmap,
+                flush_every,
             )
         }
         "jsonindex" => {
@@ -1644,6 +1661,29 @@ fn main() -> std::io::Result<()> {
                 threads,
                 positions,
             )
+        }
+        "forcemerge" => {
+            if args.len() < 3 {
+                usage();
+            }
+            let mut config = IndexWriterConfig::default();
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--bitmap" => config.bitmap = true,
+                    "--bitmap-threshold" => {
+                        config.bitmap_threshold = args[i + 1].parse().unwrap_or_else(|_| usage());
+                        i += 1;
+                    }
+                    _ => {
+                        eprintln!("unknown arg: {}", args[i]);
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            let dir = FSDirectory::open(Path::new(&args[2]))?;
+            rustlucene_core::merge::force_merge(&dir, &config)
         }
         "searchdump" => {
             if args.len() < 5 {

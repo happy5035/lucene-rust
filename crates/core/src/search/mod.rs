@@ -1,5 +1,5 @@
 //! Search read path (search spec §3): per-segment iteration, docID-ordered
-//! and count collectors, Term/MatchAll/Boolean/multi-term queries
+//! and count collectors, Term/MatchAll/Boolean(And/Or/Bool)/multi-term queries
 //! (ConstantScore semantics).
 
 pub mod bitset;
@@ -15,7 +15,7 @@ pub mod segment_reader;
 pub use bitset::FixedBitSet;
 pub use collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
 pub use doc_iter::{DocIter, MatchAllIter, SegmentDocIter};
-pub use query::Query;
+pub use query::{Occur, Query};
 pub use reader::Reader;
 pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
@@ -1358,5 +1358,25 @@ mod tests {
         assert_eq!(total, 10);
         assert_eq!(docs, (15..=24).collect::<Vec<i32>>());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M6 §2.1：Occur 三态 + Bool 变体的模型层（构造/匹配/Clone/Eq）。
+    #[test]
+    fn bool_query_model() {
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "w0")),
+            (Occur::Should, Query::term("level", "INFO")),
+            (Occur::MustNot, Query::MatchAll),
+        ]);
+        let Query::Bool { clauses } = &q else {
+            panic!("expected Bool variant");
+        };
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0].0, Occur::Must);
+        assert_eq!(clauses[1].0, Occur::Should);
+        assert_eq!(clauses[2].0, Occur::MustNot);
+        assert_eq!(clauses[2].1, Query::MatchAll);
+        let q2 = q.clone();
+        assert_eq!(q, q2);
     }
 }

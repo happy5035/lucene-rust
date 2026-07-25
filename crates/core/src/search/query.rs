@@ -1,5 +1,5 @@
-//! Query enum (search spec §3): Term, MatchAll, And, Or, Terms, Prefix,
-//! Wildcard, Phrase. All queries have ConstantScore semantics.
+//! Query enum (search spec §3 + M6 §2.1): Term, MatchAll, And, Or, Terms,
+//! Prefix, Wildcard, Phrase, Bool. All queries have ConstantScore semantics.
 
 use std::io;
 
@@ -12,6 +12,15 @@ use super::doc_iter::{
 use super::multi_term;
 use super::roaring_exec;
 use super::segment_reader::SegmentReader;
+
+/// Boolean clause occur (spec M6 §2.1)：MUST / SHOULD / MUST_NOT；
+/// FILTER 不做（ConstantScore 下与 MUST 等价，spec §0 拍板）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Occur {
+    Must,
+    Should,
+    MustNot,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Query {
@@ -44,6 +53,11 @@ pub enum Query {
         field: String,
         terms: Vec<Vec<u8>>,
     },
+    /// Nested Boolean query (spec M6 §2.1)：子查询可为任意变体（含 Bool
+    /// 自身），跨字段。执行语义见 §2.2，拍平规则见 §2.4。
+    Bool {
+        clauses: Vec<(Occur, Query)>,
+    },
     /// 1D point range (M6 spec §3.1), LongPoint/IntPoint `newRangeQuery`
     /// semantics: both ends inclusive; `low > high` is rejected with
     /// `Err(InvalidInput)` at execution (跨任务钉死接口).
@@ -72,6 +86,12 @@ impl Query {
             field: field.to_string(),
             terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect(),
         }
+    }
+
+    /// Nested Boolean query (spec M6 §2.1)。And/Or 平铺变体保留不删
+    /// （bench 与电池在用）；新查询一律用 Bool。
+    pub fn bool(clauses: Vec<(Occur, Query)>) -> Query {
+        Query::Bool { clauses }
     }
 
     /// Terms(IN) — Boolean SHOULD sugar (spec M2 §1): the doc union of the
@@ -239,6 +259,7 @@ impl Query {
                 };
                 Ok(Some(SegmentDocIter::Points(PointsDocIter::new(bm))))
             }
+            Query::Bool { .. } => unimplemented!("Bool segment_iterator lands in Task A Step 4"),
         }
     }
 }

@@ -13,10 +13,12 @@ use std::io;
 
 #[cfg(test)]
 use crate::codec_util::index_header_length;
-use crate::codec_util::{write_footer, write_index_header};
+use crate::codec_util::{
+    check_footer, check_footer_structure, check_index_header, write_footer, write_index_header,
+};
 use crate::directory::FSDirectory;
-use crate::io::ChecksumIndexOutput;
-use crate::packed::direct_monotonic_write;
+use crate::io::{ChecksumIndexOutput, DataInput};
+use crate::packed::{DirectMonotonicReader, direct_monotonic_write};
 
 /// Lucene90StoredFieldsFormat.Mode.BEST_SPEED parameters
 /// (Lucene90StoredFieldsFormat.java:157-172,182-185).
@@ -595,10 +597,213 @@ pub struct StoredFieldsStats {
     pub fdm_name: String,
 }
 
+/// `.fdx/.fdm` 块索引读（FieldsIndexReader 对偶；Lucene90CompressingStoredFieldsReader
+/// 构造路径；M6 T-C stored 裸拷贝专用，spec §4.2/§4.3）。打开时解析全部元数据，
+/// 两个 DirectMonotonic 序列（docs 累计数 / chunk 起始 fp）的原件驻内存，
+/// get 时现场重建 view。
+pub struct StoredFieldsIndexReader {
+    block_shift: u32,
+    num_chunks: usize,
+    docs_meta: Vec<u8>,
+    docs_data: Vec<u8>,
+    sp_meta: Vec<u8>,
+    sp_data: Vec<u8>,
+}
+
+/// 从 .fdm 流内读一个 DirectMonotonic 的 meta 区（内联 21B/块；
+/// DirectMonotonicReader.Meta 构造的块数公式，packed.rs:237-241）。
+fn read_dm_meta(
+    fdm: &mut crate::io::ChecksumIndexInput,
+    num_values: usize,
+    block_shift: u32,
+) -> io::Result<Vec<u8>> {
+    let num_blocks = if num_values == 0 {
+        0
+    } else {
+        (num_values - 1) >> block_shift
+    } + 1;
+    let mut meta = vec![0u8; num_blocks * DirectMonotonicReader::META_RECORD_BYTES];
+    fdm.read_bytes(&mut meta)?;
+    Ok(meta)
+}
+
+impl StoredFieldsIndexReader {
+    /// 解析 .fdm 全部元数据 + 从 .fdx 切出两个 DM 数据区
+    /// （布局对照写侧 finish，stored_fields.rs:482-573）。
+    pub fn open(dir: &FSDirectory, segment: &str, segment_id: &[u8; 16]) -> io::Result<Self> {
+        let [_fdt_name, fdx_name, fdm_name] = file_names(segment, "");
+        let mut fdm = dir.open_checksum_input(&fdm_name)?;
+        check_index_header(
+            &mut fdm,
+            &format!("{INDEX_CODEC_NAME}Meta"),
+            FDT_VERSION,
+            FDT_VERSION,
+            segment_id,
+            "",
+        )?;
+        let chunk_size = fdm.read_vint()?;
+        if chunk_size != CHUNK_SIZE as i32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("chunkSize {chunk_size} != {CHUNK_SIZE}"),
+            ));
+        }
+        let num_docs = fdm.read_int()?;
+        let block_shift = fdm.read_int()? as u32;
+        let total_values = fdm.read_int()? as usize; // totalChunks + 1
+        if total_values == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt fdm: totalChunks + 1 == 0",
+            ));
+        }
+        let docs_sp = fdm.read_long()? as u64;
+        let docs_meta = read_dm_meta(&mut fdm, total_values, block_shift)?;
+        let sp_sp = fdm.read_long()? as u64;
+        let sp_meta = read_dm_meta(&mut fdm, total_values, block_shift)?;
+        let sp_end = fdm.read_long()? as u64;
+        let _max_pointer = fdm.read_long()? as u64;
+        let _num_chunks = fdm.read_vlong()?;
+        let _num_dirty_chunks = fdm.read_vlong()?;
+        let _num_dirty_docs = fdm.read_vlong()?;
+        check_footer(&mut fdm)?;
+
+        // .fdx：header 之后是两段 DM packed data，sp_end 即数据区末尾（写侧
+        // finish 随即 write_footer，stored_fields.rs:549-552）。
+        let mut fdx_in = dir.open_input(&fdx_name)?;
+        check_index_header(
+            &mut fdx_in,
+            &format!("{INDEX_CODEC_NAME}Idx"),
+            FIELDS_INDEX_VERSION,
+            FIELDS_INDEX_VERSION,
+            segment_id,
+            "",
+        )?;
+        let header_len = fdx_in.file_pointer();
+        check_footer_structure(&fdx_in, fdx_in.length())?;
+        let mut fdx = vec![0u8; (fdx_in.length() - header_len - 16) as usize]; // 16 = footer
+        fdx_in.read_bytes(&mut fdx)?;
+        let rel = |fp: u64| (fp - header_len) as usize;
+        let reader = StoredFieldsIndexReader {
+            block_shift,
+            num_chunks: total_values - 1,
+            docs_data: fdx[rel(docs_sp)..rel(sp_sp)].to_vec(),
+            docs_meta,
+            sp_data: fdx[rel(sp_sp)..rel(sp_end)].to_vec(),
+            sp_meta,
+        };
+        // docs DM 末值 == numDocs（写侧 debug_assert，stored_fields.rs:523）
+        debug_assert_eq!(
+            reader.docs_dm().get(total_values as u64 - 1),
+            num_docs as u64
+        );
+        Ok(reader)
+    }
+
+    fn docs_dm(&self) -> DirectMonotonicReader<'_> {
+        DirectMonotonicReader::new(
+            &self.docs_meta,
+            &self.docs_data,
+            self.num_chunks + 1,
+            self.block_shift,
+        )
+        .expect("meta length checked at open")
+    }
+
+    fn sp_dm(&self) -> DirectMonotonicReader<'_> {
+        DirectMonotonicReader::new(
+            &self.sp_meta,
+            &self.sp_data,
+            self.num_chunks + 1,
+            self.block_shift,
+        )
+        .expect("meta length checked at open")
+    }
+
+    pub fn num_chunks(&self) -> usize {
+        self.num_chunks
+    }
+
+    /// chunk 内文档数 = docsDM[chunk+1] - docsDM[chunk]。
+    pub fn chunk_doc_count(&self, chunk: usize) -> i32 {
+        let dm = self.docs_dm();
+        (dm.get(chunk as u64 + 1) - dm.get(chunk as u64)) as i32
+    }
+
+    /// chunk 在 .fdt 中的字节区间 [start, end)；末块 end == maxPointer
+    /// （sp DM 末值即 maxPointer，写侧 stored_fields.rs:536-540）。
+    pub fn chunk_byte_range(&self, chunk: usize) -> (u64, u64) {
+        let sp = self.sp_dm();
+        (sp.get(chunk as u64), sp.get(chunk as u64 + 1))
+    }
+}
+
+impl StoredFieldsWriter {
+    #[cfg(test)]
+    fn force_flush_for_test(&mut self) {
+        self.flush(true).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::IndexOutput;
+    use crate::directory::FSDirectory;
+    use crate::io::{DataInput, IndexOutput};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codec-lucene9-stored-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// 写三个 chunk（2+2+1 docs），用新 reader 复读块索引。
+    #[test]
+    fn index_reader_chunk_layout() {
+        let root = temp_dir("idxread");
+        let dir = FSDirectory::open(&root).unwrap();
+        let id = [9u8; 16];
+        let mut w = StoredFieldsWriter::new(&dir, "_0", id, "").unwrap();
+        // chunk 1: docs 0,1（每 doc 一个小字符串字段）
+        for d in 0..5 {
+            w.write_document(&[(0, StoredField::String(format!("doc-{d}")))])
+                .unwrap();
+            if d == 1 || d == 3 {
+                w.force_flush_for_test(); // Step 4 在 impl 里新增的 #[cfg(test)] flush(true) 出口
+            }
+        }
+        let stats = w.finish(5, &dir).unwrap();
+        assert_eq!(stats.num_chunks, 3);
+
+        let idx = StoredFieldsIndexReader::open(&dir, "_0", &id).unwrap();
+        assert_eq!(idx.num_chunks(), 3);
+        assert_eq!(idx.chunk_doc_count(0), 2);
+        assert_eq!(idx.chunk_doc_count(1), 2);
+        assert_eq!(idx.chunk_doc_count(2), 1);
+
+        // 字节区间单调递增且末块终点 = maxPointer；逐块头部 (docBase, code) 校验
+        let mut fdt = dir.open_input("_0.fdt").unwrap();
+        let mut prev_end = 0;
+        let mut doc_base = 0;
+        for c in 0..idx.num_chunks() {
+            let (start, end) = idx.chunk_byte_range(c);
+            assert!(start >= prev_end && end > start);
+            prev_end = end;
+            fdt.seek(start).unwrap();
+            assert_eq!(fdt.read_vint().unwrap(), doc_base);
+            let code = fdt.read_vint().unwrap();
+            assert_eq!(code >> 2, idx.chunk_doc_count(c));
+            assert_eq!(code & 1, 0, "never sliced (small docs)");
+            doc_base += idx.chunk_doc_count(c);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     fn ints_bytes(values: &[i32]) -> Vec<u8> {
         let mut out = ChecksumIndexOutput::new(IndexOutput::in_memory());

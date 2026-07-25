@@ -31,6 +31,13 @@ pub trait DocIter {
     fn freq(&self) -> u32 {
         1
     }
+    /// 两阶段确认（M7 §2.1，Lucene TwoPhaseIterator.matches）：对
+    /// next_doc/advance 返回的当前候选做昂贵验证；默认 Ok(true) = 单阶段
+    /// 迭代器。返回 false 后调用方以 next_doc() 推进（候选已消费）；
+    /// 对同一候选 doc 至多调用一次。
+    fn matches(&mut self) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 // ── MatchAll ──────────────────────────────────────────────────────────
@@ -999,8 +1006,26 @@ impl DocIter for ConjOverDocIter {
                 }
             }
             if matched {
-                self.doc = candidate;
-                return Ok(candidate);
+                // M7 §2.3：approximation 对齐后逐个 confirmation（Lucene
+                // ConjunctionScorer 同款）；任一 false → 推进停在
+                // candidate 的子句（含已确认的）后重新对齐。
+                let mut all_match = true;
+                for s in &mut self.sub {
+                    if !s.matches()? {
+                        all_match = false;
+                        break;
+                    }
+                }
+                if all_match {
+                    self.doc = candidate;
+                    return Ok(candidate);
+                }
+                for s in &mut self.sub {
+                    if s.doc_id() == candidate && s.next_doc()? == NO_MORE_DOCS {
+                        self.doc = NO_MORE_DOCS;
+                        return Ok(NO_MORE_DOCS);
+                    }
+                }
             }
         }
     }
@@ -1053,15 +1078,37 @@ impl DocIter for DisjOverDocIter {
                 }
             }
         }
-        let mut best = NO_MORE_DOCS;
-        for s in &self.sub {
-            let d = s.doc_id();
-            if d != NO_MORE_DOCS && d < best {
-                best = d;
+        loop {
+            let mut best = NO_MORE_DOCS;
+            for s in &self.sub {
+                let d = s.doc_id();
+                if d != NO_MORE_DOCS && d < best {
+                    best = d;
+                }
+            }
+            if best == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(NO_MORE_DOCS);
+            }
+            // M7 §2.3：对停在 best 的子句逐个 confirmation；至少一个
+            // true → 命中（短路，省掉其余子句的确认成本）。
+            let mut any = false;
+            for s in &mut self.sub {
+                if s.doc_id() == best && s.matches()? {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                self.doc = best;
+                return Ok(best);
+            }
+            for s in &mut self.sub {
+                if s.doc_id() == best {
+                    s.next_doc()?;
+                }
             }
         }
-        self.doc = best;
-        Ok(best)
     }
     fn advance(&mut self, target: i32) -> io::Result<i32> {
         if self.doc >= target {
@@ -1113,7 +1160,7 @@ impl ExcludingDocIter {
                 self.doc = NO_MORE_DOCS;
                 return Ok(NO_MORE_DOCS);
             }
-            if self.prohibited.advance(d)? != d {
+            if self.prohibited.advance(d)? != d && self.main.matches()? {
                 self.doc = d;
                 return Ok(d);
             }
@@ -1233,6 +1280,12 @@ impl DocIter for SegmentDocIter {
             Self::And(a) => a.freq(),
             Self::Or(o) => o.freq(),
             _ => 1,
+        }
+    }
+    fn matches(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Phrase(p) => p.matches(),
+            _ => Ok(true),
         }
     }
 }

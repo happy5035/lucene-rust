@@ -46,6 +46,9 @@ impl Searcher {
                 if doc == NO_MORE_DOCS {
                     break;
                 }
+                if !iter.matches()? {
+                    continue;
+                }
                 let freq = if needs_freq { iter.freq() } else { 1 };
                 collector.collect(doc_base + doc, freq);
             }

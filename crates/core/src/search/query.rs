@@ -572,6 +572,9 @@ fn drive_count(it: Option<SegmentDocIter>) -> io::Result<u64> {
             if it.next_doc()? == NO_MORE_DOCS {
                 break;
             }
+            if !it.matches()? {
+                continue;
+            }
             n += 1;
         }
     }

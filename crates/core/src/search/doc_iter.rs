@@ -364,6 +364,13 @@ impl DocIter for BitsetDocIter {
 
 // ── Phrase (slop=0) ─────────────────────────────────────────────────────
 
+/// phrase approximation 源（M7 §2.2）：全 term 有内联 bitmap 时 roaring
+/// AND 物化候选序列（µs 级，比 PFOR 合取快）；否则 postings 合取舞蹈。
+enum PhraseApprox {
+    Postings,
+    Bitmap { docs: Vec<u32>, cursor: usize },
+}
+
 /// One phrase term occurrence: an independent EverythingEnum + its offset
 /// in the phrase. Repeated terms get independent enums, which makes them
 /// naturally correct (spec M2 §6; PhrasePositions :24-58).
@@ -378,6 +385,7 @@ struct Occurrence {
 /// occurrence's positions (ExactPhraseMatcher :138-167).
 pub struct PhraseDocIter {
     occ: Vec<Occurrence>, // df-ascending (conjunction cost order)
+    approx: PhraseApprox,
     doc: i32,
     lead: usize,
 }
@@ -412,22 +420,46 @@ impl PhraseDocIter {
                 ),
             ));
         }
-        let mut sought: Vec<(u32, u32, PositionsEnum)> = Vec::with_capacity(terms.len());
+        let mut sought: Vec<(u32, u32, TermEntry)> = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
             let Some((_, entry)) = seg.seek_term(field, t)? else {
                 return Ok(None); // absent term: no hits (PhraseWeight null scorer)
             };
-            sought.push((entry.doc_freq, i as u32, seg.positions_enum(&entry)?));
+            sought.push((entry.doc_freq, i as u32, entry));
         }
-        // conjunction lead = cheapest enum first; offsets travel with their
-        // enum, so phrase semantics are unaffected
         sought.sort_by_key(|(df, _, _)| *df);
-        let occ = sought
-            .into_iter()
-            .map(|(_, offset, en)| Occurrence { en, offset })
-            .collect();
+        // M7 §2.2 bitmap 候选快路径：全部 term 有内联 bitmap → roaring
+        // AND 物化候选序列；任一缺失 → postings 合取 approximation。
+        let mut views: Vec<FrozenBitmap> = Vec::with_capacity(sought.len());
+        let mut all_bitmap = true;
+        for (_, _, entry) in &sought {
+            match seg.open_term_bitmap(entry)? {
+                Some(v) => views.push(v),
+                None => {
+                    all_bitmap = false;
+                    break;
+                }
+            }
+        }
+        let approx = if all_bitmap {
+            let refs: Vec<&FrozenBitmap> = views.iter().collect();
+            PhraseApprox::Bitmap {
+                docs: codec_lucene9::roaring::intersect_docs(&refs),
+                cursor: 0,
+            }
+        } else {
+            PhraseApprox::Postings
+        };
+        let mut occ: Vec<Occurrence> = Vec::with_capacity(sought.len());
+        for (_, offset, entry) in sought {
+            occ.push(Occurrence {
+                en: seg.positions_enum(&entry)?,
+                offset,
+            });
+        }
         Ok(Some(PhraseDocIter {
             occ,
+            approx,
             doc: -1,
             lead: 0,
         }))
@@ -466,6 +498,7 @@ impl PhraseDocIter {
     /// （ConjunctionDISI 舞蹈），**不解码位置**——候选直接返回，位置
     /// 验证推迟到 matches()。
     fn next_candidate(&mut self) -> io::Result<i32> {
+        debug_assert!(matches!(self.approx, PhraseApprox::Postings));
         if self.doc >= 0 {
             for o in &mut self.occ {
                 if o.en.doc_id() == self.doc && o.en.next_doc()? == NO_MORE_DOCS {
@@ -525,13 +558,40 @@ impl DocIter for PhraseDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
-        self.next_candidate()
+        match &mut self.approx {
+            PhraseApprox::Postings => self.next_candidate(),
+            PhraseApprox::Bitmap { docs, cursor } => {
+                if self.doc >= 0 {
+                    *cursor += 1;
+                }
+                match docs.get(*cursor) {
+                    Some(&d) => {
+                        self.doc = d as i32;
+                        Ok(self.doc)
+                    }
+                    None => {
+                        self.doc = NO_MORE_DOCS;
+                        Ok(NO_MORE_DOCS)
+                    }
+                }
+            }
+        }
     }
 
     /// 两阶段确认（M7 §2.2）：对当前候选解码位置并验证
     /// （ExactPhraseMatcher :138-167，逻辑从旧 next_doc 原样搬入）。
     fn matches(&mut self) -> io::Result<bool> {
         debug_assert!(self.doc >= 0 && self.doc != NO_MORE_DOCS);
+        for o in &mut self.occ {
+            if o.en.doc_id() != self.doc {
+                // bitmap approximation：positions enum 尚未定位——advance
+                // 对齐（跳表，非逐 doc）；近似集 ⊆ 各 term doc 集，必命中。
+                let d = o.en.advance(self.doc)?;
+                if d != self.doc {
+                    return Ok(false); // 防御（不变量破坏时宁可漏不可错）
+                }
+            }
+        }
         self.positions_match()
     }
     // advance: trait default（线性 next_candidate 循环，approximation

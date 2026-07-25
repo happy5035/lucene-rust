@@ -1757,4 +1757,53 @@ mod tests {
         assert_eq!(s.count(&q).unwrap(), 2);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// M7 T-A3：phrase bitmap 候选快路径等价——hot/warm df=5000 ≥ 4096
+    /// （bitmap 索引上两者都有内联 bitmap → roaring AND approximation），
+    /// 与 bitmap off 索引（postings 合取 approximation）逐位一致。
+    fn write_phrase_bitmap_corpus(root: &std::path::Path, bitmap: bool) {
+        let mut cfg = IndexWriterConfig::default();
+        cfg.bitmap = bitmap;
+        let mut w = IndexWriter::create(root, schema_pos(), cfg).unwrap();
+        for i in 0..5000u32 {
+            let msg = if i % 3 == 0 { "hot warm" } else { "hot x warm" };
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), msg)).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+    }
+
+    #[test]
+    fn phrase_bitmap_approx_equivalence() {
+        let root_off = temp_dir("phbmoff");
+        let root_on = temp_dir("phbmon");
+        write_phrase_bitmap_corpus(&root_off, false);
+        write_phrase_bitmap_corpus(&root_on, true);
+        let dir_off = FSDirectory::open(&root_off).unwrap();
+        let mut s_off = Searcher::open(&dir_off).unwrap();
+        let dir_on = FSDirectory::open(&root_on).unwrap();
+        let mut s_on = Searcher::open(&dir_on).unwrap();
+        let battery: Vec<Query> = vec![
+            Query::phrase("message", &["hot", "warm"]),          // 1667（i%3==0）
+            Query::phrase("message", &["hot", "x"]),             // 3333
+            Query::bool(vec![
+                (Occur::Must, Query::phrase("message", &["hot", "warm"])),
+                (Occur::Must, Query::term("level", "INFO")),
+            ]),
+            Query::bool(vec![
+                (Occur::Must, Query::phrase("message", &["hot", "warm"])),
+                (Occur::MustNot, Query::term("tid", "tid-7")),
+            ]),
+        ];
+        for q in &battery {
+            let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
+            let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
+            assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
+            assert_eq!(s_off.count(q).unwrap(), s_on.count(q).unwrap(), "count {q:?}");
+        }
+        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "warm"])).unwrap(), 1667);
+        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "x"])).unwrap(), 3333);
+        fs::remove_dir_all(&root_off).unwrap();
+        fs::remove_dir_all(&root_on).unwrap();
+    }
 }

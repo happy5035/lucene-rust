@@ -42,6 +42,9 @@ const MAX_BLOCK: usize = 48;
 pub(crate) const OUTPUT_FLAG_IS_FLOOR: u64 = 0x1;
 pub(crate) const OUTPUT_FLAG_HAS_TERMS: u64 = 0x2;
 
+/// Segment postings filename, e.g. `_0_Lucene912_0.doc`.
+/// Kept `pub` because `rustlucene-core::merge` needs to probe for the `.doc`
+/// file before opening a per-field postings reader.
 pub fn file_name(segment: &str, ext: &str) -> String {
     format!("{segment}_{SEGMENT_SUFFIX}.{ext}")
 }

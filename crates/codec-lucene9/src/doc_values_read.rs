@@ -16,6 +16,7 @@ use crate::io::{ChecksumIndexInput, DataInput, IndexInput};
 use crate::packed::{DirectMonotonicReader, DirectReader};
 
 /// Lucene90DocValuesProducer.readNumeric (:197-224) 的归并子集。
+#[derive(Debug)]
 struct NumericMeta {
     docs_offset: i64, // -2 = 全空；-1 = 稠密；否则 DISI 区起点（.dvd 绝对 fp）
     docs_length: i64,
@@ -29,6 +30,7 @@ struct NumericMeta {
 
 /// readTermDict (:278-299)：ords 子条目 + terms dict 元数据。
 /// terms reverse index 的偏移量读入即弃（归并不需要点查）。
+#[derive(Debug)]
 struct SortedMeta {
     ords: NumericMeta,
     dict_size: u64,
@@ -40,11 +42,13 @@ struct SortedMeta {
     terms_addresses_length: i64,
 }
 
+#[derive(Debug)]
 enum DvEntry {
     Numeric(NumericMeta),
     Sorted(SortedMeta),
 }
 
+#[derive(Debug)]
 pub struct DocValuesReader {
     /// .dvd header 之后的全部字节（footer 除外）；归并逐字段顺序消费。
     dvd: Vec<u8>,
@@ -192,9 +196,39 @@ impl DocValuesReader {
     }
 
     /// meta 里的 offset 是 .dvd 绝对 fp；self.dvd 以 header 末尾为 0 基。
-    fn slice(&self, offset: i64, length: i64) -> &[u8] {
-        let start = (offset as u64 - self.header_len) as usize;
-        &self.dvd[start..start + length as usize]
+    fn slice(&self, offset: i64, length: i64) -> io::Result<&[u8]> {
+        if offset < 0 || length < 0 {
+            return Err(corrupt("negative DV slice bounds"));
+        }
+        let start = (offset as u64)
+            .checked_sub(self.header_len)
+            .ok_or_else(|| corrupt("DV offset before data"))? as usize;
+        let end = start + length as usize;
+        if end > self.dvd.len() {
+            return Err(corrupt(format!(
+                "DV slice [{}, {}) exceeds dvd length {}",
+                start,
+                end,
+                self.dvd.len()
+            )));
+        }
+        Ok(&self.dvd[start..end])
+    }
+
+    /// 读取 region 中 [p, p+2) 的 LE u16，越界时返回 InvalidData。
+    fn read_u16_le(region: &[u8], p: usize) -> io::Result<u16> {
+        if p + 2 > region.len() {
+            return Err(corrupt("truncated DISI u16"));
+        }
+        Ok(u16::from_le_bytes(region[p..p + 2].try_into().unwrap()))
+    }
+
+    /// 读取 region 中 [p, p+8) 的 LE u64，越界时返回 InvalidData。
+    fn read_u64_le(region: &[u8], p: usize) -> io::Result<u64> {
+        if p + 8 > region.len() {
+            return Err(corrupt("truncated DISI u64"));
+        }
+        Ok(u64::from_le_bytes(region[p..p + 8].try_into().unwrap()))
     }
 
     fn numeric_meta(&self, field_number: i32) -> Option<&NumericMeta> {
@@ -230,28 +264,34 @@ impl DocValuesReader {
         if m.docs_offset == -1 {
             return Ok((0..m.num_values as u32).collect());
         }
-        let region = self.slice(m.docs_offset, m.docs_length);
-        let le_u16 = |p: usize| u16::from_le_bytes(region[p..p + 2].try_into().unwrap());
+        let region = self.slice(m.docs_offset, m.docs_length)?;
         let mut docs = Vec::with_capacity(m.num_values as usize);
         let mut pos = 0usize;
         loop {
-            let block_id = le_u16(pos) as u32;
-            let cardinality = le_u16(pos + 2) as u32 + 1;
+            if pos + 4 > region.len() {
+                return Err(corrupt("truncated DISI block header"));
+            }
+            let block_id = Self::read_u16_le(region, pos)? as u32;
+            let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
             pos += 4;
             if block_id == DISI_SENTINEL_BLOCK {
                 break;
             }
             if cardinality <= DISI_MAX_ARRAY_LENGTH {
                 for _ in 0..cardinality {
-                    docs.push((block_id << 16) | le_u16(pos) as u32);
+                    docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
                     pos += 2;
                 }
             } else if cardinality == DISI_BLOCK_SIZE {
                 docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
             } else {
+                // DENSE: 256B rank table + 1024 LE longs
+                if pos + 256 + 1024 * 8 > region.len() {
+                    return Err(corrupt("truncated DISI dense block"));
+                }
                 pos += 256; // rank table
                 for word_index in 0..1024usize {
-                    let mut w = u64::from_le_bytes(region[pos..pos + 8].try_into().unwrap());
+                    let mut w = Self::read_u64_le(region, pos)?;
                     pos += 8;
                     while w != 0 {
                         let bit = w.trailing_zeros();
@@ -267,23 +307,29 @@ impl DocValuesReader {
 
     /// 值流：bpv==0 → vec![min; num_values]（producer :487-493）；否则
     /// DirectReader 逐值 `min + gcd * get(i)`（:527-534；gcd 恒 1 按通用解）。
-    fn read_values(&self, m: &NumericMeta) -> Vec<i64> {
+    fn read_values(&self, m: &NumericMeta) -> io::Result<Vec<i64>> {
         if m.bpv == 0 {
-            return vec![m.min; m.num_values as usize];
+            return Ok(vec![m.min; m.num_values as usize]);
         }
-        let reader = DirectReader::new(
-            self.slice(m.values_offset, m.values_length),
-            m.bpv as u32,
-            0,
-        )
-        .expect("writer-supported bpv");
-        (0..m.num_values)
+        let data = self.slice(m.values_offset, m.values_length)?;
+        // 校验数据区足够容纳 num_values 个值（bpv 位/值，offset=0）。
+        let bits_needed = m.num_values * m.bpv as u64;
+        let bytes_needed = (bits_needed + 7) / 8;
+        if data.len() < bytes_needed as usize {
+            return Err(corrupt(format!(
+                "numeric values truncated: need {} bytes, have {}",
+                bytes_needed,
+                data.len()
+            )));
+        }
+        let reader = DirectReader::new(data, m.bpv as u32, 0)?;
+        Ok((0..m.num_values)
             .map(|i| {
                 (reader.get(i) as i64)
                     .wrapping_mul(m.gcd)
                     .wrapping_add(m.min)
             })
-            .collect()
+            .collect())
     }
 
     /// 逐 doc (doc, value)，doc 升序。全空 → 空 Vec。
@@ -295,7 +341,7 @@ impl DocValuesReader {
             ));
         };
         let docs = self.read_docs_with_field(m)?;
-        let values = self.read_values(m);
+        let values = self.read_values(m)?;
         debug_assert_eq!(docs.len(), values.len());
         Ok(docs.into_iter().zip(values).collect())
     }
@@ -309,7 +355,7 @@ impl DocValuesReader {
             ));
         };
         let docs = self.read_docs_with_field(&s.ords)?;
-        let values = self.read_values(&s.ords);
+        let values = self.read_values(&s.ords)?;
         Ok(docs
             .into_iter()
             .zip(values)
@@ -334,11 +380,11 @@ impl DocValuesReader {
         let num_blocks = (s.dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE);
         let addrs = DirectMonotonicReader::new(
             &s.addresses_meta,
-            self.slice(s.terms_addresses_offset, s.terms_addresses_length),
+            self.slice(s.terms_addresses_offset, s.terms_addresses_length)?,
             num_blocks,
             s.block_shift,
         )?;
-        let data = self.slice(s.terms_data_offset, s.terms_data_length);
+        let data = self.slice(s.terms_data_offset, s.terms_data_length)?;
         let mut terms = Vec::with_capacity(s.dict_size as usize);
         for b in 0..num_blocks {
             let start = addrs.get(b as u64) as usize;
@@ -347,6 +393,9 @@ impl DocValuesReader {
             } else {
                 data.len()
             };
+            if start > end || end > data.len() {
+                return Err(corrupt("terms dict block bounds"));
+            }
             let region = &data[start..end];
             let mut r = IndexInput::in_memory(region.to_vec());
             let first_len = r.read_vint()? as usize;
@@ -357,7 +406,11 @@ impl DocValuesReader {
                 (s.dict_size as usize - b * TERMS_DICT_BLOCK_SIZE).min(TERMS_DICT_BLOCK_SIZE);
             if block_count > 1 {
                 let uncompressed = r.read_vint()? as usize;
-                let mut compressed = vec![0u8; region.len() - r.file_pointer() as usize];
+                let consumed = r.file_pointer() as usize;
+                if consumed > region.len() {
+                    return Err(corrupt("terms dict compressed length overflow"));
+                }
+                let mut compressed = vec![0u8; region.len() - consumed];
                 r.read_bytes(&mut compressed)?;
                 let decompressed = lz4::block::decompress(&compressed, Some(uncompressed as i32))
                     .map_err(|e| corrupt(format!("terms dict lz4: {e}")))?;
@@ -472,6 +525,104 @@ mod tests {
         let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
         assert!(r.sorted_dict(1).unwrap().is_empty());
         assert!(r.sorted_ords(1).unwrap().is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- corrupt-data tests: must return InvalidData, not panic ----
+
+    use crate::codec_util::index_header_length;
+
+    fn dvm_bpv_offset() -> usize {
+        // header + field_number(i32) + type(u8) + docs_offset(i64) + docs_length(i64)
+        // + jump_table_entry_count(i16) + dense_rank_power(i8) + num_values(i64) + table_size(i32)
+        index_header_length(META_CODEC, SUFFIX) + 4 + 1 + 8 + 8 + 2 + 1 + 8 + 4
+    }
+
+    /// 修改 .dvm 内容后重算 footer CRC（覆盖 0..len-8）。
+    fn rewrite_dvm_crc(bytes: &mut [u8]) {
+        let n = bytes.len();
+        let crc = crate::codec_util::crc32(&bytes[..n - 8]);
+        bytes[n - 8..].copy_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn corrupt_dvd_truncated_open_fails() {
+        let root = write_index("corrupt-open", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [dvd_name, _dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvd_path = root.join(&dvd_name);
+        let header_len = index_header_length(DATA_CODEC, SUFFIX) as u64;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dvd_path)
+            .unwrap();
+        f.set_len(header_len + 1).unwrap();
+        let dir = FSDirectory::open(&root).unwrap();
+        let err = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_bpv_numeric_values_fails() {
+        let root = write_index("corrupt-bpv", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        bytes[dvm_bpv_offset()] = 7; // unsupported bpv
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.numeric_values(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_docs_length_numeric_values_fails() {
+        let root = write_index("corrupt-disi", |w| {
+            w.add_numeric_field(0, 100, &[(0, 1), (50, 2)]).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        // docs_length is right after docs_offset in the numeric meta.
+        let docs_length_offset = index_header_length(META_CODEC, SUFFIX) + 4 + 1 + 8;
+        bytes[docs_length_offset..docs_length_offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.numeric_values(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_bpv_sorted_ords_fails() {
+        let dict: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = (0..20u32).map(|d| (d, d % 10)).collect();
+        let root = write_index("corrupt-sorted", |w| {
+            w.add_sorted_field(0, 20, &dict_refs, &ords).unwrap();
+        });
+        let [_dvd_name, dvm_name] = crate::doc_values::file_names("_0", SUFFIX);
+        let dvm_path = root.join(&dvm_name);
+        let mut bytes = fs::read(&dvm_path).unwrap();
+        bytes[dvm_bpv_offset()] = 7; // ords numeric meta bpv
+        rewrite_dvm_crc(&mut bytes);
+        fs::write(&dvm_path, bytes).unwrap();
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.sorted_ords(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(&root).unwrap();
     }
 }

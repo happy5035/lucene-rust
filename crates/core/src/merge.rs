@@ -430,11 +430,27 @@ pub(crate) fn merge_points(
     w.finish()
 }
 
+/// 删除指定 segment 名下所有可能产生的文件（`_N.*` 与 `_N_*`）。
+/// 用于 force_merge 失败/提交失败时的尽力孤儿清理，覆盖子 writer 写到
+/// 一半就失败的 partial 文件（这些文件不会进入 `written` 清单）。
+fn cleanup_segment_files(dir: &FSDirectory, segment_name: &str) {
+    let prefix_dot = format!("{segment_name}.");
+    let prefix_underscore = format!("{segment_name}_");
+    let Ok(names) = dir.list_all() else {
+        return;
+    };
+    for name in names {
+        if name.starts_with(&prefix_dot) || name.starts_with(&prefix_underscore) {
+            let _ = dir.delete(&name);
+        }
+    }
+}
+
 /// forceMerge(1)（M6 spec §4.1）：读当前 segments_N → 逐格式归并出一个新段 →
 /// 两段式提交（复用 index_writer::commit_infos 的 fsync + pending/rename 路径）→
 /// 成功后删旧段文件与全部旧 segments_N（Java on-commit 清理同款）。
-/// 中途失败：旧提交点完好；已写出的新段文件按已知文件名清单尽力清理
-/// （SegmentMerger abort 语义）。单线程。
+/// 中途失败：旧提交点完好；已写出的新段文件按 known-filename 清单 + 新段名
+/// prefix 扫描尽力清理（SegmentMerger abort 语义，包含 partial 文件）。单线程。
 pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<()> {
     use codec_lucene9::segment_infos::{random_id, SegmentCommitInfo, SegmentInfos, SEGMENTS};
 
@@ -443,35 +459,37 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         return Ok(()); // 空索引 no-op（关键代码事实 10）
     }
 
-    // 归并输入（按提交序累加 doc_base）
-    let mut doc_base = 0u32;
-    let mut sources: Vec<SegmentMergeSource> = Vec::with_capacity(old_infos.segments.len());
-    let mut all_fis: Vec<FieldInfos> = Vec::with_capacity(old_infos.segments.len());
-    for sci in &old_infos.segments {
-        let fis = FieldInfos::read(dir, &sci.info.name, &sci.info.id, "")?;
-        sources.push(SegmentMergeSource {
-            name: sci.info.name.clone(),
-            id: sci.info.id,
-            doc_base,
-            field_infos: FieldInfos::new(fis.fields.clone()),
-        });
-        all_fis.push(fis);
-        doc_base += sci.info.doc_count as u32;
-    }
-    assert_field_infos_consistent(&all_fis)?;
-    let merged_fis = FieldInfos::new(all_fis[0].fields.clone());
-    let total_max_doc = doc_base;
-
-    // 新段名 = "_" + base36(counter)；id 全新（关键代码事实 8/11）
+    // 新段名在读取/校验输入前确定，这样即使 field infos 不一致等早期失败，
+    // 也能按前缀清理该段名对应的 partial 孤儿文件。
     let new_name = format!(
         "_{}",
         crate::segment_builder::to_base36(old_infos.counter as u64)
     );
-    let new_id = random_id();
+
     // 失败清理清单：逐格式产出即记录（spec §4.1 abort 语义）。written 留在
     // 外层作用域（闭包只 &mut 借用），失败分支与提交失败分支都要消费它。
     let mut written: Vec<String> = Vec::new();
     let result = (|| -> io::Result<SegmentCommitInfo> {
+        // 归并输入（按提交序累加 doc_base）
+        let mut doc_base = 0u32;
+        let mut sources: Vec<SegmentMergeSource> = Vec::with_capacity(old_infos.segments.len());
+        let mut all_fis: Vec<FieldInfos> = Vec::with_capacity(old_infos.segments.len());
+        for sci in &old_infos.segments {
+            let fis = FieldInfos::read(dir, &sci.info.name, &sci.info.id, "")?;
+            sources.push(SegmentMergeSource {
+                name: sci.info.name.clone(),
+                id: sci.info.id,
+                doc_base,
+                field_infos: FieldInfos::new(fis.fields.clone()),
+            });
+            all_fis.push(fis);
+            doc_base += sci.info.doc_count as u32;
+        }
+        assert_field_infos_consistent(&all_fis)?;
+        let merged_fis = FieldInfos::new(all_fis[0].fields.clone());
+        let total_max_doc = doc_base;
+        let new_id = random_id();
+
         // .fnm 先行（全部文件同一 new_id）
         let fnm = merged_fis.write(dir, &new_name, &new_id, "")?;
         written.push(fnm.clone());
@@ -530,6 +548,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
             for f in &written {
                 let _ = dir.delete(f); // 尽力而为（Java abort 同款）
             }
+            cleanup_segment_files(dir, &new_name); // 同时清理 partial 文件
             return Err(e);
         }
     };
@@ -547,6 +566,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         for f in &written {
             let _ = dir.delete(f);
         }
+        cleanup_segment_files(dir, &new_name);
         return Err(e);
     }
 
@@ -794,8 +814,9 @@ mod tests {
         }
         // 段 0: alpha@(0,f1),(1,f1)；段 1: alpha@(0,f1),(1,f1) → 偏移后 3,4
         assert_eq!(got, vec![(0, 1), (1, 1), (3, 1), (4, 1)]);
-        // df=4 低于读侧 BITMAP_MIN_DF(4096)，open_term_bitmap 返回 None；
-        // 但 writer 仍因 threshold=2 写了内联 bitmap（由 Step 18 大电池覆盖）。
+        // df=4 低于读侧 BITMAP_MIN_DF(4096)，所以对该 merged term 调用
+        // open_term_bitmap 会返回 None；这不代表 writer 没写 bitmap 文件——
+        // threshold=2 仍会让 writer 输出内联 bitmap，命中逻辑由 Step 18 覆盖。
         assert!(postings.open_term_bitmap(alpha, 4).unwrap().is_none());
         // singleton：gamma df=1
         let gamma = &terms[3].1;
@@ -1067,6 +1088,12 @@ mod tests {
         w.commit().unwrap();
         drop(w);
 
+        // 预置一些以新段名 _2 开头的 partial/完整孤儿文件，模拟 writer 写到
+        // 一半崩溃后残留；force_merge 失败时必须把它们全部清掉。
+        fs::write(root.join("_2.partial"), b"partial").unwrap();
+        fs::write(root.join("_2.fdt"), b"stored").unwrap();
+        fs::write(root.join("_2_Lucene90_0.dvd"), b"dv").unwrap();
+
         let err = force_merge(&dir, &IndexWriterConfig::default()).unwrap_err();
         assert!(err.to_string().contains("field infos mismatch"), "{err}");
         // 无 _2 前缀孤儿；旧 segments_2 仍是当前提交点
@@ -1078,6 +1105,28 @@ mod tests {
         let s = Searcher::open(&dir).unwrap();
         assert_eq!(s.segment_count(), 2);
         assert_eq!(s.max_doc(), 2);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// cleanup_segment_files 直接删除目标 segment 的所有前缀文件，但不碰其他 segment
+    /// 与提交点文件。
+    #[test]
+    fn cleanup_segment_files_deletes_by_prefix() {
+        let root = temp_dir("cleanprefix");
+        let dir = FSDirectory::open(&root).unwrap();
+        fs::write(root.join("_0.fdt"), b"a").unwrap();
+        fs::write(root.join("_0.fdx"), b"b").unwrap();
+        fs::write(root.join("_0_Lucene90_0.dvd"), b"c").unwrap();
+        fs::write(root.join("_1.fdt"), b"d").unwrap();
+        fs::write(root.join("segments_1"), b"e").unwrap();
+        cleanup_segment_files(&dir, "_0");
+        let files: std::collections::BTreeSet<String> =
+            dir.list_all().unwrap().into_iter().collect();
+        assert!(!files.contains("_0.fdt"));
+        assert!(!files.contains("_0.fdx"));
+        assert!(!files.contains("_0_Lucene90_0.dvd"));
+        assert!(files.contains("_1.fdt"));
+        assert!(files.contains("segments_1"));
         fs::remove_dir_all(&root).unwrap();
     }
 

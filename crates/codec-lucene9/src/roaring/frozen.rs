@@ -32,6 +32,8 @@
 
 use croaring::{BitmapView, Frozen};
 
+use super::materialized::MaterializedBitmap;
+
 /// CRoaring's frozen format cookie (roaring.h:7935 `FROZEN_COOKIE =
 /// 13766`): low 15 bits of the trailing 4-byte header; num_containers in
 /// the high 17 bits (roaring.c:18000-18004).
@@ -166,6 +168,12 @@ impl FrozenBitmap {
         it.reset_at_or_after(from);
         it.next_many(dst)
     }
+
+    /// 容器级拷贝为 owned bitmap（M7 §3.1：fold 叶子的零迭代转换——
+    /// view().to_bitmap() 按容器克隆，不逐 doc）。
+    pub fn to_materialized(&self) -> MaterializedBitmap {
+        MaterializedBitmap::from_bitmap(self.view().to_bitmap())
+    }
 }
 
 /// Materialized pairwise intersection fold + collect (M5 §2: croaring
@@ -230,6 +238,7 @@ pub fn or_cardinality(bitmaps: &[&FrozenBitmap]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::roaring::parse_region;
     use croaring::Bitmap;
 
     /// xorshift64* — deterministic, same as the other codec test modules.
@@ -368,5 +377,30 @@ mod tests {
         assert!(FrozenBitmap::open(&padded, df).is_none());
         // too small for a header
         assert!(FrozenBitmap::open(&payload[..3], df).is_none());
+    }
+
+    #[test]
+    fn to_materialized_container_copy() {
+        let docs: Vec<u32> = (0..9000u32).map(|i| i * 2).collect();
+        let mut buf = crate::io::IndexOutput::in_memory();
+        crate::roaring::write_term_bitmap(&mut buf, &docs).unwrap();
+        let bytes = buf.into_bytes();
+        let len = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()) as usize;
+        let region = &bytes[..len];
+        let fb = parse_region(region, docs.len() as u32).expect("valid region");
+        let m = fb.to_materialized();
+        assert_eq!(m.cardinality(), docs.len() as u64);
+        let mut out = [0u32; 1024];
+        let mut got = Vec::new();
+        let mut from = 0;
+        loop {
+            let n = m.docs_from(from, &mut out);
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&out[..n]);
+            from = got.last().unwrap() + 1;
+        }
+        assert_eq!(got, docs);
     }
 }

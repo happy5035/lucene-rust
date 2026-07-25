@@ -425,6 +425,35 @@ impl StoredFieldsWriter {
         self.finish_document()
     }
 
+    /// M6 T-C：裸 chunk 追加（Lucene90CompressingStoredFieldsWriter.copyChunks
+    /// :552-595 的写侧一半）。`code` 原样携带源 chunk 的 numDocs<<2|dirty|sliced
+    /// 位；docBase 重写为当前 doc_base（rebase，:565-568）。`payload` = 源 chunk
+    /// 去掉 (docBase, code) 两个 VInt 后的全部字节（numStoredFields/lengths/LZ4
+    /// 数据，逐字节不解压）。调用后内部 doc 缓冲必须恒空——与 write_field 的
+    /// 文档级写入路径互斥（本系统归并只用裸路径）。
+    pub fn append_raw_chunk(&mut self, num_docs: i32, code: i32, payload: &[u8]) -> io::Result<()> {
+        assert_eq!(
+            self.num_buffered_docs, 0,
+            "raw chunk append never mixes with doc-level writes"
+        );
+        assert_eq!(code >> 2, num_docs, "code numDocs mismatch");
+        self.num_chunks += 1;
+        if code & 2 != 0 {
+            // dirty bit（force flush 的 chunk）：记账与 flush(true) 一致 (:238-241)
+            self.num_dirty_chunks += 1;
+            self.num_dirty_docs += num_docs as i64;
+        }
+        self.chunk_num_docs.push(num_docs);
+        self.chunk_start_pointers
+            .push(self.fields_stream.file_pointer() as i64);
+        self.total_docs_in_chunks += num_docs as i64;
+        self.fields_stream.write_vint(self.doc_base)?; // rebase
+        self.fields_stream.write_vint(code)?;
+        self.fields_stream.write_bytes(payload)?;
+        self.doc_base += num_docs;
+        Ok(())
+    }
+
     /// flush (:234-270).
     fn flush(&mut self, force: bool) -> io::Result<()> {
         self.num_chunks += 1;
@@ -801,6 +830,70 @@ mod tests {
             assert_eq!(code >> 2, idx.chunk_doc_count(c));
             assert_eq!(code & 1, 0, "never sliced (small docs)");
             doc_base += idx.chunk_doc_count(c);
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// copyChunks 主路径（Lucene90CompressingStoredFieldsWriter.java:520-595）：
+    /// 头两个 VInt 重写（docBase 重定基），其余字节原样。
+    #[test]
+    fn append_raw_chunk_rebases_doc_base() {
+        let root = temp_dir("rawcopy");
+        let dir = FSDirectory::open(&root).unwrap();
+        let id_a = [1u8; 16];
+        let mut wa = StoredFieldsWriter::new(&dir, "_a", id_a, "").unwrap();
+        for d in 0..5 {
+            wa.write_document(&[(0, StoredField::String(format!("payload-{d}")))])
+                .unwrap();
+            if d == 1 || d == 3 {
+                wa.force_flush_for_test();
+            }
+        }
+        wa.finish(5, &dir).unwrap();
+
+        let idx = StoredFieldsIndexReader::open(&dir, "_a", &id_a).unwrap();
+        let id_b = [2u8; 16];
+        let mut wb = StoredFieldsWriter::new(&dir, "_b", id_b, "").unwrap();
+        let mut fdt = dir.open_input("_a.fdt").unwrap();
+        for c in 0..idx.num_chunks() {
+            let (start, end) = idx.chunk_byte_range(c);
+            fdt.seek(start).unwrap();
+            let _src_base = fdt.read_vint().unwrap();
+            let code = fdt.read_vint().unwrap();
+            let mut payload = vec![0u8; (end - fdt.file_pointer()) as usize];
+            fdt.read_bytes(&mut payload).unwrap();
+            wb.append_raw_chunk(idx.chunk_doc_count(c), code, &payload)
+                .unwrap();
+        }
+        wb.finish(5, &dir).unwrap();
+
+        // 段 B 索引：3 chunks、doc 数 2/2/1、docBase 已重定基
+        let idx_b = StoredFieldsIndexReader::open(&dir, "_b", &id_b).unwrap();
+        assert_eq!(idx_b.num_chunks(), 3);
+        let mut fdt_b = dir.open_input("_b.fdt").unwrap();
+        let mut doc_base = 0;
+        for c in 0..idx_b.num_chunks() {
+            assert_eq!(idx_b.chunk_doc_count(c), idx.chunk_doc_count(c));
+            let (start_b, end_b) = idx_b.chunk_byte_range(c);
+            fdt_b.seek(start_b).unwrap();
+            assert_eq!(
+                fdt_b.read_vint().unwrap(),
+                doc_base,
+                "chunk {c} docBase rebased"
+            );
+            let code_b = fdt_b.read_vint().unwrap();
+            // payload（header 之后全部字节）与源段逐字节一致
+            let (start_a, end_a) = idx.chunk_byte_range(c);
+            fdt.seek(start_a).unwrap();
+            fdt.read_vint().unwrap();
+            let code_a = fdt.read_vint().unwrap();
+            assert_eq!(code_a, code_b);
+            let mut pa = vec![0u8; (end_a - fdt.file_pointer()) as usize];
+            fdt.read_bytes(&mut pa).unwrap();
+            let mut pb = vec![0u8; (end_b - fdt_b.file_pointer()) as usize];
+            fdt_b.read_bytes(&mut pb).unwrap();
+            assert_eq!(pa, pb, "chunk {c} payload byte-identical");
+            doc_base += idx_b.chunk_doc_count(c);
         }
         fs::remove_dir_all(&root).unwrap();
     }

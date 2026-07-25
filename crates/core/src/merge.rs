@@ -590,10 +590,24 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
     }
     stale.sort();
     stale.dedup();
-    for f in &stale {
-        dir.delete(f)?;
-    }
+    let _ = delete_stale_files(&stale, |f| dir.delete(f));
     Ok(())
+}
+
+/// 两段式提交成功后删除旧段文件/旧 segments_N。删除失败是尽力而为，
+/// 不因此让已经成功的 `force_merge` 返回错误（避免 CLI/自动化误判）。
+fn delete_stale_files<D>(stale: &[String], mut delete: D) -> Vec<(String, io::Error)>
+where
+    D: FnMut(&str) -> io::Result<()>,
+{
+    let mut failures = Vec::new();
+    for f in stale {
+        if let Err(e) = delete(f) {
+            eprintln!("warning: failed to delete stale file {f}: {e}");
+            failures.push((f.clone(), e));
+        }
+    }
+    failures
 }
 
 #[cfg(test)]
@@ -1127,6 +1141,26 @@ mod tests {
         assert!(files.contains("_1.fdt"));
         assert!(files.contains("segments_1"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 提交成功后的旧文件清理为尽力而为：单个文件删除失败不能中断循环，
+    /// 也不能让已经成功的 force_merge 返回 Err。
+    #[test]
+    fn delete_stale_files_continues_past_errors() {
+        let stale = vec!["a".into(), "b".into(), "c".into()];
+        let mut calls = Vec::new();
+        let failures = delete_stale_files(&stale, |f| {
+            calls.push(f.to_string());
+            if f == "b" {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "no"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(calls, vec!["a", "b", "c"]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "b");
+        assert_eq!(failures[0].1.kind(), io::ErrorKind::PermissionDenied);
     }
 
     /// spec §4.4：空索引 no-op（0-doc 段本系统不存在，关键代码事实 10）。

@@ -141,7 +141,11 @@ pub fn commit_segments(
     commit_infos(&dir, &mut infos, generation)
 }
 
-fn commit_infos(dir: &FSDirectory, infos: &mut SegmentInfos, generation: i64) -> io::Result<()> {
+pub(crate) fn commit_infos(
+    dir: &FSDirectory,
+    infos: &mut SegmentInfos,
+    generation: i64,
+) -> io::Result<()> {
     infos.version += 1;
     // Make every referenced segment file durable before publishing the
     // commit point that references them.

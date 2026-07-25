@@ -441,8 +441,147 @@ pub(crate) fn merge_points(
 /// 成功后删旧段文件与全部旧 segments_N（Java on-commit 清理同款）。
 /// 中途失败：旧提交点完好；已写出的新段文件按已知文件名清单尽力清理
 /// （SegmentMerger abort 语义）。单线程。
-pub fn force_merge(_dir: &FSDirectory, _config: &IndexWriterConfig) -> io::Result<()> {
-    todo!("Step 16")
+pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<()> {
+    use codec_lucene9::segment_infos::{random_id, SegmentCommitInfo, SegmentInfos, SEGMENTS};
+
+    let (old_infos, old_gen) = SegmentInfos::read_latest(dir)?;
+    if old_infos.segments.is_empty() {
+        return Ok(()); // 空索引 no-op（关键代码事实 10）
+    }
+
+    // 归并输入（按提交序累加 doc_base）
+    let mut doc_base = 0u32;
+    let mut sources: Vec<SegmentMergeSource> = Vec::with_capacity(old_infos.segments.len());
+    let mut all_fis: Vec<FieldInfos> = Vec::with_capacity(old_infos.segments.len());
+    for sci in &old_infos.segments {
+        let fis = FieldInfos::read(dir, &sci.info.name, &sci.info.id, "")?;
+        sources.push(SegmentMergeSource {
+            name: sci.info.name.clone(),
+            id: sci.info.id,
+            max_doc: sci.info.doc_count,
+            doc_base,
+            field_infos: FieldInfos::new(fis.fields.clone()),
+        });
+        all_fis.push(fis);
+        doc_base += sci.info.doc_count as u32;
+    }
+    assert_field_infos_consistent(&all_fis)?;
+    let merged_fis = FieldInfos::new(all_fis[0].fields.clone());
+    let total_max_doc = doc_base;
+
+    // 新段名 = "_" + base36(counter)；id 全新（关键代码事实 8/11）
+    let new_name = format!(
+        "_{}",
+        crate::segment_builder::to_base36(old_infos.counter as u64)
+    );
+    let new_id = random_id();
+    // 失败清理清单：逐格式产出即记录（spec §4.1 abort 语义）。written 留在
+    // 外层作用域（闭包只 &mut 借用），失败分支与提交失败分支都要消费它。
+    let mut written: Vec<String> = Vec::new();
+    let result = (|| -> io::Result<SegmentCommitInfo> {
+        // .fnm 先行（全部文件同一 new_id）
+        let fnm = merged_fis.write(dir, &new_name, &new_id, "")?;
+        written.push(fnm.clone());
+        // stored → postings → DV → points（关键代码事实 9）
+        let stored = merge_stored(dir, &sources, &new_name, &new_id, total_max_doc as i32)?;
+        written.extend(stored.iter().cloned());
+        let bitmap_threshold = config.bitmap.then_some(
+            config
+                .bitmap_threshold
+                .max(codec_lucene9::roaring::BITMAP_MIN_DF),
+        );
+        let postings = merge_postings(
+            dir,
+            &sources,
+            &merged_fis,
+            &new_name,
+            &new_id,
+            bitmap_threshold,
+        )?;
+        written.extend(postings.iter().cloned());
+        let dv = merge_doc_values(
+            dir,
+            &sources,
+            &merged_fis,
+            &new_name,
+            &new_id,
+            total_max_doc,
+        )?;
+        written.extend(dv.iter().cloned());
+        let points = merge_points(dir, &sources, &merged_fis, &new_name, &new_id)?;
+        written.extend(points.iter().cloned());
+        // .si（diagnostics 只写稳定键，关键代码事实 7）
+        let mut si = SegmentInfo::new(&new_name, new_id, total_max_doc as i32);
+        si.diagnostics.insert("source".into(), "merge".into());
+        si.diagnostics
+            .insert("lucene.version".into(), "9.12.3".into());
+        si.diagnostics
+            .insert("mergeFactor".into(), sources.len().to_string());
+        si.attributes.insert(
+            "Lucene90StoredFieldsFormat.mode".into(),
+            "BEST_SPEED".into(),
+        );
+        si.files.insert(fnm);
+        si.files.extend(stored);
+        si.files.extend(postings);
+        si.files.extend(dv);
+        si.files.extend(points);
+        si.files.insert(format!("{new_name}.si"));
+        si.write(dir, "")?;
+        written.push(format!("{new_name}.si"));
+        Ok(SegmentCommitInfo::new(si, random_id()))
+    })();
+    let new_sci = match result {
+        Ok(sci) => sci,
+        Err(e) => {
+            for f in &written {
+                let _ = dir.delete(f); // 尽力而为（Java abort 同款）
+            }
+            return Err(e);
+        }
+    };
+
+    // 两段式提交（复用现有路径：fsync 段文件 → pending → rename → dir fsync）。
+    // 提交失败同样清理新段文件——失败语义与归并中途一致（spec §4.1）。
+    let mut new_infos = SegmentInfos::new();
+    new_infos.version = old_infos.version;
+    new_infos.counter = old_infos.counter + 1;
+    new_infos.index_created_version_major = old_infos.index_created_version_major;
+    new_infos.min_segment_version = old_infos.min_segment_version;
+    new_infos.user_data = old_infos.user_data.clone();
+    new_infos.segments.push(new_sci);
+    if let Err(e) = crate::index_writer::commit_infos(dir, &mut new_infos, old_gen + 1) {
+        for f in &written {
+            let _ = dir.delete(f);
+        }
+        return Err(e);
+    }
+
+    // 提交成功 ⇒ 删旧段文件 + 全部旧代 segments_N（gen ≤ old_gen）
+    let mut stale: Vec<String> = Vec::new();
+    for sci in &old_infos.segments {
+        stale.extend(sci.info.files.iter().cloned());
+    }
+    for name in dir.list_all()? {
+        if !name.starts_with(SEGMENTS) || name == "segments.gen" {
+            continue;
+        }
+        let Some(gen_str) = name[SEGMENTS.len()..].strip_prefix('_') else {
+            continue;
+        };
+        let Ok(g) = i64::from_str_radix(gen_str, 36) else {
+            continue;
+        };
+        if g <= old_gen {
+            stale.push(name);
+        }
+    }
+    stale.sort();
+    stale.dedup();
+    for f in &stale {
+        dir.delete(f)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -779,5 +918,174 @@ mod tests {
             format!("{segment}.fdx"),
             format!("{segment}.fdm"),
         ]
+    }
+
+    /// 全段归并 → Searcher 侧：segment_count()==1、maxDoc 不变、查询结果与
+    /// 归并前逐条一致、旧段文件与旧 segments_N 已删。
+    #[test]
+    fn force_merge_end_to_end() {
+        let root = temp_dir("fm");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        schema.add(FieldSpec::text_with_positions("message"));
+        schema.add(
+            FieldSpec::long_point("ts")
+                .with_numeric_dv()
+                .with_stored(true),
+        );
+        schema.add(FieldSpec::sorted_dv("host"));
+        // 两个 commit → 两段（段 0 docs 0..3，段 1 docs 0..2）
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        let put = |w: &mut IndexWriter, i: u64, level: &str, msg: &str, host: &str| {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d.add("message", FieldValue::Text(msg.to_string()));
+            d.add("ts", FieldValue::Long(1000 + i as i64));
+            d.add("host", FieldValue::Keyword(host.to_string()));
+            w.add_document(d).unwrap();
+        };
+        put(&mut w, 0, "INFO", "alpha beta", "h1");
+        put(&mut w, 1, "WARN", "alpha", "h2");
+        put(&mut w, 2, "INFO", "beta gamma", "h1");
+        w.commit().unwrap();
+        put(&mut w, 3, "ERROR", "alpha delta", "h3");
+        put(&mut w, 4, "INFO", "alpha beta", "h2");
+        w.commit().unwrap();
+        drop(w);
+
+        // 归并前基线
+        let pre = {
+            let mut s = Searcher::open(&dir).unwrap();
+            assert_eq!(s.segment_count(), 2);
+            let mut lines = Vec::new();
+            lines.push(format!("maxDoc={}", s.max_doc()));
+            for (field, term) in [
+                ("level", "INFO"),
+                ("level", "WARN"),
+                ("level", "ERROR"),
+                ("message", "alpha"),
+                ("message", "beta"),
+                ("message", "delta"),
+            ] {
+                let c = s.count(&Query::term(field, term)).unwrap();
+                lines.push(format!("term {field}={term} count={c}"));
+            }
+            let c = s
+                .count(&Query::phrase("message", &["alpha", "beta"]))
+                .unwrap();
+            lines.push(format!("phrase alpha,beta count={c}"));
+            let (_, docs) = s.top_docs(&Query::MatchAll, 20).unwrap();
+            lines.push(format!("matchall first20={docs:?}"));
+            lines
+        };
+        let files_before: std::collections::BTreeSet<String> =
+            dir.list_all().unwrap().into_iter().collect();
+
+        force_merge(&dir, &IndexWriterConfig::default()).unwrap();
+
+        // 归并后：单段、查询逐条一致
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        let mut post = Vec::new();
+        post.push(format!("maxDoc={}", s.max_doc()));
+        for (field, term) in [
+            ("level", "INFO"),
+            ("level", "WARN"),
+            ("level", "ERROR"),
+            ("message", "alpha"),
+            ("message", "beta"),
+            ("message", "delta"),
+        ] {
+            let c = s.count(&Query::term(field, term)).unwrap();
+            post.push(format!("term {field}={term} count={c}"));
+        }
+        let c = s
+            .count(&Query::phrase("message", &["alpha", "beta"]))
+            .unwrap();
+        post.push(format!("phrase alpha,beta count={c}"));
+        let (_, docs) = s.top_docs(&Query::MatchAll, 20).unwrap();
+        post.push(format!("matchall first20={docs:?}"));
+        assert_eq!(pre, post, "pre/post-merge query diff must be empty");
+
+        // 旧文件清理：旧段文件（_0/_1 前缀）与旧 segments_1/segments_2 全删，
+        // 只剩新段（_2 前缀，第三段名）+ segments_3
+        let files_after: Vec<String> = dir.list_all().unwrap();
+        for f in &files_after {
+            assert!(!f.starts_with("_0") && !f.starts_with("_1"), "stale {f}");
+        }
+        assert!(files_after.iter().any(|f| f == "segments_3"));
+        assert!(!files_before.is_empty());
+        assert_eq!(
+            files_after
+                .iter()
+                .filter(|f| f.starts_with("segments_"))
+                .count(),
+            1,
+            "exactly one commit file: {files_after:?}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 单段退化（spec §4.4）：归并 = 重打包，结果与归并前查询一致。
+    #[test]
+    fn force_merge_single_segment_degenerates() {
+        let root = temp_dir("fm1");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        for i in 0..5 {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(format!("L{}", i % 2)));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+        force_merge(&dir, &IndexWriterConfig::default()).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(s.max_doc(), 5);
+        assert_eq!(s.count(&Query::term("level", "L0")).unwrap(), 3);
+        let files: Vec<String> = dir.list_all().unwrap();
+        assert!(files.iter().all(|f| !f.starts_with("_0.")));
+        assert!(files.iter().any(|f| f == "segments_2"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 中途失败清理（spec §4.1）：field infos 不一致 ⇒ Err；目录里不留
+    /// 新段孤儿文件；旧提交点完好（仍 2 段可查）。
+    #[test]
+    fn force_merge_failure_cleans_orphans() {
+        let root = temp_dir("fmfail");
+        let dir = FSDirectory::open(&root).unwrap();
+        // 段 0：level；段 1：level + extra（schema 动态增长 ⇒ .fnm 分歧）
+        let mut w =
+            IndexWriter::create(&root, Schema::new(), IndexWriterConfig::default()).unwrap();
+        w.schema_mut().add(FieldSpec::keyword("level"));
+        let mut d = Document::new();
+        d.add("level", FieldValue::Keyword("INFO".into()));
+        w.add_document(d).unwrap();
+        w.commit().unwrap();
+        w.schema_mut().add(FieldSpec::keyword("extra"));
+        let mut d = Document::new();
+        d.add("level", FieldValue::Keyword("WARN".into()));
+        d.add("extra", FieldValue::Keyword("x".into()));
+        w.add_document(d).unwrap();
+        w.commit().unwrap();
+        drop(w);
+
+        let err = force_merge(&dir, &IndexWriterConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("field infos mismatch"), "{err}");
+        // 无 _2 前缀孤儿；旧 segments_2 仍是当前提交点
+        let files: Vec<String> = dir.list_all().unwrap();
+        assert!(
+            files.iter().all(|f| !f.starts_with("_2")),
+            "orphans: {files:?}"
+        );
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 2);
+        assert_eq!(s.max_doc(), 2);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

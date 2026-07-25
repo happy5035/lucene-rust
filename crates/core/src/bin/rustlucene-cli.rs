@@ -472,6 +472,26 @@ fn searchbench(
         })
         .collect();
 
+    // M6 RANGE lines (same file, replayed verbatim like AND/OR/PHRASE):
+    // RANGE\t<field>\t<low>\t<high>；low>high 行会让查询在执行期
+    // Err(InvalidInput)（跨任务钉死接口），dump 侧不写这种行。
+    let range_tasks: Vec<(String, i64, i64)> = content
+        .lines()
+        .filter(|l| l.starts_with("RANGE\t"))
+        .filter_map(|l| {
+            let parts: Vec<&str> = l.split('\t').collect();
+            if parts.len() >= 4 {
+                Some((
+                    parts[1].to_string(),
+                    parts[2].parse::<i64>().unwrap_or(0),
+                    parts[3].parse::<i64>().unwrap_or(0),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Classify into freq buckets (luceneutil convention)
     let low_limit = 10u32;
     let med_limit = (max_doc as u32 / 100).max(11);
@@ -509,6 +529,7 @@ fn searchbench(
         Wildcard(String),
         Terms(Vec<String>),
         Phrase(String, String),
+        Range(String, i64, i64),
     }
     let mut work: Vec<(String, WorkItem)> = Vec::new();
     for t in &low_terms {
@@ -562,6 +583,13 @@ fn searchbench(
             WorkItem::Phrase(t1.clone(), t2.clone()),
         ));
     }
+    // RANGE lines: replayed verbatim, appended after the M2 line types.
+    for (f, low, high) in &range_tasks {
+        work.push((
+            "range\tall".to_string(),
+            WorkItem::Range(f.clone(), *low, *high),
+        ));
+    }
 
     if work.is_empty() {
         eprintln!("searchbench: no terms after sampling");
@@ -580,6 +608,7 @@ fn searchbench(
                 Query::terms(field, &refs)
             }
             WorkItem::Phrase(t1, t2) => Query::phrase(field, &[t1.as_str(), t2.as_str()]),
+            WorkItem::Range(f, low, high) => Query::point_range(f, *low, *high),
         }
     };
     // One measured execution. ITERM forces a full DocIter walk through the
@@ -608,6 +637,9 @@ fn searchbench(
             WorkItem::Wildcard(p) => format!("wildcard={p} bucket={label}"),
             WorkItem::Terms(ts) => format!("terms={} bucket={label}", ts.join(",")),
             WorkItem::Phrase(t1, t2) => format!("phrase t1={t1} t2={t2} bucket={label}"),
+            WorkItem::Range(f, low, high) => {
+                format!("range field={f} low={low} high={high} bucket={label}")
+            }
         }
     };
 

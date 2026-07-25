@@ -61,6 +61,7 @@ pub enum VectorSimilarity {
 }
 
 /// A single field's metadata (index/FieldInfo.java).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FieldInfo {
     pub name: String,
     pub number: i32,

@@ -79,8 +79,29 @@ pub(crate) fn build_ord_remap(dicts: &[Vec<Vec<u8>>], global: &[Vec<u8>]) -> Vec
 /// 不变量）；不一致即报错，不做全局重编号（MergeState.fieldInfos 的
 /// 同名合并在本系统是恒等）。
 pub(crate) fn assert_field_infos_consistent(all: &[FieldInfos]) -> io::Result<()> {
-    let _ = all;
-    todo!("Step 10")
+    let Some(first) = all.first() else {
+        return Ok(());
+    };
+    for (seg_idx, fis) in all.iter().enumerate().skip(1) {
+        if fis.fields != first.fields {
+            let names = |f: &FieldInfos| {
+                f.fields
+                    .iter()
+                    .map(|fi| fi.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "field infos mismatch: segment 0 [{}] vs segment {seg_idx} [{}]",
+                    names(first),
+                    names(fis)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 一个待归并段的打开状态（按 segments_N 提交序；doc_base 已累加好）。
@@ -215,5 +236,52 @@ mod tests {
         let dicts = vec![dict(&["a", "b", "c"])];
         let global = merge_sorted_dicts(&dicts);
         assert_eq!(build_ord_remap(&dicts, &global), vec![vec![0, 1, 2]]);
+    }
+
+    use codec_lucene9::field_infos::{DocValuesType, IndexOptions};
+
+    fn fis(specs: &[(&str, IndexOptions, DocValuesType)]) -> FieldInfos {
+        FieldInfos::new(
+            specs
+                .iter()
+                .enumerate()
+                .map(|(i, &(name, io_opt, dv))| {
+                    let mut fi = FieldInfo::stored(name, i as i32);
+                    fi.index_options = io_opt;
+                    fi.omit_norms = io_opt != IndexOptions::None;
+                    fi.doc_values_type = dv;
+                    fi
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn field_infos_consistent_accepts_identical() {
+        let a = fis(&[
+            ("level", IndexOptions::Docs, DocValuesType::Sorted),
+            ("message", IndexOptions::DocsAndFreqs, DocValuesType::None),
+        ]);
+        let b = fis(&[
+            ("level", IndexOptions::Docs, DocValuesType::Sorted),
+            ("message", IndexOptions::DocsAndFreqs, DocValuesType::None),
+        ]);
+        assert_field_infos_consistent(&[a, b]).unwrap();
+    }
+
+    #[test]
+    fn field_infos_consistent_rejects_diverged() {
+        let a = fis(&[("level", IndexOptions::Docs, DocValuesType::Sorted)]);
+        // DV 类型分歧（同源写不出，手工构造）
+        let b = fis(&[("level", IndexOptions::Docs, DocValuesType::None)]);
+        let err = assert_field_infos_consistent(&[a, b]).unwrap_err();
+        assert!(err.to_string().contains("field infos mismatch"));
+        // 字段数分歧同样拒绝
+        let c = fis(&[
+            ("level", IndexOptions::Docs, DocValuesType::Sorted),
+            ("extra", IndexOptions::None, DocValuesType::None),
+        ]);
+        let d = fis(&[("level", IndexOptions::Docs, DocValuesType::Sorted)]);
+        assert!(assert_field_infos_consistent(&[c, d]).is_err());
     }
 }

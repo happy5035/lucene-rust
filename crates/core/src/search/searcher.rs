@@ -158,13 +158,16 @@ impl Searcher {
         if query.is_multi_term()
             || matches!(
                 query,
-                Query::And { .. } | Query::Or { .. } | Query::PointRange { .. }
+                Query::And { .. }
+                    | Query::Or { .. }
+                    | Query::Bool { .. }
+                    | Query::PointRange { .. }
             )
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "freq_sum is only defined for Term queries (MatchAll degenerates to \
-                 doc count); multi-term, And/Or and PointRange queries have no \
+                 doc count); multi-term and Boolean (And/Or/Bool) queries have no \
                  well-defined freq sum",
             ));
         }

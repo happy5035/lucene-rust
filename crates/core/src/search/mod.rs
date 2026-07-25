@@ -1690,4 +1690,22 @@ mod tests {
         assert_eq!(s.count(&q).unwrap(), 10);
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// spec §2.3：freq_sum 对 Bool 拒绝（同 And/Or / multi-term 先例）。
+    #[test]
+    fn freq_sum_rejects_bool_queries() {
+        let root = temp_dir("boolfreqsum");
+        write_terms_corpus(&root);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "t00")),
+            (Occur::MustNot, Query::term("message", "t07")),
+        ]);
+        let err = s.freq_sum(&q).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Term 不受影响
+        assert_eq!(s.freq_sum(&Query::term("message", "t00")).unwrap(), 4);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

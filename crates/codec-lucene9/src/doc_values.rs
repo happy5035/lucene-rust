@@ -28,33 +28,33 @@ use crate::packed::{
 };
 
 /// Lucene90DocValuesFormat DATA_CODEC / META_CODEC / extensions (:158-161).
-const DATA_CODEC: &str = "Lucene90DocValuesData";
-const META_CODEC: &str = "Lucene90DocValuesMetadata";
+pub(crate) const DATA_CODEC: &str = "Lucene90DocValuesData";
+pub(crate) const META_CODEC: &str = "Lucene90DocValuesMetadata";
 const DATA_EXTENSION: &str = "dvd";
 const META_EXTENSION: &str = "dvm";
 /// VERSION_START == VERSION_CURRENT == 0 (:162-163).
-const VERSION: u32 = 0;
+pub(crate) const VERSION: u32 = 0;
 
 /// .dvm type bytes (:166-170).
-const TYPE_NUMERIC: u8 = 0;
-const TYPE_SORTED: u8 = 2;
+pub(crate) const TYPE_NUMERIC: u8 = 0;
+pub(crate) const TYPE_SORTED: u8 = 2;
 
 /// DIRECT_MONOTONIC_BLOCK_SHIFT (:172): all DirectMonotonic sequences here.
-const DIRECT_MONOTONIC_BLOCK_SHIFT: u32 = 16;
+pub(crate) const DIRECT_MONOTONIC_BLOCK_SHIFT: u32 = 16;
 /// TERMS_DICT_BLOCK_LZ4_SHIFT (:177-179): 64 terms per dict block.
 const TERMS_DICT_BLOCK_LZ4_SHIFT: u32 = 6;
-const TERMS_DICT_BLOCK_SIZE: usize = 1 << TERMS_DICT_BLOCK_LZ4_SHIFT;
+pub(crate) const TERMS_DICT_BLOCK_SIZE: usize = 1 << TERMS_DICT_BLOCK_LZ4_SHIFT;
 /// TERMS_DICT_REVERSE_INDEX_SHIFT (:180-183): sample every 1024 terms.
 const TERMS_DICT_REVERSE_INDEX_SHIFT: u32 = 10;
-const TERMS_DICT_REVERSE_INDEX_SIZE: usize = 1 << TERMS_DICT_REVERSE_INDEX_SHIFT;
+pub(crate) const TERMS_DICT_REVERSE_INDEX_SIZE: usize = 1 << TERMS_DICT_REVERSE_INDEX_SHIFT;
 
 /// IndexedDISI constants (:102-108).
-const DISI_BLOCK_SIZE: u32 = 65536;
+pub(crate) const DISI_BLOCK_SIZE: u32 = 65536;
 const DISI_BLOCK_LONGS: usize = 1024; // DISI_BLOCK_SIZE / 64
-const DISI_MAX_ARRAY_LENGTH: u32 = 4095;
+pub(crate) const DISI_MAX_ARRAY_LENGTH: u32 = 4095;
 const DISI_DENSE_RANK_POWER: u8 = 9; // DEFAULT_DENSE_RANK_POWER
 /// NO_MORE_DOCS >>> 16 (:251): sentinel block id.
-const DISI_SENTINEL_BLOCK: u32 = 0x7FFF_FFFF >> 16;
+pub(crate) const DISI_SENTINEL_BLOCK: u32 = 0x7FFF_FFFF >> 16;
 
 /// Segment file names (IndexFileNames.segmentFileName :90-106):
 /// `segment + "_" + suffix + "." + ext`, without the "_" when suffix is empty.

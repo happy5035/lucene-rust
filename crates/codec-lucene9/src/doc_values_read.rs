@@ -1,0 +1,477 @@
+//! Lucene90 DocValues 顺序读（Lucene90DocValuesProducer :197-299 的归并子集；
+//! M6 T-C，spec §4.3）。只服务 forceMerge 的全量顺序遍历：无随机点查、
+//! 无跳表加速（IndexedDISI jump table 与 terms reverse index 解析但跳过）。
+//! 布局 ground truth：docs/format-notes-docvalues.md + doc_values.rs 写侧注释。
+
+use std::io;
+
+use crate::codec_util::{check_footer, check_footer_structure, check_index_header, corrupt};
+use crate::directory::FSDirectory;
+use crate::doc_values::{
+    DATA_CODEC, DIRECT_MONOTONIC_BLOCK_SHIFT, DISI_BLOCK_SIZE, DISI_MAX_ARRAY_LENGTH,
+    DISI_SENTINEL_BLOCK, META_CODEC, TERMS_DICT_BLOCK_SIZE, TERMS_DICT_REVERSE_INDEX_SIZE,
+    TYPE_NUMERIC, TYPE_SORTED, VERSION,
+};
+use crate::io::{ChecksumIndexInput, DataInput, IndexInput};
+use crate::packed::{DirectMonotonicReader, DirectReader};
+
+/// Lucene90DocValuesProducer.readNumeric (:197-224) 的归并子集。
+struct NumericMeta {
+    docs_offset: i64, // -2 = 全空；-1 = 稠密；否则 DISI 区起点（.dvd 绝对 fp）
+    docs_length: i64,
+    num_values: u64,
+    bpv: u8,
+    min: i64,
+    gcd: i64,
+    values_offset: i64,
+    values_length: i64,
+}
+
+/// readTermDict (:278-299)：ords 子条目 + terms dict 元数据。
+/// terms reverse index 的偏移量读入即弃（归并不需要点查）。
+struct SortedMeta {
+    ords: NumericMeta,
+    dict_size: u64,
+    block_shift: u32,
+    addresses_meta: Vec<u8>, // DirectMonotonic meta（.dvm 内联 21B/块）
+    terms_data_offset: i64,
+    terms_data_length: i64,
+    terms_addresses_offset: i64,
+    terms_addresses_length: i64,
+}
+
+enum DvEntry {
+    Numeric(NumericMeta),
+    Sorted(SortedMeta),
+}
+
+pub struct DocValuesReader {
+    /// .dvd header 之后的全部字节（footer 除外）；归并逐字段顺序消费。
+    dvd: Vec<u8>,
+    /// .dvd index header 长度：meta 里的 offset 是绝对 fp，切片时减之。
+    header_len: u64,
+    entries: Vec<(i32, DvEntry)>,
+}
+
+/// readNumeric (:197-224)。tableSize 恒 -1、valueJumpTableOffset 恒 -1
+/// （写侧 doc_values.rs:221/238）；其他值是非本系统产物，拒绝。
+fn read_numeric_meta(dvm: &mut ChecksumIndexInput) -> io::Result<NumericMeta> {
+    let docs_offset = dvm.read_long()?;
+    let docs_length = dvm.read_long()?;
+    let _jump_table_entry_count = dvm.read_short()?;
+    let _dense_rank_power = dvm.read_byte()?;
+    let num_values = dvm.read_long()? as u64;
+    let table_size = dvm.read_int()?;
+    if table_size != -1 {
+        return Err(corrupt(format!(
+            "tableSize {table_size} != -1 (not our writer)"
+        )));
+    }
+    let bpv = dvm.read_byte()?;
+    let min = dvm.read_long()?;
+    let gcd = dvm.read_long()?;
+    let values_offset = dvm.read_long()?;
+    let values_length = dvm.read_long()?;
+    let value_jump_table_offset = dvm.read_long()?;
+    if value_jump_table_offset != -1 {
+        return Err(corrupt("valueJumpTable present (not our writer)"));
+    }
+    Ok(NumericMeta {
+        docs_offset,
+        docs_length,
+        num_values,
+        bpv,
+        min,
+        gcd,
+        values_offset,
+        values_length,
+    })
+}
+
+/// readTermDict (:278-299)。reverse index 的 DM meta 内联在 .dvm——
+/// 必须读过（字节数按块数公式推出）才能到下一字段条目。
+fn read_terms_meta(dvm: &mut ChecksumIndexInput, ords: NumericMeta) -> io::Result<SortedMeta> {
+    let dict_size = dvm.read_vlong()? as u64;
+    let block_shift = dvm.read_int()? as u32;
+    if block_shift != DIRECT_MONOTONIC_BLOCK_SHIFT {
+        return Err(corrupt(format!("terms dict blockShift {block_shift}")));
+    }
+    let num_addr = (dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE);
+    let mut addresses_meta = vec![0u8; dm_meta_len(num_addr, block_shift)];
+    dvm.read_bytes(&mut addresses_meta)?;
+    let _max_term_length = dvm.read_int()?;
+    let _max_block_length = dvm.read_int()?;
+    let terms_data_offset = dvm.read_long()?;
+    let terms_data_length = dvm.read_long()?;
+    let terms_addresses_offset = dvm.read_long()?;
+    let terms_addresses_length = dvm.read_long()?;
+    let index_shift = dvm.read_int()? as u32;
+    if index_shift != 10 {
+        return Err(corrupt(format!("terms index shift {index_shift}")));
+    }
+    let num_index = 1 + (dict_size as usize).div_ceil(TERMS_DICT_REVERSE_INDEX_SIZE);
+    let mut skipped = vec![0u8; dm_meta_len(num_index, block_shift)];
+    dvm.read_bytes(&mut skipped)?; // reverse index DM meta，读入即弃
+    let _terms_index_offset = dvm.read_long()?;
+    let _terms_index_length = dvm.read_long()?;
+    let _terms_index_addresses_offset = dvm.read_long()?;
+    let _terms_index_addresses_length = dvm.read_long()?;
+    Ok(SortedMeta {
+        ords,
+        dict_size,
+        block_shift,
+        addresses_meta,
+        terms_data_offset,
+        terms_data_length,
+        terms_addresses_offset,
+        terms_addresses_length,
+    })
+}
+
+/// DirectMonotonic meta 内联字节数（块数公式，packed.rs:237-241 × 21B/块）。
+fn dm_meta_len(num_values: usize, block_shift: u32) -> usize {
+    let num_blocks = if num_values == 0 {
+        0
+    } else {
+        ((num_values - 1) >> block_shift) + 1
+    };
+    num_blocks * DirectMonotonicReader::META_RECORD_BYTES
+}
+
+impl DocValuesReader {
+    /// 解析 .dvm 全部字段条目 + 校验 .dvd header/footer
+    /// （Lucene90DocValuesProducer 构造 :168-195 的精简版）。
+    pub fn open(
+        dir: &FSDirectory,
+        segment: &str,
+        segment_id: &[u8; 16],
+        suffix: &str,
+    ) -> io::Result<Self> {
+        let [dvd_name, dvm_name] = crate::doc_values::file_names(segment, suffix);
+        let mut dvm = dir.open_checksum_input(&dvm_name)?;
+        check_index_header(&mut dvm, META_CODEC, VERSION, VERSION, segment_id, suffix)?;
+        let mut entries = Vec::new();
+        loop {
+            let field_number = dvm.read_int()?;
+            if field_number == -1 {
+                break; // EOF marker（写侧 doc_values.rs:163）
+            }
+            match dvm.read_byte()? {
+                TYPE_NUMERIC => {
+                    let m = read_numeric_meta(&mut dvm)?;
+                    entries.push((field_number, DvEntry::Numeric(m)));
+                }
+                TYPE_SORTED => {
+                    let ords = read_numeric_meta(&mut dvm)?;
+                    let m = read_terms_meta(&mut dvm, ords)?;
+                    entries.push((field_number, DvEntry::Sorted(m)));
+                }
+                t => return Err(corrupt(format!("unsupported DV type {t}"))),
+            }
+        }
+        check_footer(&mut dvm)?;
+
+        let mut dvd_in = dir.open_input(&dvd_name)?;
+        check_index_header(
+            &mut dvd_in,
+            DATA_CODEC,
+            VERSION,
+            VERSION,
+            segment_id,
+            suffix,
+        )?;
+        let header_len = dvd_in.file_pointer();
+        check_footer_structure(&dvd_in, dvd_in.length())?;
+        let mut dvd = vec![0u8; (dvd_in.length() - header_len - 16) as usize]; // 16 = footer
+        dvd_in.read_bytes(&mut dvd)?;
+        Ok(DocValuesReader {
+            dvd,
+            header_len,
+            entries,
+        })
+    }
+
+    /// meta 里的 offset 是 .dvd 绝对 fp；self.dvd 以 header 末尾为 0 基。
+    fn slice(&self, offset: i64, length: i64) -> &[u8] {
+        let start = (offset as u64 - self.header_len) as usize;
+        &self.dvd[start..start + length as usize]
+    }
+
+    fn numeric_meta(&self, field_number: i32) -> Option<&NumericMeta> {
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == field_number)
+            .and_then(|(_, e)| match e {
+                DvEntry::Numeric(m) => Some(m),
+                DvEntry::Sorted(_) => None,
+            })
+    }
+
+    fn sorted_meta(&self, field_number: i32) -> Option<&SortedMeta> {
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == field_number)
+            .and_then(|(_, e)| match e {
+                DvEntry::Sorted(m) => Some(m),
+                DvEntry::Numeric(_) => None,
+            })
+    }
+
+    /// docsWithField（IndexedDISI 顺序解码，IndexedDISI.java:102-254）：
+    /// docs_offset==-2 → 空；==-1 → 0..num_values（稠密）；否则逐块——块头
+    /// LE short blockID + LE short cardinality-1；SPARSE（≤4095：LE short
+    /// 低 16 位）、DENSE（256B rank 跳过 + 1024 LE long 位图展开）、
+    /// ALL（==65536：无 payload）；sentinel 块（blockID == 0x7FFF）止；
+    /// jump table 在块区末尾，顺序读不消费。
+    fn read_docs_with_field(&self, m: &NumericMeta) -> io::Result<Vec<u32>> {
+        if m.docs_offset == -2 {
+            return Ok(Vec::new());
+        }
+        if m.docs_offset == -1 {
+            return Ok((0..m.num_values as u32).collect());
+        }
+        let region = self.slice(m.docs_offset, m.docs_length);
+        let le_u16 = |p: usize| u16::from_le_bytes(region[p..p + 2].try_into().unwrap());
+        let mut docs = Vec::with_capacity(m.num_values as usize);
+        let mut pos = 0usize;
+        loop {
+            let block_id = le_u16(pos) as u32;
+            let cardinality = le_u16(pos + 2) as u32 + 1;
+            pos += 4;
+            if block_id == DISI_SENTINEL_BLOCK {
+                break;
+            }
+            if cardinality <= DISI_MAX_ARRAY_LENGTH {
+                for _ in 0..cardinality {
+                    docs.push((block_id << 16) | le_u16(pos) as u32);
+                    pos += 2;
+                }
+            } else if cardinality == DISI_BLOCK_SIZE {
+                docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
+            } else {
+                pos += 256; // rank table
+                for word_index in 0..1024usize {
+                    let mut w = u64::from_le_bytes(region[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    while w != 0 {
+                        let bit = w.trailing_zeros();
+                        docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
+                        w &= w - 1;
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(docs.len() as u64, m.num_values);
+        Ok(docs)
+    }
+
+    /// 值流：bpv==0 → vec![min; num_values]（producer :487-493）；否则
+    /// DirectReader 逐值 `min + gcd * get(i)`（:527-534；gcd 恒 1 按通用解）。
+    fn read_values(&self, m: &NumericMeta) -> Vec<i64> {
+        if m.bpv == 0 {
+            return vec![m.min; m.num_values as usize];
+        }
+        let reader = DirectReader::new(
+            self.slice(m.values_offset, m.values_length),
+            m.bpv as u32,
+            0,
+        )
+        .expect("writer-supported bpv");
+        (0..m.num_values)
+            .map(|i| {
+                (reader.get(i) as i64)
+                    .wrapping_mul(m.gcd)
+                    .wrapping_add(m.min)
+            })
+            .collect()
+    }
+
+    /// 逐 doc (doc, value)，doc 升序。全空 → 空 Vec。
+    pub fn numeric_values(&self, field_number: i32) -> io::Result<Vec<(u32, i64)>> {
+        let Some(m) = self.numeric_meta(field_number) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no NUMERIC DV entry for field {field_number}"),
+            ));
+        };
+        let docs = self.read_docs_with_field(m)?;
+        let values = self.read_values(m);
+        debug_assert_eq!(docs.len(), values.len());
+        Ok(docs.into_iter().zip(values).collect())
+    }
+
+    /// 逐 doc (doc, ord)，doc 升序：ords 子条目走 numeric 同一路径。
+    pub fn sorted_ords(&self, field_number: i32) -> io::Result<Vec<(u32, u32)>> {
+        let Some(s) = self.sorted_meta(field_number) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no SORTED DV entry for field {field_number}"),
+            ));
+        };
+        let docs = self.read_docs_with_field(&s.ords)?;
+        let values = self.read_values(&s.ords);
+        Ok(docs
+            .into_iter()
+            .zip(values)
+            .map(|(d, o)| (d, o as u32))
+            .collect())
+    }
+
+    /// terms dict 全量展开：64 项/块，块首词 verbatim（VInt 长度 + 字节），
+    /// 其余在 `VInt uncompressedLength + LZ4 流` 内前缀压缩（token 低 4 位
+    /// prefix（15 ⇒ +VInt 续）、高 4 位 suffix-1（=15 ⇒ suffix = 16+VInt）——
+    /// 写侧 doc_values.rs:280-291 的逆；块地址 DirectMonotonic :578）。
+    pub fn sorted_dict(&self, field_number: i32) -> io::Result<Vec<Vec<u8>>> {
+        let Some(s) = self.sorted_meta(field_number) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no SORTED DV entry for field {field_number}"),
+            ));
+        };
+        if s.dict_size == 0 {
+            return Ok(Vec::new());
+        }
+        let num_blocks = (s.dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE);
+        let addrs = DirectMonotonicReader::new(
+            &s.addresses_meta,
+            self.slice(s.terms_addresses_offset, s.terms_addresses_length),
+            num_blocks,
+            s.block_shift,
+        )?;
+        let data = self.slice(s.terms_data_offset, s.terms_data_length);
+        let mut terms = Vec::with_capacity(s.dict_size as usize);
+        for b in 0..num_blocks {
+            let start = addrs.get(b as u64) as usize;
+            let end = if b + 1 < num_blocks {
+                addrs.get(b as u64 + 1) as usize
+            } else {
+                data.len()
+            };
+            let region = &data[start..end];
+            let mut r = IndexInput::in_memory(region.to_vec());
+            let first_len = r.read_vint()? as usize;
+            let mut first = vec![0u8; first_len];
+            r.read_bytes(&mut first)?;
+            terms.push(first.clone());
+            let block_count =
+                (s.dict_size as usize - b * TERMS_DICT_BLOCK_SIZE).min(TERMS_DICT_BLOCK_SIZE);
+            if block_count > 1 {
+                let uncompressed = r.read_vint()? as usize;
+                let mut compressed = vec![0u8; region.len() - r.file_pointer() as usize];
+                r.read_bytes(&mut compressed)?;
+                let decompressed = lz4::block::decompress(&compressed, Some(uncompressed as i32))
+                    .map_err(|e| corrupt(format!("terms dict lz4: {e}")))?;
+                let mut dr = IndexInput::in_memory(decompressed);
+                let mut prev = first;
+                for _ in 1..block_count {
+                    let token = dr.read_byte()? as usize;
+                    let mut prefix = token & 0x0F;
+                    let mut suffix = 1 + (token >> 4);
+                    if prefix == 15 {
+                        prefix += dr.read_vint()? as usize;
+                    }
+                    if suffix == 16 {
+                        suffix += dr.read_vint()? as usize;
+                    }
+                    let mut sfx = vec![0u8; suffix];
+                    dr.read_bytes(&mut sfx)?;
+                    let mut term = prev[..prefix].to_vec();
+                    term.extend_from_slice(&sfx);
+                    prev = term.clone();
+                    terms.push(term);
+                }
+            }
+        }
+        Ok(terms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc_values::DocValuesWriter;
+    use std::fs;
+    use std::path::PathBuf;
+
+    const SEGMENT_ID: [u8; 16] = [0x5A; 16];
+    const SUFFIX: &str = "Lucene90_0";
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("codec-lucene9-dvr-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn write_index(tag: &str, f: impl FnOnce(&mut DocValuesWriter)) -> PathBuf {
+        let root = temp_dir(tag);
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut w = DocValuesWriter::new(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        f(&mut w);
+        w.finish().unwrap();
+        root
+    }
+
+    #[test]
+    fn numeric_dense_sparse_empty() {
+        let max_doc = 200_000u32;
+        // field 0: 稠密常量（bpv 0、无 DISI）
+        let constant: Vec<(u32, i64)> = (0..1000).map(|d| (d, 42)).collect();
+        // field 1: 稀疏三形态 DISI（照抄 doc_values.rs 既有测试的分布）
+        let mut sparse: Vec<(u32, i64)> = vec![(5, -7), (100, 8), (4095, 9)];
+        for i in 0..5000u32 {
+            sparse.push((65536 + i, i as i64 * 3));
+        }
+        for i in 0..65536u32 {
+            sparse.push((131072 + i, -1));
+        }
+        // field 2: 全空（docsWithField = -2 分支）
+        let root = write_index("num", |w| {
+            w.add_numeric_field(0, max_doc, &constant).unwrap();
+            w.add_numeric_field(1, max_doc, &sparse).unwrap();
+            w.add_numeric_field(2, max_doc, &[]).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        assert_eq!(r.numeric_values(0).unwrap(), constant);
+        assert_eq!(r.numeric_values(1).unwrap(), sparse);
+        assert_eq!(r.numeric_values(2).unwrap(), Vec::<(u32, i64)>::new());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sorted_dict_and_ords() {
+        // 150 词 → 3 个 64 项块；ords 部分 doc 无值（docsWithField 稀疏）
+        let dict: Vec<String> = (0..150).map(|i| format!("term-{i:04}")).collect();
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = (0..300u32)
+            .filter(|d| d % 3 != 0) // 200/300 docs 有值 → DISI 稀疏路径
+            .enumerate()
+            .map(|(i, d)| (d, (i % 150) as u32)) // 200 个有值 doc 覆盖 150 个 ord
+            .collect();
+        let root = write_index("sorted", |w| {
+            w.add_sorted_field(0, 300, &dict_refs, &ords).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let got_dict = r.sorted_dict(0).unwrap();
+        assert_eq!(got_dict.len(), 150);
+        for (got, want) in got_dict.iter().zip(dict.iter()) {
+            assert_eq!(got, want.as_bytes());
+        }
+        assert_eq!(r.sorted_ords(0).unwrap(), ords);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn empty_sorted_field() {
+        let root = write_index("empty", |w| {
+            w.add_sorted_field(1, 10, &[], &[]).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        assert!(r.sorted_dict(1).unwrap().is_empty());
+        assert!(r.sorted_ords(1).unwrap().is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+}

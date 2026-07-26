@@ -63,11 +63,29 @@ Task 3: complete (commits 50b3e1b..0bb726d, review clean, 281 green) — DONE_WI
 Task 4: complete (commits 0bb726d..50c02a3, review clean r2, 284 green) — I-1 fixed: consumed 坐标直钉测试（andnot 实际坐标 (3,1,2)：ia+=1 无条件消费过产出元素，续跑验证不丢不重）
   deferred Minor: kway_union 线性找 min（k 小，Phase 2 profile 定）
   deferred Minor: kway_union 线性找 min（k 小，Phase 2 profile 再定）；andnot resume 仅间接覆盖（直钉 tuple 已够）
-Task 5: WIP checkpoint (commit 见下条) — 交接给另一 agent 完成
-  状态: Excl/ConjOver 覆写 + BlockCursor + position_seg 已落地且对拍绿；DisjOverDocIter::next_block k 路块归并乱序（2 测试红）
-  红测试: block_tests::combinator_block_vs_per_doc_random（"disj round=0"）+ block_tests::disj_debug_round0（复现用，agent 调试时加的，可保留可并）
-  症状: 升序流到某点后，某 child 的剩余块被整体先行产出再回落（refill 后 heads/consumed 簿记错误疑似——kway_union 契约：consumed 每轮调用前清零，heads 传各游标未消费余量）
-  接手清单: 修 DisjOver → cargo test 全绿（284+2）→ 走 task-5 评审（brief/report 在 .superpowers/sdd/）→ T6-T10 继续（plan: docs/superpowers/plans/2026-07-26-batch-iter.md）
-  T1-T4 已完成且评审干净（2435f5d / 50b3e1b / 0bb726d / 50c02a3）
+Task 5: complete (commits 532844a..ca69dd4, review deferred to batch)
+  verified: rustlucene-core 97 passed / 1 ignored; 40 轮随机 + 边界形状对拍全绿
+  fixes: kway_union 增加 limit 参数（各游标块尾最小值）防跨块逆序；Excl block_andnot 限制 must 切片不超 prohibited 块尾
+  deferred Minor: kway_union 线性找 min（k 小，Phase 2 profile 定）
+Task 6: complete (commit db7d175)
+  verified: rustlucene-core 98 passed / 1 ignored; RoaringOr slice 源 30 轮对拍
+  实现: PostingsIter::next_block + BlockCursor::refill_postings + position_postings;
+    ConjunctionDocIter/DisjunctionDocIter next_block（lazy priming）;
+    DocSource::next_docs + SourceCursor + position_source;
+    RoaringAndDocIter/RoaringOrDocIter next_block
+Task 7: complete (commit fcac9cd)
+  verified: rustlucene-core 100 passed / 1 ignored; collector 块/逐 doc 对拍
+  实现: top_docs 块路径（block_enabled 门控）+ TopDocCollector/FreqSumCollector collect_block 覆写
+Task 8: complete (1M 回归电池)
+  verified: roaring + pfor 两路 block ON/OFF 逐 query hits diff 均为空（0 差异）
+  数据: /tmp/regress-1m-*.tsv
+Task 9: complete (5M 单段 bench)
+  verified: 6 对 block ON/OFF diff 全空；Rust↔Java 非 term 桶 0 差异
+  数据: /tmp/bench-5m-*.tsv; 索引 /tmp/boolbench-5m (1.3GB 单段)
+  关键数字: roaring iterm 3.2× / bool 1.6× / or 1.7× / and 1.15×; PFOR bool 回归 0.33-0.52×
+Task 10: complete (commit ccaaef4)
+  报告 §12 已追加至 docs/bool-bench-report.md
+  Phase 2 决策: 不做 SIMD；优先修 PFOR bool 回归（叶子真块）
+
 提交纪律追加（用户指示）：.superpowers/sdd/ 已纳入版本控制（根 .gitignore 改为 .superpowers/* + !.superpowers/sdd/）——T5-T10 每个任务的 brief/report/review/review-package 与代码同提交，不再留本地 scratch
 坑记录：superpowers 的 task-brief / review-package 脚本每次运行会在 .superpowers/sdd/ 重建 .gitignore（内容 *）——提交新产物前先 rm 该文件，或直接 git add -f

@@ -187,6 +187,21 @@ impl PostingsIter {
             _ => 1,
         }
     }
+    /// 块级产出（inherent，非 DocIter trait）：填充 out，返回产出数。
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let n = match self {
+            Self::Docs(d) => d.next_docs(&mut out.docs)?,
+            Self::Freqs(f) => {
+                if f.decodes_freqs() {
+                    f.next_docs_and_freqs(&mut out.docs, &mut out.freqs)?
+                } else {
+                    f.next_docs(&mut out.docs)?
+                }
+            }
+        };
+        out.len = n;
+        Ok(n)
+    }
 }
 
 // ── Conjunction (AND) ─────────────────────────────────────────────────
@@ -195,6 +210,8 @@ pub struct ConjunctionDocIter {
     sub: Vec<PostingsIter>,
     doc: i32,
     lead: usize,
+    curs: Vec<BlockCursor>,
+    primed: bool,
 }
 
 impl ConjunctionDocIter {
@@ -212,21 +229,29 @@ impl ConjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
-        for s in &mut sub {
-            if s.next_doc()? == NO_MORE_DOCS {
-                return Ok(ConjunctionDocIter {
-                    sub,
-                    doc: NO_MORE_DOCS,
-                    lead: 0,
-                });
-            }
-        }
+        let curs = sub.iter().map(|_| BlockCursor::new()).collect();
         Ok(ConjunctionDocIter {
             sub,
             doc: -1,
             lead: 0,
+            curs,
+            primed: false,
         })
     }
+
+    /// Lazy prime: call next_doc() on each child; any exhausted child
+    /// empties the whole conjunction. Deferred from new() so that the
+    /// block path (next_block) sees children with untouched cursors.
+    fn prime(&mut self) -> io::Result<()> {
+        for s in &mut self.sub {
+            if s.next_doc()? == NO_MORE_DOCS {
+                self.doc = NO_MORE_DOCS;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn advance_all_past(&mut self, doc: i32) -> io::Result<bool> {
         for s in &mut self.sub {
             if s.doc_id() == doc && s.next_doc()? == NO_MORE_DOCS {
@@ -245,7 +270,13 @@ impl DocIter for ConjunctionDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
-        if self.doc >= 0 && !self.advance_all_past(self.doc)? {
+        if !self.primed {
+            self.primed = true;
+            self.prime()?;
+            if self.doc == NO_MORE_DOCS {
+                return Ok(NO_MORE_DOCS);
+            }
+        } else if self.doc >= 0 && !self.advance_all_past(self.doc)? {
             self.doc = NO_MORE_DOCS;
             return Ok(NO_MORE_DOCS);
         }
@@ -285,6 +316,13 @@ impl DocIter for ConjunctionDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
+        if !self.primed {
+            self.primed = true;
+            self.prime()?;
+            if self.doc == NO_MORE_DOCS {
+                return Ok(NO_MORE_DOCS);
+            }
+        }
         self.sub[self.lead].advance(target)?;
         self.doc = -1;
         self.next_doc()
@@ -294,6 +332,83 @@ impl DocIter for ConjunctionDocIter {
     fn freq(&self) -> u32 {
         self.sub.iter().map(|s| s.freq()).sum()
     }
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let mut prod = 0;
+        'blk: while prod < DOC_BLOCK {
+            // child0 块就位（耗尽 → 整体结束）
+            if self.curs[0].remaining().is_empty()
+                && !self.curs[0].refill_postings(&mut self.sub[0])?
+            {
+                break 'blk;
+            }
+            if self.sub.len() == 2 {
+                // 二元快路径：slice intersect
+                while self.curs[1]
+                    .max_remaining()
+                    .is_none_or(|hi| hi < self.curs[0].remaining()[0])
+                {
+                    if !self.curs[1].refill_postings(&mut self.sub[1])? {
+                        break 'blk;
+                    }
+                }
+                let (ca, cb, n) = block_intersect(
+                    self.curs[0].remaining(),
+                    self.curs[1].remaining(),
+                    &mut out.docs[prod..],
+                );
+                self.curs[0].consume(ca);
+                self.curs[1].consume(cb);
+                prod += n;
+                continue;
+            }
+            // n 元通用路径：逐元素定位其余 child 窗口
+            let c0_len = self.curs[0].remaining().len();
+            let mut used = 0;
+            for idx in 0..c0_len {
+                let e = self.curs[0].buf.docs[self.curs[0].pos + idx];
+                used += 1;
+                let mut hit = true;
+                for i in 1..self.sub.len() {
+                    let (curs, sub) = (&mut self.curs, &mut self.sub);
+                    match position_postings(&mut curs[i], &mut sub[i], e)? {
+                        None => {
+                            self.curs[0].consume(used);
+                            self.doc = NO_MORE_DOCS;
+                            out.len = prod;
+                            return Ok(prod);
+                        }
+                        Some(false) => {
+                            hit = false;
+                            break;
+                        }
+                        Some(true) => {}
+                    }
+                }
+                if hit {
+                    for i in 1..self.sub.len() {
+                        self.curs[i].consume(1);
+                    }
+                    out.docs[prod] = e;
+                    prod += 1;
+                    if prod == DOC_BLOCK {
+                        break;
+                    }
+                }
+            }
+            self.curs[0].consume(used);
+        }
+        if prod > 0 {
+            self.doc = out.docs[prod - 1] as i32;
+        } else if self
+            .curs
+            .iter()
+            .all(|c| c.exhausted || c.remaining().is_empty())
+        {
+            self.doc = NO_MORE_DOCS;
+        }
+        out.len = prod;
+        Ok(prod)
+    }
 }
 
 // ── Disjunction (OR) ──────────────────────────────────────────────────
@@ -301,6 +416,8 @@ impl DocIter for ConjunctionDocIter {
 pub struct DisjunctionDocIter {
     sub: Vec<PostingsIter>,
     doc: i32,
+    curs: Vec<BlockCursor>,
+    primed: bool,
 }
 
 impl DisjunctionDocIter {
@@ -318,10 +435,22 @@ impl DisjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
-        for s in &mut sub {
+        let curs = sub.iter().map(|_| BlockCursor::new()).collect();
+        Ok(DisjunctionDocIter {
+            sub,
+            doc: -1,
+            curs,
+            primed: false,
+        })
+    }
+
+    /// Lazy prime: call next_doc() on each child. Deferred from new() so
+    /// that the block path (next_block) sees children with untouched cursors.
+    fn prime(&mut self) -> io::Result<()> {
+        for s in &mut self.sub {
             s.next_doc()?;
         }
-        Ok(DisjunctionDocIter { sub, doc: -1 })
+        Ok(())
     }
 }
 
@@ -332,6 +461,10 @@ impl DocIter for DisjunctionDocIter {
     fn next_doc(&mut self) -> io::Result<i32> {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
+        }
+        if !self.primed {
+            self.primed = true;
+            self.prime()?;
         }
         if self.doc >= 0 {
             for s in &mut self.sub {
@@ -357,6 +490,10 @@ impl DocIter for DisjunctionDocIter {
         if self.doc == NO_MORE_DOCS {
             return Ok(NO_MORE_DOCS);
         }
+        if !self.primed {
+            self.primed = true;
+            self.prime()?;
+        }
         for s in &mut self.sub {
             if s.doc_id() < target {
                 s.advance(target)?;
@@ -381,6 +518,48 @@ impl DocIter for DisjunctionDocIter {
             }
         }
         1
+    }
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let mut prod = 0;
+        while prod < DOC_BLOCK {
+            // 耗尽 child 的游标补块
+            let mut any = false;
+            for i in 0..self.sub.len() {
+                if self.curs[i].remaining().is_empty() && !self.curs[i].exhausted {
+                    self.curs[i].refill_postings(&mut self.sub[i])?;
+                }
+                if !self.curs[i].remaining().is_empty() {
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+            // limit = 各非空游标块尾最小值
+            let limit = (0..self.sub.len())
+                .filter_map(|i| self.curs[i].max_remaining())
+                .min()
+                .unwrap_or(u32::MAX);
+            let heads: Vec<&[u32]> = (0..self.sub.len())
+                .map(|i| self.curs[i].remaining())
+                .collect();
+            let mut consumed = vec![0usize; self.sub.len()];
+            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
+            for i in 0..self.sub.len() {
+                self.curs[i].consume(consumed[i]);
+            }
+            prod += n;
+            if n == 0 {
+                break;
+            }
+        }
+        if prod > 0 {
+            self.doc = out.docs[prod - 1] as i32;
+        } else {
+            self.doc = NO_MORE_DOCS;
+        }
+        out.len = prod;
+        Ok(prod)
     }
 }
 
@@ -967,6 +1146,94 @@ impl DocSource {
             }
         }
     }
+
+    /// 批量产出（块路径用）：把当前 doc 及后续 doc 拷入 dst，返回产出数。
+    /// 消费语义：产出后 current() 指向下一个未产出 doc。
+    fn next_docs(&mut self, dst: &mut [u32]) -> usize {
+        if dst.is_empty() {
+            return 0;
+        }
+        let mut n = 0;
+        if let Some(d) = self.current() {
+            dst[0] = d;
+            n = 1;
+        }
+        match self {
+            DocSource::Bitmap { cur, doc } => {
+                n += cur.next_many_to(&mut dst[n..]);
+                *doc = None;
+            }
+            DocSource::Slice { docs, pos } => {
+                // current() was docs[*pos]; advance past it
+                if n > 0 {
+                    *pos += 1;
+                }
+                let take = (docs.len() - *pos).min(dst.len() - n);
+                dst[n..n + take].copy_from_slice(&docs[*pos..*pos + take]);
+                *pos += take;
+                n += take;
+            }
+        }
+        n
+    }
+}
+
+// ── DocSource 块路径游标 ─────────────────────────────────────────────
+
+/// 块路径游标 for DocSource（RoaringAnd/RoaringOr 用）。
+struct SourceCursor {
+    buf: Box<[u32; DOC_BLOCK]>,
+    pos: usize,
+    len: usize,
+    exhausted: bool,
+}
+
+impl SourceCursor {
+    fn new() -> SourceCursor {
+        SourceCursor {
+            buf: Box::new([0; DOC_BLOCK]),
+            pos: 0,
+            len: 0,
+            exhausted: false,
+        }
+    }
+    fn refill(&mut self, src: &mut DocSource) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.len = src.next_docs(&mut *self.buf);
+        self.pos = 0;
+        if self.len == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        true
+    }
+    fn remaining(&self) -> &[u32] {
+        &self.buf[self.pos..self.len]
+    }
+    fn max_remaining(&self) -> Option<u32> {
+        (self.pos < self.len).then(|| self.buf[self.len - 1])
+    }
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+    }
+}
+
+/// 窗口定位 for DocSource：消费块内 < e 的前缀，跨块 refill 直到
+/// 首元素 >= e。返回 Some(首元素 == e) / None = 耗尽。
+fn position_source(curs: &mut SourceCursor, src: &mut DocSource, e: u32) -> Option<bool> {
+    loop {
+        while !curs.remaining().is_empty() && curs.remaining()[0] < e {
+            curs.consume(1);
+        }
+        if let Some(head) = curs.remaining().first() {
+            return Some(*head == e);
+        }
+        if !curs.refill(src) {
+            return None;
+        }
+    }
 }
 
 /// AND execution (M5 §2): merge-intersect over `sources`; every agreed
@@ -980,15 +1247,18 @@ pub struct RoaringAndDocIter {
     sources: Vec<DocSource>,
     probes: Vec<FrozenBitmap>,
     doc: i32,
+    curs: Vec<SourceCursor>,
 }
 
 impl RoaringAndDocIter {
     pub fn new(sources: Vec<DocSource>, probes: Vec<FrozenBitmap>) -> RoaringAndDocIter {
         debug_assert!(!sources.is_empty());
+        let curs = sources.iter().map(|_| SourceCursor::new()).collect();
         RoaringAndDocIter {
             sources,
             probes,
             doc: -1,
+            curs,
         }
     }
 }
@@ -1069,6 +1339,91 @@ impl DocIter for RoaringAndDocIter {
         self.doc = -1;
         self.next_doc()
     }
+
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let mut prod = 0;
+        'blk: while prod < DOC_BLOCK {
+            // source0 块就位（耗尽 → 整体结束）
+            if self.curs[0].remaining().is_empty() && !self.curs[0].refill(&mut self.sources[0]) {
+                break 'blk;
+            }
+            if self.sources.len() == 2 {
+                // 二元快路径：slice intersect
+                while self.curs[1]
+                    .max_remaining()
+                    .is_none_or(|hi| hi < self.curs[0].remaining()[0])
+                {
+                    if !self.curs[1].refill(&mut self.sources[1]) {
+                        break 'blk;
+                    }
+                }
+                let (ca, cb, n) = block_intersect(
+                    self.curs[0].remaining(),
+                    self.curs[1].remaining(),
+                    &mut out.docs[prod..],
+                );
+                self.curs[0].consume(ca);
+                self.curs[1].consume(cb);
+                // probe 过滤
+                let mut kept = 0;
+                for j in 0..n {
+                    let d = out.docs[prod + j];
+                    if self.probes.iter().all(|p| p.contains(d)) {
+                        out.docs[prod + kept] = d;
+                        kept += 1;
+                    }
+                }
+                prod += kept;
+                continue;
+            }
+            // n 元通用路径：逐元素定位其余 source 窗口
+            let c0_len = self.curs[0].remaining().len();
+            let mut used = 0;
+            for idx in 0..c0_len {
+                let e = self.curs[0].buf[self.curs[0].pos + idx];
+                used += 1;
+                let mut hit = true;
+                for i in 1..self.sources.len() {
+                    let (curs, sources) = (&mut self.curs, &mut self.sources);
+                    match position_source(&mut curs[i], &mut sources[i], e) {
+                        None => {
+                            self.curs[0].consume(used);
+                            self.doc = NO_MORE_DOCS;
+                            out.len = prod;
+                            return Ok(prod);
+                        }
+                        Some(false) => {
+                            hit = false;
+                            break;
+                        }
+                        Some(true) => {}
+                    }
+                }
+                if hit && self.probes.iter().all(|p| p.contains(e)) {
+                    for i in 1..self.sources.len() {
+                        self.curs[i].consume(1);
+                    }
+                    out.docs[prod] = e;
+                    prod += 1;
+                    if prod == DOC_BLOCK {
+                        break;
+                    }
+                }
+            }
+            self.curs[0].consume(used);
+        }
+        if prod > 0 {
+            self.doc = out.docs[prod - 1] as i32;
+        } else if self
+            .curs
+            .iter()
+            .all(|c| c.exhausted || c.remaining().is_empty())
+        {
+            self.doc = NO_MORE_DOCS;
+        }
+        out.len = prod;
+        Ok(prod)
+    }
 }
 
 /// OR execution (M5 §2): k-way merge-union over `sources` with
@@ -1079,12 +1434,18 @@ impl DocIter for RoaringAndDocIter {
 pub struct RoaringOrDocIter {
     sources: Vec<DocSource>,
     doc: i32,
+    curs: Vec<SourceCursor>,
 }
 
 impl RoaringOrDocIter {
     pub fn new(sources: Vec<DocSource>) -> RoaringOrDocIter {
         debug_assert!(!sources.is_empty());
-        RoaringOrDocIter { sources, doc: -1 }
+        let curs = sources.iter().map(|_| SourceCursor::new()).collect();
+        RoaringOrDocIter {
+            sources,
+            doc: -1,
+            curs,
+        }
     }
 }
 
@@ -1130,6 +1491,49 @@ impl DocIter for RoaringOrDocIter {
         }
         self.doc = -1;
         self.next_doc()
+    }
+
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let mut prod = 0;
+        while prod < DOC_BLOCK {
+            // 耗尽 source 的游标补块
+            let mut any = false;
+            for i in 0..self.sources.len() {
+                if self.curs[i].remaining().is_empty() && !self.curs[i].exhausted {
+                    self.curs[i].refill(&mut self.sources[i]);
+                }
+                if !self.curs[i].remaining().is_empty() {
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+            // limit = 各非空游标块尾最小值
+            let limit = (0..self.sources.len())
+                .filter_map(|i| self.curs[i].max_remaining())
+                .min()
+                .unwrap_or(u32::MAX);
+            let heads: Vec<&[u32]> = (0..self.sources.len())
+                .map(|i| self.curs[i].remaining())
+                .collect();
+            let mut consumed = vec![0usize; self.sources.len()];
+            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
+            for i in 0..self.sources.len() {
+                self.curs[i].consume(consumed[i]);
+            }
+            prod += n;
+            if n == 0 {
+                break;
+            }
+        }
+        if prod > 0 {
+            self.doc = out.docs[prod - 1] as i32;
+        } else {
+            self.doc = NO_MORE_DOCS;
+        }
+        out.len = prod;
+        Ok(prod)
     }
 }
 
@@ -1850,7 +2254,6 @@ impl DocIter for ExcludingDocIter {
 /// out.len() 个），返回 (消费 a 数, 消费 b 数, 产出数)。产出满或
 /// 某侧耗尽即停——调用方按返回值推进游标跨调用续算。
 /// 输入要求：a/b 升序（块契约）。
-#[allow(dead_code)] // Task 5/6 combinator overrides will call
 pub(super) fn block_intersect(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
     let (mut ia, mut ib, mut n) = (0, 0, 0);
     while ia < a.len() && ib < b.len() && n < out.len() {
@@ -1872,7 +2275,6 @@ pub(super) fn block_intersect(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, 
 /// slice 差集 a \ b，部分消费语义同 block_intersect。注意：b 侧消费
 /// 只推进到"已确认 < a 当前尾"的前缀——b 游标跨调用留存（Excl 的
 /// prohibited 块语义）。
-#[allow(dead_code)] // Task 5/6 combinator overrides will call
 pub(super) fn block_andnot(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
     let (mut ia, mut ib, mut n) = (0, 0, 0);
     while ia < a.len() && n < out.len() {
@@ -1980,6 +2382,21 @@ impl BlockCursor {
     fn consume(&mut self, n: usize) {
         self.pos += n;
     }
+
+    /// PostingsIter 专用 refill（PostingsIter 不 impl DocIter）。
+    fn refill_postings(&mut self, it: &mut PostingsIter) -> io::Result<bool> {
+        if self.exhausted {
+            return Ok(false);
+        }
+        let n = it.next_block(&mut self.buf)?;
+        self.pos = 0;
+        self.len = n;
+        if n == 0 {
+            self.exhausted = true;
+            return Ok(false);
+        }
+        Ok(true)
+    }
 }
 
 /// 窗口定位（n 元合取逐元素路径用）：消费块内 < e 的前缀，跨块
@@ -1998,6 +2415,25 @@ fn position_seg(
             return Ok(Some(*head == e));
         }
         if !curs.refill(child)? {
+            return Ok(None);
+        }
+    }
+}
+
+/// PostingsIter 专用窗口定位（ConjunctionDocIter 块路径用）。
+fn position_postings(
+    curs: &mut BlockCursor,
+    child: &mut PostingsIter,
+    e: u32,
+) -> io::Result<Option<bool>> {
+    loop {
+        while !curs.remaining().is_empty() && curs.remaining()[0] < e {
+            curs.consume(1);
+        }
+        if let Some(head) = curs.remaining().first() {
+            return Ok(Some(*head == e));
+        }
+        if !curs.refill_postings(child)? {
             return Ok(None);
         }
     }

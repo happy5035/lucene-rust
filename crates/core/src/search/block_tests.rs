@@ -162,7 +162,8 @@ fn leaves_block_vs_per_doc_random() {
 }
 
 use super::doc_iter::{
-    block_andnot, block_intersect, kway_union, ConjOverDocIter, DisjOverDocIter, ExcludingDocIter,
+    block_andnot, block_intersect, kway_union, ConjOverDocIter, DisjOverDocIter, DocSource,
+    ExcludingDocIter, RoaringOrDocIter,
 };
 
 fn run(
@@ -444,4 +445,31 @@ fn disj_debug_round0() {
         call += 1;
     }
     assert_eq!(v, expect);
+}
+
+#[test]
+fn roaring_or_slice_sources_block_vs_per_doc() {
+    let mut lcg = Lcg(5678);
+    for round in 0..30 {
+        let k = 2 + (lcg.next_u32() % 4) as usize;
+        let sets: Vec<Vec<u32>> = (0..k)
+            .map(|_| {
+                let cnt = (lcg.next_u32() % 700) as usize;
+                lcg.doc_set(8_000, cnt)
+            })
+            .collect();
+        let mk = || {
+            let sources: Vec<DocSource> =
+                sets.iter().map(|s| DocSource::slice(s.clone())).collect();
+            SegmentDocIter::RoaringOr(RoaringOrDocIter::new(sources))
+        };
+        let mut a = mk();
+        let mut b = mk();
+        assert_eq!(
+            stream_block(&mut a),
+            stream_per_doc(&mut b),
+            "round={round}"
+        );
+        assert_eq!(stream_block(&mut mk()), expect_disj(&sets));
+    }
 }

@@ -702,6 +702,10 @@ pub struct DocsEnum {
 }
 
 impl DocsEnum {
+    pub fn doc_freq(&self) -> u32 {
+        self.core.doc_freq
+    }
+
     pub fn doc_id(&self) -> i32 {
         self.core.doc as i32
     }
@@ -726,6 +730,10 @@ pub struct DocsFreqsEnum {
 }
 
 impl DocsFreqsEnum {
+    pub fn doc_freq(&self) -> u32 {
+        self.core.doc_freq
+    }
+
     pub fn doc_id(&self) -> i32 {
         self.core.doc as i32
     }

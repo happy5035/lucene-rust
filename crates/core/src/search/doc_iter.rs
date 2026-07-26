@@ -341,27 +341,7 @@ impl DocIter for ConjunctionDocIter {
             {
                 break 'blk;
             }
-            if self.sub.len() == 2 {
-                // 二元快路径：slice intersect
-                while self.curs[1]
-                    .max_remaining()
-                    .is_none_or(|hi| hi < self.curs[0].remaining()[0])
-                {
-                    if !self.curs[1].refill_postings(&mut self.sub[1])? {
-                        break 'blk;
-                    }
-                }
-                let (ca, cb, n) = block_intersect(
-                    self.curs[0].remaining(),
-                    self.curs[1].remaining(),
-                    &mut out.docs[prod..],
-                );
-                self.curs[0].consume(ca);
-                self.curs[1].consume(cb);
-                prod += n;
-                continue;
-            }
-            // n 元通用路径：逐元素定位其余 child 窗口
+            // 逐元素驱动：child0 块内遍历，其余 child 用 advance() 跳跃定位
             let c0_len = self.curs[0].remaining().len();
             let mut used = 0;
             for idx in 0..c0_len {
@@ -369,25 +349,19 @@ impl DocIter for ConjunctionDocIter {
                 used += 1;
                 let mut hit = true;
                 for i in 1..self.sub.len() {
-                    let (curs, sub) = (&mut self.curs, &mut self.sub);
-                    match position_postings(&mut curs[i], &mut sub[i], e)? {
-                        None => {
-                            self.curs[0].consume(used);
-                            self.doc = NO_MORE_DOCS;
-                            out.len = prod;
-                            return Ok(prod);
-                        }
-                        Some(false) => {
-                            hit = false;
-                            break;
-                        }
-                        Some(true) => {}
+                    let d = self.sub[i].advance(e as i32)?;
+                    if d == NO_MORE_DOCS {
+                        self.curs[0].consume(used);
+                        self.doc = NO_MORE_DOCS;
+                        out.len = prod;
+                        return Ok(prod);
+                    }
+                    if d != e as i32 {
+                        hit = false;
+                        break;
                     }
                 }
                 if hit {
-                    for i in 1..self.sub.len() {
-                        self.curs[i].consume(1);
-                    }
                     out.docs[prod] = e;
                     prod += 1;
                     if prod == DOC_BLOCK {
@@ -399,11 +373,7 @@ impl DocIter for ConjunctionDocIter {
         }
         if prod > 0 {
             self.doc = out.docs[prod - 1] as i32;
-        } else if self
-            .curs
-            .iter()
-            .all(|c| c.exhausted || c.remaining().is_empty())
-        {
+        } else if self.curs[0].exhausted || self.curs[0].remaining().is_empty() {
             self.doc = NO_MORE_DOCS;
         }
         out.len = prod;
@@ -1676,29 +1646,8 @@ impl DocIter for ConjOverDocIter {
             if self.curs[0].remaining().is_empty() && !self.curs[0].refill(&mut self.sub[0])? {
                 break 'blk;
             }
-            if self.sub.len() == 2 {
-                // 二元快路径（bench 主导形状）：slice intersect，ca/cb
-                // 直接是两侧块消费数，部分消费语义天然正确。
-                while self.curs[1]
-                    .max_remaining()
-                    .is_none_or(|hi| hi < self.curs[0].remaining()[0])
-                {
-                    if !self.curs[1].refill(&mut self.sub[1])? {
-                        break 'blk; // child1 耗尽 → 交耗尽
-                    }
-                }
-                let (ca, cb, n) = block_intersect(
-                    self.curs[0].remaining(),
-                    self.curs[1].remaining(),
-                    &mut out.docs[prod..],
-                );
-                self.curs[0].consume(ca);
-                self.curs[1].consume(cb);
-                prod += n;
-                continue; // n=0 时 ca/cb 已推进，安全续环（两侧非空时必有推进）
-            }
-            // n 元通用路径：逐元素定位其余 child 窗口（正确性优先于
-            // 二元 slice 快路径——scratch 折叠的消费坐标映射易错）。
+            // 逐元素驱动：child0 块内遍历，其余 child 用 advance() 跳跃定位
+            //（利用 postings skip list，稀疏交集时远优于线性 position_seg）。
             let c0_len = self.curs[0].remaining().len();
             let mut used = 0;
             for idx in 0..c0_len {
@@ -1706,27 +1655,19 @@ impl DocIter for ConjOverDocIter {
                 used += 1;
                 let mut hit = true;
                 for i in 1..self.sub.len() {
-                    let (curs, sub) = (&mut self.curs, &mut self.sub);
-                    match position_seg(&mut curs[i], &mut sub[i], e)? {
-                        None => {
-                            // child 耗尽 → 交耗尽
-                            self.curs[0].consume(used);
-                            self.doc = NO_MORE_DOCS;
-                            out.len = prod;
-                            return Ok(prod);
-                        }
-                        Some(false) => {
-                            hit = false;
-                            break; // 后续 child 无需定位（前向单调，下轮 e' > e 续推）
-                        }
-                        Some(true) => {}
+                    let d = self.sub[i].advance(e as i32)?;
+                    if d == NO_MORE_DOCS {
+                        self.curs[0].consume(used);
+                        self.doc = NO_MORE_DOCS;
+                        out.len = prod;
+                        return Ok(prod);
+                    }
+                    if d != e as i32 {
+                        hit = false;
+                        break;
                     }
                 }
                 if hit {
-                    // 命中：各 child 首元素 == e（position_seg 保证），消费
-                    for i in 1..self.sub.len() {
-                        self.curs[i].consume(1);
-                    }
                     out.docs[prod] = e;
                     prod += 1;
                     if prod == DOC_BLOCK {
@@ -1738,11 +1679,7 @@ impl DocIter for ConjOverDocIter {
         }
         if prod > 0 {
             self.doc = out.docs[prod - 1] as i32;
-        } else if self
-            .curs
-            .iter()
-            .all(|c| c.exhausted || c.remaining().is_empty())
-        {
+        } else if self.curs[0].exhausted || self.curs[0].remaining().is_empty() {
             self.doc = NO_MORE_DOCS;
         }
         out.len = prod;
@@ -2399,46 +2336,6 @@ impl BlockCursor {
     }
 }
 
-/// 窗口定位（n 元合取逐元素路径用）：消费块内 < e 的前缀，跨块
-/// refill 直到首元素 >= e。返回 `Some(首元素 == e)`（contains 判定）/
-/// `None` = child 耗尽。前向单调，对同一 child 以递增 e 序列调用。
-fn position_seg(
-    curs: &mut BlockCursor,
-    child: &mut SegmentDocIter,
-    e: u32,
-) -> io::Result<Option<bool>> {
-    loop {
-        while !curs.remaining().is_empty() && curs.remaining()[0] < e {
-            curs.consume(1);
-        }
-        if let Some(head) = curs.remaining().first() {
-            return Ok(Some(*head == e));
-        }
-        if !curs.refill(child)? {
-            return Ok(None);
-        }
-    }
-}
-
-/// PostingsIter 专用窗口定位（ConjunctionDocIter 块路径用）。
-fn position_postings(
-    curs: &mut BlockCursor,
-    child: &mut PostingsIter,
-    e: u32,
-) -> io::Result<Option<bool>> {
-    loop {
-        while !curs.remaining().is_empty() && curs.remaining()[0] < e {
-            curs.consume(1);
-        }
-        if let Some(head) = curs.remaining().first() {
-            return Ok(Some(*head == e));
-        }
-        if !curs.refill_postings(child)? {
-            return Ok(None);
-        }
-    }
-}
-
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {
@@ -2458,6 +2355,17 @@ pub enum SegmentDocIter {
     ConjOver(ConjOverDocIter),
     DisjOver(DisjOverDocIter),
     Excluding(ExcludingDocIter),
+}
+
+impl SegmentDocIter {
+    pub(crate) fn cost_estimate(&self) -> u64 {
+        match self {
+            Self::Docs(d) => d.doc_freq() as u64,
+            Self::Freqs(f) => f.doc_freq() as u64,
+            Self::All(a) => a.max_doc as u64,
+            _ => u64::MAX,
+        }
+    }
 }
 
 impl DocIter for SegmentDocIter {

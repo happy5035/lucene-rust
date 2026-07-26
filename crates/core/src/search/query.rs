@@ -536,7 +536,10 @@ fn conj_over(mut its: Vec<SegmentDocIter>) -> io::Result<Option<SegmentDocIter>>
     match its.len() {
         0 => Ok(None),
         1 => Ok(its.pop()),
-        _ => Ok(Some(SegmentDocIter::ConjOver(ConjOverDocIter::new(its)?))),
+        _ => {
+            its.sort_by_key(|it| it.cost_estimate());
+            Ok(Some(SegmentDocIter::ConjOver(ConjOverDocIter::new(its)?)))
+        }
     }
 }
 

@@ -338,17 +338,17 @@ pub(crate) fn point_range_bitmap(
     let Some(points) = seg.points_reader() else {
         return Ok(None);
     };
-    let mut docs: Vec<u32> = Vec::new();
-    // 多值点逐值回调（spec §3.2）；BKD 访问序按 (value, doc) 非 doc 序，
-    // 统一 sort + dedup 再建 bitmap（Bitmap::of 快路径要求升序，去重同时
-    // 解决多值点重复计数）。
-    points.intersect(field, low, high, &mut |_value, doc| docs.push(doc as u32))?;
-    docs.sort_unstable();
-    docs.dedup();
-    if docs.is_empty() {
+    // P1-3：doc-only 遍历（Inside 叶跳过值解码）+ 容器级增量插入。
+    // BKD 访问序按 (value, doc) 非 doc 序——旧路径 Vec+sort_unstable+dedup
+    // 再 Bitmap::of（排序 ~10ns/doc，1M 点 ~10ms）；croaring add 无序幂等
+    // （~5ns/doc），多值点重复回调由 bitmap 集合语义天然去重（spec §3.2
+    // 去重契约不变，从调用方显式 dedup 移入 bitmap 构造）。
+    let mut bm = MaterializedBitmap::empty();
+    points.intersect_docs(field, low, high, &mut |doc| bm.add(doc))?;
+    if bm.cardinality() == 0 {
         return Ok(None);
     }
-    Ok(Some(MaterializedBitmap::of(&docs)))
+    Ok(Some(bm))
 }
 
 /// And/Or arm bodies of `Query::segment_iterator`, outlined into their own
@@ -629,6 +629,20 @@ fn materialize_query_bitmap(
             fold_term_entries(seg, &collected.entries, has_freqs, false, budget, cost)
         }
         Query::PointRange { field, low, high } => {
+            // P1-3：区间包含值域且全段 doc 有值 → 命中集 = 全段，.kdm
+            // 元数据判定，full(maxDoc) 免 BKD 物化（服务 Bool fold count：
+            // rngmust/rngnot 形状由此脱离 maxDoc 级物化）。doc_count <
+            // maxDoc 时哪些 doc 有值未知 → 落下方全量物化。
+            if let Some(points) = seg.points_reader() {
+                if let Some((min, max, doc_count)) = points.field_bounds(field) {
+                    if *low <= min && max <= *high && doc_count == seg.max_doc() as u32 {
+                        *cost += 1;
+                        return Ok(MatOutcome::Hits(MaterializedBitmap::full(
+                            seg.max_doc() as u32
+                        )));
+                    }
+                }
+            }
             *cost += seg.max_doc() as u64; // BKD 无法预估命中，保守计
             if *cost > budget {
                 return Ok(MatOutcome::OverBudget);
@@ -817,6 +831,17 @@ pub(crate) fn fast_segment_count(seg: &mut SegmentReader, query: &Query) -> io::
             None => 0,
         })),
         Query::PointRange { field, low, high } => {
+            // P1-3 count 捷径：区间包含字段值域 → 命中 = 全部有值 doc，
+            // .kdm 元数据 O(1) 直读（Java PointWeight.count :86-105 的
+            // min/max/getDocCount 同款）。low>high 时包含关系不可能成立，
+            // 自然落下方 point_range_bitmap 保持 Err(InvalidInput) 语义。
+            if let Some(points) = seg.points_reader() {
+                if let Some((min, max, doc_count)) = points.field_bounds(field) {
+                    if *low <= min && max <= *high {
+                        return Ok(Some(doc_count as u64));
+                    }
+                }
+            }
             let bm = point_range_bitmap(seg, field, *low, *high)?;
             Ok(Some(bm.map_or(0, |b| b.cardinality())))
         }

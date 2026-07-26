@@ -20,6 +20,21 @@ impl MaterializedBitmap {
         }
     }
 
+    /// 空集（增量构造入口，P1-3）。
+    pub fn empty() -> MaterializedBitmap {
+        MaterializedBitmap {
+            bm: croaring::Bitmap::new(),
+        }
+    }
+
+    /// 单 doc 增量插入：无序、去重天然幂等（P1-3：PointRange 物化
+    /// 去掉 Vec+sort+dedup——BKD 访问序是 (value, doc) 非 doc 序，
+    /// 旧路径排序开销 ~10ns/doc，容器级插入 ~5ns/doc 且多值点去重
+    /// 由 bitmap 语义天然承担）。
+    pub fn add(&mut self, doc: u32) {
+        self.bm.add(doc);
+    }
+
     pub fn cardinality(&self) -> u64 {
         self.bm.cardinality()
     }
@@ -105,6 +120,44 @@ mod tests {
         assert_eq!(bm.cardinality(), 0);
         let mut buf = [0u32; 8];
         assert_eq!(bm.docs_from(0, &mut buf), 0);
+    }
+
+    #[test]
+    fn incremental_add_matches_bulk_of() {
+        // P1-3：乱序 + 重复的增量 add 与升序 of 结果逐点一致
+        // （PointRange 物化路径的正确性契约）。
+        let mut bm = MaterializedBitmap::empty();
+        let docs: Vec<u32> = [7, 3, 100, 3, 7, 42, 100, 0, 9999, 42].to_vec();
+        for d in &docs {
+            bm.add(*d);
+        }
+        let mut sorted: Vec<u32> = docs;
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(bm.cardinality(), sorted.len() as u64);
+        let reference = MaterializedBitmap::of(&sorted);
+        let mut buf = [0u32; 8];
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut from = 0;
+        loop {
+            let n = bm.docs_from(from, &mut buf);
+            if n == 0 {
+                break;
+            }
+            a.extend_from_slice(&buf[..n]);
+            from = a.last().unwrap() + 1;
+        }
+        let mut from = 0;
+        loop {
+            let n = reference.docs_from(from, &mut buf);
+            if n == 0 {
+                break;
+            }
+            b.extend_from_slice(&buf[..n]);
+            from = b.last().unwrap() + 1;
+        }
+        assert_eq!(a, b);
+        assert_eq!(a, sorted);
     }
 
     #[test]

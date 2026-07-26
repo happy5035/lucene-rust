@@ -550,6 +550,134 @@ impl PointsReader {
         }
         Ok(points)
     }
+
+    /// 字段值域 + 有值 doc 数（.kdm 字段元数据，O(1) 常驻）：
+    /// `(min_value, max_value, doc_count)`。P1-3 count 捷径的判据——
+    /// 查询区间包含值域 ⇒ 命中集 = 全部有值 doc（Java PointWeight.count
+    /// :86-105 的 getMinPackedValue/getMaxPackedValue/getDocCount 同款）。
+    /// None = 段内无此 point 字段。
+    pub fn field_bounds(&self, field: &str) -> Option<(i64, i64, u32)> {
+        self.fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, m)| (m.min_value, m.max_value, m.doc_count))
+    }
+
+    /// Doc-only intersect（P1-3 迭代路径）：语义同 `intersect`（1D 闭区间、
+    /// 多值点逐值回调、去重调用方负责），但 Inside 子树只读 docID 块——
+    /// 跳过 commonPrefix/values 解码（Java visitDocIDs :588-605 的形态；
+    /// 本 reader 的 value 版 intersect 在 Inside 分支逐点解码值，宽区间
+    /// 查询为无用解码付 ~40% 开销）。Crosses 叶仍需解码值做过滤。
+    pub fn intersect_docs(
+        &self,
+        field: &str,
+        low: i64,
+        high: i64,
+        visitor: &mut dyn FnMut(u32),
+    ) -> io::Result<()> {
+        let Some((_, m)) = self.fields.iter().find(|(name, _)| name == field) else {
+            return Ok(());
+        };
+        let (low, high) = if m.bytes_per_dim == 4 {
+            if low > i32::MAX as i64 || high < i32::MIN as i64 {
+                return Ok(());
+            }
+            (
+                low.clamp(i32::MIN as i64, i32::MAX as i64),
+                high.clamp(i32::MIN as i64, i32::MAX as i64),
+            )
+        } else {
+            (low, high)
+        };
+        self.intersect_node_docs(m, 0, m.num_leaves, m.min_value, m.max_value, low, high, visitor)
+    }
+
+    /// `intersect_node` 的 doc-only 递归（Outside 跳过 / Inside 逐叶只读
+    /// docID 块 / Crosses 按 split 递归、叶内逐点过滤）。
+    #[allow(clippy::too_many_arguments)]
+    fn intersect_node_docs(
+        &self,
+        m: &FieldMeta,
+        leaves_offset: usize,
+        num_leaves: usize,
+        cell_lo: i64,
+        cell_hi: i64,
+        low: i64,
+        high: i64,
+        visitor: &mut dyn FnMut(u32),
+    ) -> io::Result<()> {
+        match relate(cell_lo, cell_hi, low, high) {
+            Relation::Outside => Ok(()),
+            Relation::Inside => {
+                for i in 0..num_leaves {
+                    self.visit_leaf_docs(m, leaves_offset + i, None, visitor)?;
+                }
+                Ok(())
+            }
+            Relation::Crosses => {
+                if num_leaves == 1 {
+                    self.visit_leaf_docs(m, leaves_offset, Some((low, high)), visitor)
+                } else {
+                    let num_left = get_num_left_leaf_nodes(num_leaves);
+                    let right_offset = leaves_offset + num_left;
+                    let split = m.splits[right_offset - 1];
+                    self.intersect_node_docs(
+                        m,
+                        leaves_offset,
+                        num_left,
+                        cell_lo,
+                        split,
+                        low,
+                        high,
+                        visitor,
+                    )?;
+                    self.intersect_node_docs(
+                        m,
+                        right_offset,
+                        num_leaves - num_left,
+                        split,
+                        cell_hi,
+                        low,
+                        high,
+                        visitor,
+                    )?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// 单叶 doc-only 访问：`filter` 为 None（Inside 叶）只读 count +
+    /// docID 块即返回，不触碰值块；Some（Crosses 叶）解码 (value, doc)
+    /// 逐点过滤后回调 doc。
+    fn visit_leaf_docs(
+        &self,
+        m: &FieldMeta,
+        leaves_offset: usize,
+        filter: Option<(i64, i64)>,
+        visitor: &mut dyn FnMut(u32),
+    ) -> io::Result<()> {
+        let Some((low, high)) = filter else {
+            let fp = m.leaf_fps[leaves_offset];
+            let mut input = self.data_in.slice(fp, self.data_in.length() - fp)?;
+            let count = input.read_vint()?;
+            if count <= 0 || count as usize > MAX_POINTS_IN_LEAF_NODE {
+                return Err(corrupt(format!(
+                    "leaf point count {count} outside [1, {MAX_POINTS_IN_LEAF_NODE}]"
+                )));
+            }
+            for doc in read_doc_ids(&mut input, count as usize)? {
+                visitor(doc);
+            }
+            return Ok(());
+        };
+        for (value, doc) in self.read_leaf(m, leaves_offset)? {
+            if value >= low && value <= high {
+                visitor(doc);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// DocIdsWriter.readInts (:182-206): all five write-side branches reversed
@@ -1059,6 +1187,69 @@ mod tests {
         let (root, fis) = write_segment("intersect-unknown", &[(0, "ts", points)], &[]);
         let reader = open(&root, &fis);
         assert!(collect(&reader, "nope", i64::MIN, i64::MAX).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---------- P1-3：intersect_docs + field_bounds ----------
+
+    /// intersect_docs 的 doc 集合 == intersect 回调 doc 的去重集——
+    /// 全区间（Inside 只读 docID 块）/ 中部（三分支）/ 点查询 / 多值点
+    /// 逐形状锁定。
+    #[test]
+    fn intersect_docs_matches_intersect_deduped() {
+        let mut rng = Rng(0xD0C5);
+        let mut points = gen_long_points(&mut rng, 5000, 3000); // 10 叶
+        // 注入多值点：同 doc 多值（去重契约的试金石）
+        points.push((10, 42));
+        points.push((20, 42));
+        points.push((30, 42));
+        let (root, fis) = write_segment("intersect-docs-5k", &[(0, "ts", points.clone())], &[]);
+        let reader = open(&root, &fis);
+        let sorted_vals: Vec<i64> = {
+            let mut v: Vec<i64> = points.iter().map(|p| p.0).collect();
+            v.sort();
+            v
+        };
+        let (lo, mid, hi) = (sorted_vals[1000], sorted_vals[2500], sorted_vals[4000]);
+        for (low, high) in [
+            (i64::MIN, i64::MAX),
+            (mid, mid),
+            (lo, hi),
+            (hi + 1, hi + 1000),
+            (i64::MIN, lo),
+            (10, 30), // 多值 doc 42 的三个值全落区间内
+        ] {
+            let mut got: Vec<u32> = Vec::new();
+            reader
+                .intersect_docs("ts", low, high, &mut |d| got.push(d))
+                .unwrap();
+            got.sort_unstable();
+            got.dedup();
+            let mut want: Vec<u32> = brute_force(&points, low, high)
+                .iter()
+                .map(|&(_, d)| d as u32)
+                .collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(got, want, "range [{low}, {high}]");
+        }
+        // 未知字段 → 零回调
+        let mut n = 0;
+        reader
+            .intersect_docs("nope", i64::MIN, i64::MAX, &mut |_| n += 1)
+            .unwrap();
+        assert_eq!(n, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// field_bounds = .kdm 值域 + doc_count（多值点：doc_count < point_count）。
+    #[test]
+    fn field_bounds_reports_kdm_metadata() {
+        let points: Vec<(i64, u32)> = vec![(-5, 1), (0, 2), (3, 2), (9, 7)];
+        let (root, fis) = write_segment("bounds", &[(0, "ts", points)], &[]);
+        let reader = open(&root, &fis);
+        assert_eq!(reader.field_bounds("ts"), Some((-5, 9, 3))); // 3 个不同 doc
+        assert_eq!(reader.field_bounds("nope"), None);
         fs::remove_dir_all(&root).unwrap();
     }
 }

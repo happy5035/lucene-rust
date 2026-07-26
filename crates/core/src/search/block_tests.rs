@@ -7,7 +7,7 @@ use codec_lucene9::roaring::MaterializedBitmap;
 
 use super::collector::{Collector, CountCollector};
 #[allow(unused_imports)] // DOC_BLOCK reserved for Task 2+ block helpers
-use super::doc_iter::{DocBlockBuf, DocIter, MaterializedDocIter, SegmentDocIter, DOC_BLOCK};
+use super::doc_iter::{DocBlockBuf, DocIter, MatchAllIter, MaterializedDocIter, SegmentDocIter, DOC_BLOCK};
 use super::searcher::drive_blocks;
 
 /// 小步长 LCG（core 无 rand dev-dep；测试专用，勿用于生产）。
@@ -132,4 +132,26 @@ fn collect_block_default_matches_per_doc() {
     let mut vc2 = VecCollector::default();
     vc2.collect_block(&docs, Some(&[2, 3, 4, 5]));
     assert_eq!(vc2.freqs, vec![2, 3, 4, 5]);
+}
+
+#[test]
+fn matchall_block_stream() {
+    for max in [0i32, 1, 127, 128, 129, 300, 1000] {
+        let mut it = SegmentDocIter::All(MatchAllIter::new(max));
+        let expect: Vec<u32> = (0..max as u32).collect();
+        assert_eq!(stream_block(&mut it), expect, "max={max}");
+    }
+}
+
+#[test]
+fn leaves_block_vs_per_doc_random() {
+    let mut lcg = Lcg(7);
+    for _ in 0..20 {
+        let n = (lcg.next_u32() % 600) as usize;
+        let docs = lcg.doc_set(50_000, n);
+        // Materialized 叶子
+        let mut a = leaf(&docs);
+        let mut b = leaf(&docs);
+        assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "mat n={n}");
+    }
 }

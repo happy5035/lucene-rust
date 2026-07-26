@@ -119,6 +119,24 @@ impl DocIter for MatchAllIter {
         }
         Ok(self.doc)
     }
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        if self.doc == NO_MORE_DOCS {
+            out.len = 0;
+            return Ok(0);
+        }
+        let start = (self.doc + 1).max(0) as u32;
+        let n = (self.max_doc as u32).saturating_sub(start).min(DOC_BLOCK as u32) as usize;
+        for i in 0..n {
+            out.docs[i] = start + i as u32;
+        }
+        self.doc = if n == 0 || start + n as u32 >= self.max_doc as u32 {
+            NO_MORE_DOCS
+        } else {
+            (start + n as u32 - 1) as i32
+        };
+        out.len = n;
+        Ok(n)
+    }
 }
 
 // ── Internal postings wrapper ─────────────────────────────────────────
@@ -723,6 +741,52 @@ impl<B: DocsBitmap> BitmapCursor<B> {
         self.next_from = target;
         self.next()
     }
+
+    /// 批量产出（spec 2026-07-26 Task 3）：把缓冲与后续 refill 的 doc
+    /// 拷入 dst 至填满或耗尽，返回产出数。维护 next_from 不变量
+    /// （= 最后产出 doc + 1），保证批读后 advance() 语义不变。
+    /// docs < max_doc <= i32::MAX，+1 不溢出。
+    fn next_many_to(&mut self, dst: &mut [u32]) -> usize {
+        let mut n = 0;
+        while n < dst.len() {
+            if self.pos >= self.end {
+                // 维护 next_from 不变量（= 已产出最后 doc + 1），
+                // 使 refill 的 docs_from seek 越过已消费区。
+                // brief 原版仅在循环尾更新，跨 refill 时 stale → 重复拉取。
+                if n > 0 {
+                    self.next_from = dst[n - 1] + 1;
+                }
+                if !self.refill() {
+                    break;
+                }
+            }
+            let take = (self.end - self.pos).min(dst.len() - n);
+            dst[n..n + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.pos += take;
+            n += take;
+        }
+        if n > 0 {
+            self.next_from = dst[n - 1] + 1;
+        }
+        n
+    }
+}
+
+/// BitmapCursor 叶子共用的块产出（RoaringDocIter / MaterializedDocIter）：
+/// 游标批读 + doc 游标簿记。耗尽后 doc 钉 NO_MORE_DOCS。
+fn cursor_next_block<B: DocsBitmap>(
+    cur: &mut BitmapCursor<B>,
+    doc: &mut i32,
+    out: &mut DocBlockBuf,
+) -> io::Result<usize> {
+    if *doc == NO_MORE_DOCS {
+        out.len = 0;
+        return Ok(0);
+    }
+    let n = cur.next_many_to(&mut out.docs);
+    *doc = if n == 0 { NO_MORE_DOCS } else { out.docs[n - 1] as i32 };
+    out.len = n;
+    Ok(n)
 }
 
 /// DocIter over a term's inline bitmap (M5 §2 Term 路径): wraps the
@@ -767,6 +831,10 @@ impl DocIter for RoaringDocIter {
             };
         }
         Ok(self.doc)
+    }
+
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        cursor_next_block(&mut self.cur, &mut self.doc, out)
     }
 }
 
@@ -815,6 +883,10 @@ impl DocIter for MaterializedDocIter {
             };
         }
         Ok(self.doc)
+    }
+
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        cursor_next_block(&mut self.cur, &mut self.doc, out)
     }
 }
 
@@ -1629,31 +1701,16 @@ impl DocIter for SegmentDocIter {
             // Docs/Freqs 是 codec 类型（无 DocIter impl）：Task 1 内联
             // 逐 doc 填充，Task 3 换成 codec 窗口批读。
             Self::Docs(d) => {
-                let mut n = 0;
-                while n < DOC_BLOCK {
-                    let doc = d.next_doc()?;
-                    if doc == NO_MORE_DOCS {
-                        break;
-                    }
-                    out.docs[n] = doc as u32;
-                    n += 1;
-                }
+                let n = d.next_docs(&mut out.docs)?;
                 out.len = n;
                 Ok(n)
             }
             Self::Freqs(f) => {
-                let mut n = 0;
-                while n < DOC_BLOCK {
-                    let doc = f.next_doc()?;
-                    if doc == NO_MORE_DOCS {
-                        break;
-                    }
-                    out.docs[n] = doc as u32;
-                    if f.decodes_freqs() {
-                        out.freqs[n] = f.freq();
-                    }
-                    n += 1;
-                }
+                let n = if f.decodes_freqs() {
+                    f.next_docs_and_freqs(&mut out.docs, &mut out.freqs)?
+                } else {
+                    f.next_docs(&mut out.docs)?
+                };
                 out.len = n;
                 Ok(n)
             }

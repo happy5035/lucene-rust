@@ -1723,8 +1723,7 @@ mod tests {
     #[test]
     fn phrase_nested_bool_twophase_equivalence() {
         let root = temp_dir("twophase");
-        let mut w =
-            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let mut w = IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
         // t1 命中；t2 非相邻；t3 逆序；t4 命中(WARN)；t5 alpha@1+beta@2 命中；t6 命中(WARN)
         let docs = [
             ("INFO", "t1", "alpha beta gamma"),
@@ -1743,7 +1742,7 @@ mod tests {
         let mut s = Searcher::open(&dir).unwrap();
         let phrase = Query::phrase("message", &["alpha", "beta"]);
         assert_eq!(s.count(&phrase).unwrap(), 4); // t1,t4,t5,t6
-        // MUST[phrase, level=INFO] → t1,t5（跨字段合取，confirmation 后于对齐）
+                                                  // MUST[phrase, level=INFO] → t1,t5（跨字段合取，confirmation 后于对齐）
         let q = Query::bool(vec![
             (Occur::Must, phrase.clone()),
             (Occur::Must, Query::term("level", "INFO")),
@@ -1775,7 +1774,8 @@ mod tests {
         let mut w = IndexWriter::create(root, schema_pos(), cfg).unwrap();
         for i in 0..5000u32 {
             let msg = if i % 3 == 0 { "hot warm" } else { "hot x warm" };
-            w.add_document(pos_doc("INFO", &format!("tid-{i}"), msg)).unwrap();
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), msg))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -1792,8 +1792,8 @@ mod tests {
         let dir_on = FSDirectory::open(&root_on).unwrap();
         let mut s_on = Searcher::open(&dir_on).unwrap();
         let battery: Vec<Query> = vec![
-            Query::phrase("message", &["hot", "warm"]),          // 1667（i%3==0）
-            Query::phrase("message", &["hot", "x"]),             // 3333
+            Query::phrase("message", &["hot", "warm"]), // 1667（i%3==0）
+            Query::phrase("message", &["hot", "x"]),    // 3333
             Query::bool(vec![
                 (Occur::Must, Query::phrase("message", &["hot", "warm"])),
                 (Occur::Must, Query::term("level", "INFO")),
@@ -1807,10 +1807,22 @@ mod tests {
             let (a_total, a_docs) = s_off.top_docs(q, 6000).unwrap();
             let (b_total, b_docs) = s_on.top_docs(q, 6000).unwrap();
             assert_eq!((a_total, a_docs), (b_total, b_docs), "top_docs {q:?}");
-            assert_eq!(s_off.count(q).unwrap(), s_on.count(q).unwrap(), "count {q:?}");
+            assert_eq!(
+                s_off.count(q).unwrap(),
+                s_on.count(q).unwrap(),
+                "count {q:?}"
+            );
         }
-        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "warm"])).unwrap(), 1667);
-        assert_eq!(s_on.count(&Query::phrase("message", &["hot", "x"])).unwrap(), 3333);
+        assert_eq!(
+            s_on.count(&Query::phrase("message", &["hot", "warm"]))
+                .unwrap(),
+            1667
+        );
+        assert_eq!(
+            s_on.count(&Query::phrase("message", &["hot", "x"]))
+                .unwrap(),
+            3333
+        );
         fs::remove_dir_all(&root_off).unwrap();
         fs::remove_dir_all(&root_on).unwrap();
     }
@@ -1823,17 +1835,17 @@ mod tests {
     #[test]
     fn must_not_phrase_twophase_confirmation() {
         let root = temp_dir("mustnotphrase");
-        let mut w =
-            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let mut w = IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
         let docs = [
-            "alpha beta",       // 0: MUST phrase hit, no x/y → keep
-            "alpha beta x y",   // 1: MUST hit, MUST_NOT confirmed → exclude
-            "alpha beta y x",   // 2: MUST hit, MUST_NOT approx-only → keep
-            "x y",              // 3: MUST miss → exclude
-            "alpha x beta",     // 4: MUST miss → exclude
+            "alpha beta",     // 0: MUST phrase hit, no x/y → keep
+            "alpha beta x y", // 1: MUST hit, MUST_NOT confirmed → exclude
+            "alpha beta y x", // 2: MUST hit, MUST_NOT approx-only → keep
+            "x y",            // 3: MUST miss → exclude
+            "alpha x beta",   // 4: MUST miss → exclude
         ];
         for (i, m) in docs.iter().enumerate() {
-            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -1866,18 +1878,18 @@ mod tests {
     #[test]
     fn nested_must_or_phrase_twophase_confirmation() {
         let root = temp_dir("nestedorphrase");
-        let mut w =
-            IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
+        let mut w = IndexWriter::create(&root, schema_pos(), IndexWriterConfig::default()).unwrap();
         let docs = [
-            "alpha beta delta",       // 0: phrase hit, delta hit → keep
-            "alpha x beta delta",     // 1: phrase approx-only, delta hit → exclude
-            "zeta delta",             // 2: zeta hit, delta hit → keep
-            "alpha beta zeta delta",  // 3: phrase hit → keep
-            "alpha beta",             // 4: phrase hit, delta miss → exclude
-            "delta",                  // 5: nothing → exclude
+            "alpha beta delta",      // 0: phrase hit, delta hit → keep
+            "alpha x beta delta",    // 1: phrase approx-only, delta hit → exclude
+            "zeta delta",            // 2: zeta hit, delta hit → keep
+            "alpha beta zeta delta", // 3: phrase hit → keep
+            "alpha beta",            // 4: phrase hit, delta miss → exclude
+            "delta",                 // 5: nothing → exclude
         ];
         for (i, m) in docs.iter().enumerate() {
-            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m)).unwrap();
+            w.add_document(pos_doc("INFO", &format!("tid-{i}"), m))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -1946,7 +1958,8 @@ mod tests {
         // doc 0 满足内层 OR（有 b 且 level INFO），doc 99 只满足 a。
         w.add_document(doc("INFO", "tid-0", "a b")).unwrap();
         for i in 1..99 {
-            w.add_document(doc("WARN", &format!("tid-{i}"), "b")).unwrap();
+            w.add_document(doc("WARN", &format!("tid-{i}"), "b"))
+                .unwrap();
         }
         w.add_document(doc("WARN", "tid-99", "a")).unwrap();
         w.commit().unwrap();
@@ -2017,10 +2030,13 @@ mod tests {
             // 嵌套（外层 MUST + 内层 SHOULD → 不可拍平）
             Query::bool(vec![
                 (Occur::Must, Query::term("level", "INFO")),
-                (Occur::Must, Query::bool(vec![
-                    (Occur::Should, Query::term("message", "hot")),
-                    (Occur::Should, Query::term("tid", "tid-8")),
-                ])),
+                (
+                    Occur::Must,
+                    Query::bool(vec![
+                        (Occur::Should, Query::term("message", "hot")),
+                        (Occur::Should, Query::term("tid", "tid-8")),
+                    ]),
+                ),
             ]),
             // 短语叶子 + MUST_NOT
             Query::bool(vec![
@@ -2031,7 +2047,10 @@ mod tests {
             Query::bool(vec![(Occur::MustNot, Query::term("message", "hot"))]),
             // Terms 叶子
             Query::bool(vec![
-                (Occur::Must, Query::terms("message", &["hot", "x", "nosuch"])),
+                (
+                    Occur::Must,
+                    Query::terms("message", &["hot", "x", "nosuch"]),
+                ),
                 (Occur::MustNot, Query::term("tid", "tid-7")),
             ]),
         ];
@@ -2093,17 +2112,18 @@ mod tests {
         let mut s = Searcher::open(&dir).unwrap();
         let battery: Vec<Query> = vec![
             Query::MatchAll,
-            Query::term("message", "hot"),            // doc_freq 直读快路径
-            Query::term("message", "nosuch"),         // 空
+            Query::term("message", "hot"),    // doc_freq 直读快路径
+            Query::term("message", "nosuch"), // 空
             Query::phrase("message", &["hot", "warm"]), // 无快路径（Phrase）→ 全程迭代
-            Query::terms("message", &["hot", "x"]),   // ≤16 OR 路径
-            Query::prefix("message", "ho"),           // bitset popcount
-            Query::bool(vec![                          // fold 快路径
+            Query::terms("message", &["hot", "x"]), // ≤16 OR 路径
+            Query::prefix("message", "ho"),   // bitset popcount
+            Query::bool(vec![
+                // fold 快路径
                 (Occur::Must, Query::term("level", "INFO")),
                 (Occur::MustNot, Query::term("tid", "tid-7")),
             ]),
             Query::bool(vec![(Occur::MustNot, Query::term("message", "x"))]), // maxDoc−prohibited
-            Query::point_range("nope", 0, 1),         // 未知 point 字段 → 0
+            Query::point_range("nope", 0, 1),                                 // 未知 point 字段 → 0
         ];
         for q in &battery {
             for n in [0usize, 1, 7, 100, 6000] {
@@ -2170,8 +2190,14 @@ mod tests {
         cfg.bitmap = false;
         let mut w = IndexWriter::create(&root, schema(), cfg).unwrap();
         for i in 0..DOCS {
-            let m = format!("t{} t{} t{}", i % K_TERMS, (i / 3) % K_TERMS, (i / 7) % K_TERMS);
-            w.add_document(doc("INFO", &format!("tid-{i}"), &m)).unwrap();
+            let m = format!(
+                "t{} t{} t{}",
+                i % K_TERMS,
+                (i / 3) % K_TERMS,
+                (i / 7) % K_TERMS
+            );
+            w.add_document(doc("INFO", &format!("tid-{i}"), &m))
+                .unwrap();
         }
         w.commit().unwrap();
         drop(w);
@@ -2184,8 +2210,9 @@ mod tests {
                 let (_b, seg) = reader.leaves().next().unwrap();
                 let mut sub = Vec::new();
                 for t in &terms {
-                    if let Some(it) =
-                        Query::term("message", t).segment_iterator(seg, false).unwrap()
+                    if let Some(it) = Query::term("message", t)
+                        .segment_iterator(seg, false)
+                        .unwrap()
                     {
                         sub.push(it);
                     }

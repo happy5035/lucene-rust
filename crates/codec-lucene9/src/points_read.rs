@@ -589,7 +589,16 @@ impl PointsReader {
         } else {
             (low, high)
         };
-        self.intersect_node_docs(m, 0, m.num_leaves, m.min_value, m.max_value, low, high, visitor)
+        self.intersect_node_docs(
+            m,
+            0,
+            m.num_leaves,
+            m.min_value,
+            m.max_value,
+            low,
+            high,
+            visitor,
+        )
     }
 
     /// `intersect_node` 的 doc-only 递归（Outside 跳过 / Inside 逐叶只读

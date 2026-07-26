@@ -260,7 +260,9 @@ impl Query {
                 let Some(bm) = point_range_bitmap(seg, field, *low, *high)? else {
                     return Ok(None);
                 };
-                Ok(Some(SegmentDocIter::Materialized(MaterializedDocIter::new(bm))))
+                Ok(Some(SegmentDocIter::Materialized(
+                    MaterializedDocIter::new(bm),
+                )))
             }
             Query::Bool { clauses } => bool_segment_iterator(seg, clauses, needs_freq),
         }
@@ -479,7 +481,9 @@ fn bool_segment_iterator(
                     // MUST_NOT 存在 → 空，而非 MatchAll − prohibited）。
                     return Ok(None);
                 }
-                return Ok(Some(SegmentDocIter::Materialized(MaterializedDocIter::new(bm))));
+                return Ok(Some(SegmentDocIter::Materialized(
+                    MaterializedDocIter::new(bm),
+                )));
             }
             MatOutcome::OverBudget => {}
         }
@@ -589,12 +593,12 @@ fn materialize_query_bitmap(
     cost: &mut u64,
 ) -> io::Result<MatOutcome> {
     match query {
-        Query::MatchAll => Ok(MatOutcome::Hits(MaterializedBitmap::full(seg.max_doc() as u32))),
+        Query::MatchAll => Ok(MatOutcome::Hits(MaterializedBitmap::full(
+            seg.max_doc() as u32
+        ))),
         Query::Term { field, term } => match seg.seek_term(field, term)? {
             None => Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))),
-            Some((has_freqs, entry)) => {
-                term_entry_bitmap(seg, &entry, has_freqs, budget, cost)
-            }
+            Some((has_freqs, entry)) => term_entry_bitmap(seg, &entry, has_freqs, budget, cost),
         },
         Query::And { field, terms } | Query::Or { field, terms } => {
             let is_and = matches!(query, Query::And { .. });
@@ -648,7 +652,9 @@ fn materialize_query_bitmap(
                 return Ok(MatOutcome::OverBudget);
             }
             let bm = point_range_bitmap(seg, field, *low, *high)?;
-            Ok(MatOutcome::Hits(bm.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+            Ok(MatOutcome::Hits(
+                bm.unwrap_or_else(|| MaterializedBitmap::of(&[])),
+            ))
         }
         Query::Phrase { field, terms } => {
             // 成本近似 = 各 term df 和（doc 合取扫描量）；缺 term → 空
@@ -711,7 +717,9 @@ fn fold_term_entries(
             return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))); // 交集已空，短路
         }
     }
-    Ok(MatOutcome::Hits(acc.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+    Ok(MatOutcome::Hits(
+        acc.unwrap_or_else(|| MaterializedBitmap::of(&[])),
+    ))
 }
 
 /// Bool 子句 fold（M7 §3.1）：正集三态与迭代语义逐条对应——MUST 交 /
@@ -755,7 +763,9 @@ pub(crate) fn materialize_bool_bitmap(
                 return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
             }
         }
-        Ok(MatOutcome::Hits(acc.unwrap_or_else(|| MaterializedBitmap::of(&[]))))
+        Ok(MatOutcome::Hits(
+            acc.unwrap_or_else(|| MaterializedBitmap::of(&[])),
+        ))
     }
     let mut positive = if !musts.is_empty() {
         match fold_group(seg, &musts, true, budget, cost)? {
@@ -823,7 +833,10 @@ pub(crate) fn bool_segment_fast_count(
 /// 快路径（调用方迭代计数）。归并既有全部捷径（Term doc_freq 直读 /
 /// PointRange bitmap cardinality / multi-term bitset popcount / And-Or
 /// roaring count / Bool 快路径族）。Searcher::count 与 top_docs 共用。
-pub(crate) fn fast_segment_count(seg: &mut SegmentReader, query: &Query) -> io::Result<Option<u64>> {
+pub(crate) fn fast_segment_count(
+    seg: &mut SegmentReader,
+    query: &Query,
+) -> io::Result<Option<u64>> {
     match query {
         Query::MatchAll => Ok(Some(seg.max_doc() as u64)),
         Query::Term { field, term } => Ok(Some(match seg.seek_term(field, term)? {

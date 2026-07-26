@@ -327,9 +327,7 @@ impl EnumCore {
             let upto = self.doc_buffer_upto;
             // 窗口 = 当前缓冲到哨兵（NO_MORE_DOCS 占位）或 dst 填满
             let mut take = 0;
-            while take < docs.len() - n
-                && self.doc_buffer[upto + take] != NO_MORE_DOCS as u64
-            {
+            while take < docs.len() - n && self.doc_buffer[upto + take] != NO_MORE_DOCS as u64 {
                 take += 1;
             }
             if take == 0 {
@@ -764,7 +762,10 @@ impl DocsFreqsEnum {
         docs: &mut [u32],
         freqs: &mut [u32],
     ) -> io::Result<usize> {
-        assert!(self.core.decode_freqs, "next_docs_and_freqs on no-freq enum");
+        assert!(
+            self.core.decode_freqs,
+            "next_docs_and_freqs on no-freq enum"
+        );
         self.core.next_docs(docs, Some(freqs))
     }
 }
@@ -1707,8 +1708,11 @@ mod tests {
             let entry = seek(&fsdir, &fis, field, term);
             for step in [1usize, 7, 128, 200, 4096] {
                 let mut en = reader.docs(&entry).unwrap();
-                assert_eq!(drain_next_docs(&mut en, step), expect_docs,
-                    "{field}:{term:?} step={step} docs");
+                assert_eq!(
+                    drain_next_docs(&mut en, step),
+                    expect_docs,
+                    "{field}:{term:?} step={step} docs"
+                );
             }
             let mut en = reader.docs(&entry).unwrap();
             assert_eq!(drain_per_doc(&mut en), expect_docs);
@@ -1723,8 +1727,11 @@ mod tests {
             let entry = seek(&fsdir, &fis, field, term);
             for step in [1usize, 7, 128, 200, 4096] {
                 let mut en = reader.docs_and_freqs_no_freq(&entry).unwrap();
-                assert_eq!(drain_next_docs_enum(&mut en, step), expect_docs,
-                    "{field}:{term:?} step={step} docs");
+                assert_eq!(
+                    drain_next_docs_enum(&mut en, step),
+                    expect_docs,
+                    "{field}:{term:?} step={step} docs"
+                );
             }
             // 逐 doc 参照路径同集
             let mut en = reader.docs_and_freqs_no_freq(&entry).unwrap();

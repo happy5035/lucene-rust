@@ -125,7 +125,9 @@ impl DocIter for MatchAllIter {
             return Ok(0);
         }
         let start = (self.doc + 1).max(0) as u32;
-        let n = (self.max_doc as u32).saturating_sub(start).min(DOC_BLOCK as u32) as usize;
+        let n = (self.max_doc as u32)
+            .saturating_sub(start)
+            .min(DOC_BLOCK as u32) as usize;
         for i in 0..n {
             out.docs[i] = start + i as u32;
         }
@@ -784,7 +786,11 @@ fn cursor_next_block<B: DocsBitmap>(
         return Ok(0);
     }
     let n = cur.next_many_to(&mut out.docs);
-    *doc = if n == 0 { NO_MORE_DOCS } else { out.docs[n - 1] as i32 };
+    *doc = if n == 0 {
+        NO_MORE_DOCS
+    } else {
+        out.docs[n - 1] as i32
+    };
     out.len = n;
     Ok(n)
 }
@@ -1269,7 +1275,10 @@ impl DocIter for ConjOverDocIter {
             if self.sub.len() == 2 {
                 // 二元快路径（bench 主导形状）：slice intersect，ca/cb
                 // 直接是两侧块消费数，部分消费语义天然正确。
-                while self.curs[1].max_remaining().is_none_or(|hi| hi < self.curs[0].remaining()[0]) {
+                while self.curs[1]
+                    .max_remaining()
+                    .is_none_or(|hi| hi < self.curs[0].remaining()[0])
+                {
                     if !self.curs[1].refill(&mut self.sub[1])? {
                         break 'blk; // child1 耗尽 → 交耗尽
                     }
@@ -1325,7 +1334,11 @@ impl DocIter for ConjOverDocIter {
         }
         if prod > 0 {
             self.doc = out.docs[prod - 1] as i32;
-        } else if self.curs.iter().all(|c| c.exhausted || c.remaining().is_empty()) {
+        } else if self
+            .curs
+            .iter()
+            .all(|c| c.exhausted || c.remaining().is_empty())
+        {
             self.doc = NO_MORE_DOCS;
         }
         out.len = prod;
@@ -1665,11 +1678,16 @@ impl DocIter for DisjOverDocIter {
             if !any {
                 break;
             }
+            // limit = 各非空游标块尾最小值；保证不在某游标块耗尽后继续产出
+            let limit = (0..self.sub.len())
+                .filter_map(|i| self.curs[i].max_remaining())
+                .min()
+                .unwrap_or(u32::MAX);
             let heads: Vec<&[u32]> = (0..self.sub.len())
                 .map(|i| self.curs[i].remaining())
                 .collect();
             let mut consumed = vec![0usize; self.sub.len()];
-            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..]);
+            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
             for i in 0..self.sub.len() {
                 self.curs[i].consume(consumed[i]);
             }
@@ -1803,8 +1821,12 @@ impl DocIter for ExcludingDocIter {
             if p_exhausted {
                 continue;
             }
+            // 限制 must 切片不超过 prohibited 块尾，避免越界直通
+            let p_hi = self.pcur.max_remaining().unwrap();
+            let m_rest = self.mcur.remaining();
+            let m_take = m_rest.partition_point(|&d| d <= p_hi);
             let (cm, cp, n) = block_andnot(
-                self.mcur.remaining(),
+                &m_rest[..m_take],
                 self.pcur.remaining(),
                 &mut out.docs[prod..],
             );
@@ -1869,14 +1891,17 @@ pub(super) fn block_andnot(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usi
     (ia, ib, n)
 }
 
-/// k 路有序 slice 归并去重，out 满即停。consumed[i] 写回各 head 消费
-/// 数（调用方每次调用前初始化为 0；Vec 长度 = heads.len()）。k 小（bool 子句数）→ 线性扫
-/// 最小头，不上堆（堆化是 bool-bench-report §11 P2 议题）。
-#[allow(dead_code)] // Task 5/6 combinator overrides will call
-pub(super) fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u32]) -> usize {
+/// k 路有序 slice 归并去重，out 满即停或下一最小头 > limit 即停。
+/// consumed[i] 写回各 head 消费数（调用方每次调用前初始化为 0；
+/// Vec 长度 = heads.len()）。k 小（bool 子句数）→ 线性扫最小头，不上堆。
+pub(super) fn kway_union(
+    heads: &[&[u32]],
+    consumed: &mut [usize],
+    out: &mut [u32],
+    limit: u32,
+) -> usize {
     debug_assert_eq!(heads.len(), consumed.len());
     let mut n = 0;
-    let mut last: Option<u32> = None;
     while n < out.len() {
         // 选最小头
         let mut best: Option<(usize, u32)> = None;
@@ -1889,6 +1914,9 @@ pub(super) fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u3
             }
         }
         let Some((_, d)) = best else { break };
+        if d > limit {
+            break;
+        }
         // 推进所有等于 d 的头（去重）
         for (i, h) in heads.iter().enumerate() {
             let rest = &h[consumed[i]..];
@@ -1896,11 +1924,8 @@ pub(super) fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u3
                 consumed[i] += 1;
             }
         }
-        if last != Some(d) {
-            out[n] = d;
-            n += 1;
-            last = Some(d);
-        }
+        out[n] = d;
+        n += 1;
     }
     n
 }

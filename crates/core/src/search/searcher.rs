@@ -140,6 +140,25 @@ impl Searcher {
             let Some(mut iter) = query.segment_iterator(seg, false)? else {
                 continue; // 段内空（fast=Some(0) 或 None 时均无命中可计）
             };
+            if block_enabled() {
+                let mut out = DocBlockBuf::new();
+                loop {
+                    if docs.len() >= n && fast.is_some() {
+                        break;
+                    }
+                    let blk_n = iter.next_block(&mut out)?;
+                    if blk_n == 0 {
+                        break;
+                    }
+                    if fast.is_none() {
+                        total += blk_n as u64;
+                    }
+                    let room = n.saturating_sub(docs.len());
+                    let take = room.min(blk_n);
+                    docs.extend(out.docs[..take].iter().map(|&d| d as i32 + doc_base));
+                }
+                continue;
+            }
             loop {
                 if docs.len() >= n && fast.is_some() {
                     break; // 段内提前终止

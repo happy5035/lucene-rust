@@ -5,7 +5,7 @@
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
 
-use super::collector::{Collector, CountCollector};
+use super::collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
 #[allow(unused_imports)] // DOC_BLOCK reserved for Task 2+ block helpers
 use super::doc_iter::{
     DocBlockBuf, DocIter, MatchAllIter, MaterializedDocIter, SegmentDocIter, DOC_BLOCK,
@@ -472,4 +472,33 @@ fn roaring_or_slice_sources_block_vs_per_doc() {
         );
         assert_eq!(stream_block(&mut mk()), expect_disj(&sets));
     }
+}
+
+#[test]
+fn top_doc_collector_block_per_doc_parity() {
+    for top_n in [1usize, 5, 128, 129, 300, 1000] {
+        let docs: Vec<u32> = (0..300).map(|i| i * 7).collect();
+        let mut ref_c = TopDocCollector::new(top_n);
+        for &d in &docs {
+            ref_c.collect(d as i32, 1);
+        }
+        let mut blk_c = TopDocCollector::new(top_n);
+        for chunk in docs.chunks(128) {
+            blk_c.collect_block(chunk, None);
+        }
+        assert_eq!(blk_c.total, ref_c.total, "top_n={top_n}");
+        assert_eq!(blk_c.docs, ref_c.docs, "top_n={top_n}");
+        assert_eq!(blk_c.docs.len(), top_n.min(docs.len()));
+    }
+}
+
+#[test]
+fn freq_sum_collector_block() {
+    let mut c = FreqSumCollector::default();
+    let docs = [1u32, 2, 3];
+    c.collect_block(&docs, Some(&[4, 5, 6]));
+    assert_eq!(c.total_freq, 15);
+    let mut c2 = FreqSumCollector::default();
+    c2.collect_block(&docs, None);
+    assert_eq!(c2.total_freq, 3);
 }

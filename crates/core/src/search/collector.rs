@@ -70,6 +70,12 @@ impl Collector for TopDocCollector {
             self.docs.push(doc);
         }
     }
+    fn collect_block(&mut self, docs: &[u32], _freqs: Option<&[u32]>) {
+        self.total += docs.len() as u64;
+        let room = self.top_n.saturating_sub(self.docs.len());
+        let take = room.min(docs.len());
+        self.docs.extend(docs[..take].iter().map(|&d| d as i32));
+    }
 }
 
 /// Sum of term freqs over all hits — exercises the PFor freq decode end to
@@ -85,5 +91,11 @@ impl Collector for FreqSumCollector {
     }
     fn needs_freq(&self) -> bool {
         true
+    }
+    fn collect_block(&mut self, docs: &[u32], freqs: Option<&[u32]>) {
+        match freqs {
+            Some(f) => self.total_freq += f.iter().map(|&x| x as u64).sum::<u64>(),
+            None => self.total_freq += docs.len() as u64,
+        }
     }
 }

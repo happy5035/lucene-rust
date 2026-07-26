@@ -822,45 +822,38 @@ Expected: FAIL——MatchAll 走默认 fill 时 `stream_block` 其实已正确�
     }
 ```
 
-- [ ] **Step 4: RoaringDocIter / MaterializedDocIter 覆写**
+- [ ] **Step 4: RoaringDocIter / MaterializedDocIter 覆写（共享 helper）**
+
+两者共用 `BitmapCursor<B: DocsBitmap>` 游标且语义逐字相同——抽一个自由函数（放在 `BitmapCursor` impl 块之后的 bitmap 迭代器区），两个 impl 各调一行（评审裁决 2026-07-26：原"复制勿抽公共"指示撤销）：
+
+```rust
+/// BitmapCursor 叶子共用的块产出（RoaringDocIter / MaterializedDocIter）：
+/// 游标批读 + doc 游标簿记。耗尽后 doc 钉 NO_MORE_DOCS。
+fn cursor_next_block<B: DocsBitmap>(
+    cur: &mut BitmapCursor<B>,
+    doc: &mut i32,
+    out: &mut DocBlockBuf,
+) -> io::Result<usize> {
+    if *doc == NO_MORE_DOCS {
+        out.len = 0;
+        return Ok(0);
+    }
+    let n = cur.next_many_to(&mut out.docs);
+    *doc = if n == 0 { NO_MORE_DOCS } else { out.docs[n - 1] as i32 };
+    out.len = n;
+    Ok(n)
+}
+```
 
 在 `impl DocIter for RoaringDocIter`（:702-727）的 `advance` 之后追加：
 
 ```rust
     fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
-        if self.doc == NO_MORE_DOCS {
-            out.len = 0;
-            return Ok(0);
-        }
-        let n = self.cur.next_many_to(&mut out.docs);
-        if n == 0 {
-            self.doc = NO_MORE_DOCS;
-        } else {
-            self.doc = out.docs[n - 1] as i32;
-        }
-        out.len = n;
-        Ok(n)
+        cursor_next_block(&mut self.cur, &mut self.doc, out)
     }
 ```
 
-`impl DocIter for MaterializedDocIter`（:750-775）追加完全相同的覆写（同文件内复制，勿抽公共宏——两个 impl 块独立演进）：
-
-```rust
-    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
-        if self.doc == NO_MORE_DOCS {
-            out.len = 0;
-            return Ok(0);
-        }
-        let n = self.cur.next_many_to(&mut out.docs);
-        if n == 0 {
-            self.doc = NO_MORE_DOCS;
-        } else {
-            self.doc = out.docs[n - 1] as i32;
-        }
-        out.len = n;
-        Ok(n)
-    }
-```
+`impl DocIter for MaterializedDocIter`（:750-775）追加逐字相同的三行覆写。
 
 - [ ] **Step 5: MatchAllIter 覆写**
 

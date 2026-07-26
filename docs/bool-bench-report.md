@@ -355,3 +355,85 @@ RL_BITMAP=0 <同上>
 java -Xmx512m -cp "$CP" SearchBench /tmp/boolbench-idx message \
   --load-queries /tmp/boolq.txt --no-cache --warmup 10 --iter 30 [--topn 10 | --no-fast-count]
 ```
+
+## 12. 批量迭代（块级 DocIter）——5M 单段 bench（2026-07-26）
+
+### 12.1 方法论
+
+- 索引：`logwrite 5M seed=42 --bitmap --positions` + `forcemerge --bitmap` → 单段 5,000,000 docs / 1.3 GB
+- 查询集：m7-q.txt 698 条复用（df 等比 ×5，level 词 df≈1M，选择率 ~20% 不变）
+- 矩阵：roaring/pfor × block on/off × 三模式（count/iter/topn） + Java 基线；warmup 3 / iter 10
+- 引擎改动：spec 2026-07-26（commit ca69dd4..fcac9cd）；RL_BLOCK=0 逃生门逐 query 对账 0 差异
+- perf 证据等级：墙钟（bench 机 PMU 不可用）
+
+### 12.2 block on/off 对照（no-fast 全量迭代，p50 µs）
+
+| 形状桶 | roaring on | roaring off | 倍数 | pfor on | pfor off | 倍数 | java |
+|--------|-----------|------------|------|---------|---------|------|------|
+| and high | 239 | 275 | 1.15× | 1450 | 1731 | 1.19× | 641 |
+| and med | 128 | 145 | 1.14× | 704 | 826 | 1.17× | 552 |
+| bool high | 1019 | 1607 | 1.58× | 11017 | 5761 | 0.52× | 1301 |
+| bool med | 531 | 808 | 1.52× | 7979 | 2611 | 0.33× | 1084 |
+| iterm high | 181 | 580 | 3.20× | 278 | 655 | 2.36× | 179 |
+| iterm med | 90 | 279 | 3.11× | 137 | 318 | 2.33× | 360 |
+| or high | 1450 | 2407 | 1.66× | 2797 | 2981 | 1.07× | 1010 |
+| or med | 706 | 1133 | 1.60× | 1214 | 1339 | 1.10× | 2215 |
+| phrase high | 1376 | 1406 | 1.02× | 2487 | 2448 | 0.98× | 1192 |
+| phrase med | 469 | 479 | 1.02× | 1060 | 1039 | 0.98× | 2427 |
+
+### 12.3 count 模式（fast-count 主导）
+
+count 模式下 and/or/bool 桶走 fast_segment_count 短路，块化影响近零（ratio ≈ 1.00）。
+iterm 桶（无 fast-count 捷径）仍获 3.0-3.2× 收益（roaring）。
+
+### 12.4 1M↔5M 标度
+
+5M 单段 vs 1M 双段：and/or 桶 p50 放大约 4-5×（近线性），bool 桶放大约 3-4×
+（子句数固定但 df 等比放大，组合器工作量超线性增长被 bitmap 批量吸收）。
+
+### 12.5 与 demo 预估对照
+
+demo 预估 PFOR 3-10× / roaring 1.5-4×（spec §1.2）。实测：
+- roaring iterm 3.1-3.2×（符合预估上界）
+- roaring bool/or 1.5-1.7×（符合预估下界）
+- roaring and 1.1-1.2×（低于预估——and 走 block_intersect 快路径，解码占比高于代数）
+- PFOR iterm 2.3×（低于预估——PFOR 解码本身已批量化，块化增量有限）
+- PFOR bool 0.33-0.52×（回归——见 §12.6 分析）
+
+### 12.6 Phase 2 决策备忘
+
+**PFOR bool 回归分析**：PFOR bool 块路径 p50 = 11017µs vs 逐 doc = 5761µs（high），
+回归 1.9×。根因：PFOR 路径无内联 bitmap，Bool 组合器的子句迭代器走 DocsFreqsEnum
+默认 fill（逐 doc next_doc 循环），块化覆写仅在外层组合器生效而叶子未真块——
+外层 kway_union 的 limit 截断导致频繁短块产出 + refill 循环开销超过逐 doc 堆归并。
+Phase 2 修复方向：PFOR 叶子 DocsFreqsEnum 真块覆写（Task 1-2 的 next_docs 已就绪，
+但 Conjunction/Disjunction 的 PostingsIter 子在 PFOR 路径下的 next_block 需验证
+codec 批读窗口是否对齐 128 块边界）。
+
+**profile 热点**（墙钟推断）：
+- roaring 路径：代数内核（block_intersect/kway_union）占比 < 20%，bitmap 解码占主导
+- PFOR 路径：codec 解码占 60%+，组合器开销 < 10%
+
+**决策**：
+- Phase 2 不做 SIMD（代数内核占比过低，ROI 不足）
+- Phase 2 优先修复 PFOR bool 回归（叶子真块 + 去除 limit 截断对短块的放大效应）
+- BitsetDocIter 默认 fill 实测影响：phrase 桶 1.02×（无影响，设计记录确认）
+
+### 12.7 复现命令
+
+```bash
+# 5M 索引构建
+./target/release/rustlucene-cli logwrite /tmp/boolbench-5m 5000000 42 --bitmap --positions
+./target/release/rustlucene-cli forcemerge /tmp/boolbench-5m --bitmap
+
+# Rust 三模式 × block on/off
+B=./target/release/rustlucene-cli
+$B searchbench /tmp/boolbench-5m message --load-queries /tmp/boolq.txt --warmup 3 --iter 10 [--no-fast-count | --topn 10]
+RL_BLOCK=0 $B searchbench ... # 同上
+RL_BITMAP=0 $B searchbench ... # PFOR 路径
+
+# Java 基线
+CP="interop/java/classes:interop/java/lib/lucene-core-9.12.3.jar:interop/java/lib/lucene-analysis-common-9.12.3.jar"
+java -Xmx2g -cp "$CP" SearchBench /tmp/boolbench-5m message \
+  --load-queries /tmp/boolq.txt --no-cache --warmup 3 --iter 10
+```

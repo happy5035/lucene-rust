@@ -155,3 +155,116 @@ fn leaves_block_vs_per_doc_random() {
         assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "mat n={n}");
     }
 }
+
+use super::doc_iter::{block_andnot, block_intersect, kway_union};
+
+fn run(f: impl Fn(&[u32], &[u32], &mut [u32]) -> (usize, usize, usize), a: &[u32], b: &[u32]) -> Vec<u32> {
+    // 分片消费至耗尽（模拟组合器跨调用状态机）
+    let mut out = vec![0u32; 128];
+    let mut res = Vec::new();
+    let (mut pa, mut pb) = (0, 0);
+    loop {
+        let (ca, cb, n) = f(&a[pa..], &b[pb..], &mut out);
+        res.extend_from_slice(&out[..n]);
+        pa += ca;
+        pb += cb;
+        if n == 0 || (pa == a.len() && (ca == 0 || cb == 0 && pb == b.len())) {
+            break;
+        }
+        if ca == 0 && cb == 0 {
+            break;
+        }
+    }
+    res
+}
+
+fn expect_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    a.iter().filter(|x| b.contains(x)).copied().collect()
+}
+
+fn expect_andnot(a: &[u32], b: &[u32]) -> Vec<u32> {
+    a.iter().filter(|x| !b.contains(x)).copied().collect()
+}
+
+#[test]
+fn algebra_quadrants() {
+    let cases: Vec<(Vec<u32>, Vec<u32>)> = vec![
+        (vec![], vec![]),
+        (vec![1, 2, 3], vec![]),
+        (vec![], vec![1, 2, 3]),
+        (vec![1, 3, 5], vec![2, 4, 6]),          // 不相交
+        (vec![1, 2, 3], vec![1, 2, 3]),          // 全等
+        (vec![2, 4], vec![1, 2, 3, 4, 5]),       // 包含
+        ((0..300).step_by(2).collect(), (0..300).step_by(3).collect()), // 交错跨块
+        ((0..128).collect(), (0..256).collect()),                      // 128 整数倍
+        ((0..127).collect(), (0..129).collect()),                      // 尾块
+    ];
+    for (a, b) in cases {
+        assert_eq!(run(block_intersect, &a, &b), expect_intersect(&a, &b), "intersect {a:?} {b:?}");
+        assert_eq!(run(block_andnot, &a, &b), expect_andnot(&a, &b), "andnot {a:?} {b:?}");
+        // andnot 反对称
+        assert_eq!(run(block_andnot, &b, &a), expect_andnot(&b, &a), "andnot rev {a:?} {b:?}");
+    }
+}
+
+#[test]
+fn kway_union_dedup_and_order() {
+    let mut lcg = Lcg(99);
+    for _ in 0..30 {
+        let k = 2 + (lcg.next_u32() % 5) as usize;
+        let mut sets: Vec<Vec<u32>> = Vec::with_capacity(k);
+        for _ in 0..k {
+            let cnt = (lcg.next_u32() % 400) as usize;
+            sets.push(lcg.doc_set(3_000, cnt));
+        }
+        // 期望 = 并集去重升序
+        let mut expect: Vec<u32> = sets.iter().flatten().copied().collect();
+        expect.sort_unstable();
+        expect.dedup();
+        // 分片消费
+        let mut got = Vec::new();
+        let mut pos = vec![0usize; k];
+        let mut out = vec![0u32; 64]; // 故意 <128 触发多次归并
+        loop {
+            let heads: Vec<&[u32]> = sets.iter().enumerate().map(|(i, s)| &s[pos[i]..]).collect();
+            let mut consumed = vec![0usize; k];
+            let n = kway_union(&heads, &mut consumed, &mut out);
+            got.extend_from_slice(&out[..n]);
+            for i in 0..k {
+                pos[i] += consumed[i];
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(got, expect, "k={k}");
+    }
+}
+
+#[test]
+fn algebra_consumed_coordinates_partial_fill() {
+    // out 容量小于结果集：消费坐标必须停在"最后参与元素"处，
+    // 调用方凭此续跑不丢不重（I-1：直钉坐标，不靠全流装配间接验证）。
+    let a = [1u32, 2, 3, 4, 5, 6];
+    let b = [2u32, 4, 6, 8];
+    let mut out = [0u32; 2];
+
+    // intersect：out=[2,4]，a 消费到 4（含），b 消费到 4（含）
+    let (ca_i, cb_i, n_i) = block_intersect(&a, &b, &mut out);
+    assert_eq!(&out[..n_i], &[2, 4]);
+    assert_eq!((ca_i, cb_i, n_i), (4, 2, 2));
+
+    // andnot：a\b = [1,3,5,...]，out=[1,3]，a 消费 3 个（ia 在 emit 后
+    // ++ 到 3），b 消费到 <4 处（即 1 个：2）—— 实现值与 brief 不同，
+    // 见 task-4-report Fix I-1 偏差说明。
+    let (ca_a, cb_a, n_a) = block_andnot(&a, &b, &mut out);
+    assert_eq!(&out[..n_a], &[1, 3]);
+    assert_eq!((ca_a, cb_a, n_a), (3, 1, 2));
+
+    // 续跑验证：从 intersect 消费坐标续跑拼出完整结果，不丢不重
+    let (ca2, cb2, n2) = block_intersect(&a[ca_i..], &b[cb_i..], &mut out);
+    let mut full: Vec<u32> = vec![2, 4];
+    full.extend_from_slice(&out[..n2]);
+    assert_eq!(full, vec![2, 4, 6]);
+    let _ = (ca2, cb2);
+}

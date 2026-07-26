@@ -1606,6 +1606,89 @@ impl DocIter for ExcludingDocIter {
     }
 }
 
+// ── 块代数内核（spec 2026-07-26 §4；Phase 2 SIMD 只换这里） ─────────
+
+/// 双指针 intersect，部分消费语义：对 a/b 前缀求交写入 out（至多
+/// out.len() 个），返回 (消费 a 数, 消费 b 数, 产出数)。产出满或
+/// 某侧耗尽即停——调用方按返回值推进游标跨调用续算。
+/// 输入要求：a/b 升序（块契约）。
+#[allow(dead_code)] // Task 5/6 combinator overrides will call
+pub(super) fn block_intersect(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
+    let (mut ia, mut ib, mut n) = (0, 0, 0);
+    while ia < a.len() && ib < b.len() && n < out.len() {
+        let (x, y) = (a[ia], b[ib]);
+        if x == y {
+            out[n] = x;
+            n += 1;
+            ia += 1;
+            ib += 1;
+        } else if x < y {
+            ia += 1;
+        } else {
+            ib += 1;
+        }
+    }
+    (ia, ib, n)
+}
+
+/// slice 差集 a \ b，部分消费语义同 block_intersect。注意：b 侧消费
+/// 只推进到"已确认 < a 当前尾"的前缀——b 游标跨调用留存（Excl 的
+/// prohibited 块语义）。
+#[allow(dead_code)] // Task 5/6 combinator overrides will call
+pub(super) fn block_andnot(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
+    let (mut ia, mut ib, mut n) = (0, 0, 0);
+    while ia < a.len() && n < out.len() {
+        let x = a[ia];
+        while ib < b.len() && b[ib] < x {
+            ib += 1;
+        }
+        if ib < b.len() && b[ib] == x {
+            ib += 1; // 排除；b 该元素已消费
+        } else {
+            out[n] = x;
+            n += 1;
+        }
+        ia += 1;
+    }
+    (ia, ib, n)
+}
+
+/// k 路有序 slice 归并去重，out 满即停。consumed[i] 写回各 head 消费
+/// 数（调用方每次调用前初始化为 0；Vec 长度 = heads.len()）。k 小（bool 子句数）→ 线性扫
+/// 最小头，不上堆（堆化是 bool-bench-report §11 P2 议题）。
+#[allow(dead_code)] // Task 5/6 combinator overrides will call
+pub(super) fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u32]) -> usize {
+    debug_assert_eq!(heads.len(), consumed.len());
+    let mut n = 0;
+    let mut last: Option<u32> = None;
+    while n < out.len() {
+        // 选最小头
+        let mut best: Option<(usize, u32)> = None;
+        for (i, h) in heads.iter().enumerate() {
+            let rest = &h[consumed[i]..];
+            if let Some(&d) = rest.first() {
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((i, d));
+                }
+            }
+        }
+        let Some((_, d)) = best else { break };
+        // 推进所有等于 d 的头（去重）
+        for (i, h) in heads.iter().enumerate() {
+            let rest = &h[consumed[i]..];
+            if rest.first() == Some(&d) {
+                consumed[i] += 1;
+            }
+        }
+        if last != Some(d) {
+            out[n] = d;
+            n += 1;
+            last = Some(d);
+        }
+    }
+    n
+}
+
 // ── SegmentDocIter ────────────────────────────────────────────────────
 
 pub enum SegmentDocIter {

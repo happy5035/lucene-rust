@@ -1,0 +1,219 @@
+# Review package: 0bb726d..3e4f97f
+
+## Commits
+3e4f97f feat(batch): 共享块代数内核 block_intersect / block_andnot / kway_union
+
+## Files changed
+ crates/core/src/search/block_tests.rs | 85 +++++++++++++++++++++++++++++++++++
+ crates/core/src/search/doc_iter.rs    | 83 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 168 insertions(+)
+
+## Diff
+diff --git a/crates/core/src/search/block_tests.rs b/crates/core/src/search/block_tests.rs
+index efee607..855ae53 100644
+--- a/crates/core/src/search/block_tests.rs
++++ b/crates/core/src/search/block_tests.rs
+@@ -148,10 +148,95 @@ fn leaves_block_vs_per_doc_random() {
+     let mut lcg = Lcg(7);
+     for _ in 0..20 {
+         let n = (lcg.next_u32() % 600) as usize;
+         let docs = lcg.doc_set(50_000, n);
+         // Materialized 叶子
+         let mut a = leaf(&docs);
+         let mut b = leaf(&docs);
+         assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "mat n={n}");
+     }
+ }
++
++use super::doc_iter::{block_andnot, block_intersect, kway_union};
++
++fn run(f: impl Fn(&[u32], &[u32], &mut [u32]) -> (usize, usize, usize), a: &[u32], b: &[u32]) -> Vec<u32> {
++    // 分片消费至耗尽（模拟组合器跨调用状态机）
++    let mut out = vec![0u32; 128];
++    let mut res = Vec::new();
++    let (mut pa, mut pb) = (0, 0);
++    loop {
++        let (ca, cb, n) = f(&a[pa..], &b[pb..], &mut out);
++        res.extend_from_slice(&out[..n]);
++        pa += ca;
++        pb += cb;
++        if n == 0 || (pa == a.len() && (ca == 0 || cb == 0 && pb == b.len())) {
++            break;
++        }
++        if ca == 0 && cb == 0 {
++            break;
++        }
++    }
++    res
++}
++
++fn expect_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
++    a.iter().filter(|x| b.contains(x)).copied().collect()
++}
++
++fn expect_andnot(a: &[u32], b: &[u32]) -> Vec<u32> {
++    a.iter().filter(|x| !b.contains(x)).copied().collect()
++}
++
++#[test]
++fn algebra_quadrants() {
++    let cases: Vec<(Vec<u32>, Vec<u32>)> = vec![
++        (vec![], vec![]),
++        (vec![1, 2, 3], vec![]),
++        (vec![], vec![1, 2, 3]),
++        (vec![1, 3, 5], vec![2, 4, 6]),          // 不相交
++        (vec![1, 2, 3], vec![1, 2, 3]),          // 全等
++        (vec![2, 4], vec![1, 2, 3, 4, 5]),       // 包含
++        ((0..300).step_by(2).collect(), (0..300).step_by(3).collect()), // 交错跨块
++        ((0..128).collect(), (0..256).collect()),                      // 128 整数倍
++        ((0..127).collect(), (0..129).collect()),                      // 尾块
++    ];
++    for (a, b) in cases {
++        assert_eq!(run(block_intersect, &a, &b), expect_intersect(&a, &b), "intersect {a:?} {b:?}");
++        assert_eq!(run(block_andnot, &a, &b), expect_andnot(&a, &b), "andnot {a:?} {b:?}");
++        // andnot 反对称
++        assert_eq!(run(block_andnot, &b, &a), expect_andnot(&b, &a), "andnot rev {a:?} {b:?}");
++    }
++}
++
++#[test]
++fn kway_union_dedup_and_order() {
++    let mut lcg = Lcg(99);
++    for _ in 0..30 {
++        let k = 2 + (lcg.next_u32() % 5) as usize;
++        let mut sets: Vec<Vec<u32>> = Vec::with_capacity(k);
++        for _ in 0..k {
++            let cnt = (lcg.next_u32() % 400) as usize;
++            sets.push(lcg.doc_set(3_000, cnt));
++        }
++        // 期望 = 并集去重升序
++        let mut expect: Vec<u32> = sets.iter().flatten().copied().collect();
++        expect.sort_unstable();
++        expect.dedup();
++        // 分片消费
++        let mut got = Vec::new();
++        let mut pos = vec![0usize; k];
++        let mut out = vec![0u32; 64]; // 故意 <128 触发多次归并
++        loop {
++            let heads: Vec<&[u32]> = sets.iter().enumerate().map(|(i, s)| &s[pos[i]..]).collect();
++            let mut consumed = vec![0usize; k];
++            let n = kway_union(&heads, &mut consumed, &mut out);
++            got.extend_from_slice(&out[..n]);
++            for i in 0..k {
++                pos[i] += consumed[i];
++            }
++            if n == 0 {
++                break;
++            }
++        }
++        assert_eq!(got, expect, "k={k}");
++    }
++}
+diff --git a/crates/core/src/search/doc_iter.rs b/crates/core/src/search/doc_iter.rs
+index 7ac70d6..80eb5e9 100644
+--- a/crates/core/src/search/doc_iter.rs
++++ b/crates/core/src/search/doc_iter.rs
+@@ -1599,20 +1599,103 @@ impl DocIter for ExcludingDocIter {
+             return Ok(self.doc);
+         }
+         if self.doc == NO_MORE_DOCS {
+             return Ok(NO_MORE_DOCS);
+         }
+         self.main.advance(target)?;
+         self.next_non_excluded()
+     }
+ }
+ 
++// ── 块代数内核（spec 2026-07-26 §4；Phase 2 SIMD 只换这里） ─────────
++
++/// 双指针 intersect，部分消费语义：对 a/b 前缀求交写入 out（至多
++/// out.len() 个），返回 (消费 a 数, 消费 b 数, 产出数)。产出满或
++/// 某侧耗尽即停——调用方按返回值推进游标跨调用续算。
++/// 输入要求：a/b 升序（块契约）。
++#[allow(dead_code)] // Task 5/6 combinator overrides will call
++pub(super) fn block_intersect(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
++    let (mut ia, mut ib, mut n) = (0, 0, 0);
++    while ia < a.len() && ib < b.len() && n < out.len() {
++        let (x, y) = (a[ia], b[ib]);
++        if x == y {
++            out[n] = x;
++            n += 1;
++            ia += 1;
++            ib += 1;
++        } else if x < y {
++            ia += 1;
++        } else {
++            ib += 1;
++        }
++    }
++    (ia, ib, n)
++}
++
++/// slice 差集 a \ b，部分消费语义同 block_intersect。注意：b 侧消费
++/// 只推进到"已确认 < a 当前尾"的前缀——b 游标跨调用留存（Excl 的
++/// prohibited 块语义）。
++#[allow(dead_code)] // Task 5/6 combinator overrides will call
++pub(super) fn block_andnot(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
++    let (mut ia, mut ib, mut n) = (0, 0, 0);
++    while ia < a.len() && n < out.len() {
++        let x = a[ia];
++        while ib < b.len() && b[ib] < x {
++            ib += 1;
++        }
++        if ib < b.len() && b[ib] == x {
++            ib += 1; // 排除；b 该元素已消费
++        } else {
++            out[n] = x;
++            n += 1;
++        }
++        ia += 1;
++    }
++    (ia, ib, n)
++}
++
++/// k 路有序 slice 归并去重，out 满即停。consumed[i] 写回各 head 消费
++/// 数（调用方初始化长度 = heads.len()）。k 小（bool 子句数）→ 线性扫
++/// 最小头，不上堆（堆化是 bool-bench-report §11 P2 议题）。
++#[allow(dead_code)] // Task 5/6 combinator overrides will call
++pub(super) fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u32]) -> usize {
++    debug_assert_eq!(heads.len(), consumed.len());
++    let mut n = 0;
++    let mut last: Option<u32> = None;
++    while n < out.len() {
++        // 选最小头
++        let mut best: Option<(usize, u32)> = None;
++        for (i, h) in heads.iter().enumerate() {
++            let rest = &h[consumed[i]..];
++            if let Some(&d) = rest.first() {
++                if best.is_none_or(|(_, bd)| d < bd) {
++                    best = Some((i, d));
++                }
++            }
++        }
++        let Some((_, d)) = best else { break };
++        // 推进所有等于 d 的头（去重）
++        for (i, h) in heads.iter().enumerate() {
++            let rest = &h[consumed[i]..];
++            if rest.first() == Some(&d) {
++                consumed[i] += 1;
++            }
++        }
++        if last != Some(d) {
++            out[n] = d;
++            n += 1;
++            last = Some(d);
++        }
++    }
++    n
++}
++
+ // ── SegmentDocIter ────────────────────────────────────────────────────
+ 
+ pub enum SegmentDocIter {
+     Docs(DocsEnum),
+     Freqs(DocsFreqsEnum),
+     All(MatchAllIter),
+     And(ConjunctionDocIter),
+     Or(DisjunctionDocIter),
+     Bitset(BitsetDocIter),
+     Phrase(PhraseDocIter),

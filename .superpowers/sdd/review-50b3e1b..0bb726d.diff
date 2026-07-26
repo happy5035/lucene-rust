@@ -1,0 +1,282 @@
+# Review package: 50b3e1b..0bb726d
+
+## Commits
+0bb726d feat(batch): 叶子 next_block 覆写——bitmap 游标 next_many_to / MatchAll 算术填充 / Docs-Freqs codec 批读
+
+## Files changed
+ crates/core/src/search/block_tests.rs | 24 ++++++++-
+ crates/core/src/search/doc_iter.rs    | 99 +++++++++++++++++++++++++++--------
+ 2 files changed, 101 insertions(+), 22 deletions(-)
+
+## Diff
+diff --git a/crates/core/src/search/block_tests.rs b/crates/core/src/search/block_tests.rs
+index 4707d36..efee607 100644
+--- a/crates/core/src/search/block_tests.rs
++++ b/crates/core/src/search/block_tests.rs
+@@ -1,20 +1,20 @@
+ //! 块路径对拍电池（spec §7）：block 流 == per-doc 流逐点一致。
+ //! block_enabled() 是进程级 OnceLock 不可在测试内翻转——对拍直调
+ //! drive_blocks vs per-doc 循环两个显式路径。
+ 
+ use codec_lucene9::postings_read::NO_MORE_DOCS;
+ use codec_lucene9::roaring::MaterializedBitmap;
+ 
+ use super::collector::{Collector, CountCollector};
+ #[allow(unused_imports)] // DOC_BLOCK reserved for Task 2+ block helpers
+-use super::doc_iter::{DocBlockBuf, DocIter, MaterializedDocIter, SegmentDocIter, DOC_BLOCK};
++use super::doc_iter::{DocBlockBuf, DocIter, MatchAllIter, MaterializedDocIter, SegmentDocIter, DOC_BLOCK};
+ use super::searcher::drive_blocks;
+ 
+ /// 小步长 LCG（core 无 rand dev-dep；测试专用，勿用于生产）。
+ struct Lcg(u64);
+ impl Lcg {
+     fn next_u32(&mut self) -> u32 {
+         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+         (self.0 >> 33) as u32
+     }
+     /// 升序去重 doc 集：density 控制命中率，universe 内随机选取。
+@@ -126,10 +126,32 @@ fn collect_block_default_matches_per_doc() {
+     // collect_block 默认实现 == 逐 doc collect（外部 collector 兜底契约）
+     let mut vc = VecCollector::default();
+     let docs = [1u32, 5, 9, 200];
+     vc.collect_block(&docs, None);
+     assert_eq!(vc.docs, vec![1, 5, 9, 200]);
+     assert_eq!(vc.freqs, vec![1, 1, 1, 1]);
+     let mut vc2 = VecCollector::default();
+     vc2.collect_block(&docs, Some(&[2, 3, 4, 5]));
+     assert_eq!(vc2.freqs, vec![2, 3, 4, 5]);
+ }
++
++#[test]
++fn matchall_block_stream() {
++    for max in [0i32, 1, 127, 128, 129, 300, 1000] {
++        let mut it = SegmentDocIter::All(MatchAllIter::new(max));
++        let expect: Vec<u32> = (0..max as u32).collect();
++        assert_eq!(stream_block(&mut it), expect, "max={max}");
++    }
++}
++
++#[test]
++fn leaves_block_vs_per_doc_random() {
++    let mut lcg = Lcg(7);
++    for _ in 0..20 {
++        let n = (lcg.next_u32() % 600) as usize;
++        let docs = lcg.doc_set(50_000, n);
++        // Materialized 叶子
++        let mut a = leaf(&docs);
++        let mut b = leaf(&docs);
++        assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "mat n={n}");
++    }
++}
+diff --git a/crates/core/src/search/doc_iter.rs b/crates/core/src/search/doc_iter.rs
+index 60d6e8a..7ac70d6 100644
+--- a/crates/core/src/search/doc_iter.rs
++++ b/crates/core/src/search/doc_iter.rs
+@@ -112,20 +112,38 @@ impl DocIter for MatchAllIter {
+     fn advance(&mut self, target: i32) -> io::Result<i32> {
+         if target > self.doc {
+             self.doc = if target >= self.max_doc {
+                 NO_MORE_DOCS
+             } else {
+                 target
+             };
+         }
+         Ok(self.doc)
+     }
++    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
++        if self.doc == NO_MORE_DOCS {
++            out.len = 0;
++            return Ok(0);
++        }
++        let start = (self.doc + 1).max(0) as u32;
++        let n = (self.max_doc as u32).saturating_sub(start).min(DOC_BLOCK as u32) as usize;
++        for i in 0..n {
++            out.docs[i] = start + i as u32;
++        }
++        self.doc = if n == 0 || start + n as u32 >= self.max_doc as u32 {
++            NO_MORE_DOCS
++        } else {
++            (start + n as u32 - 1) as i32
++        };
++        out.len = n;
++        Ok(n)
++    }
+ }
+ 
+ // ── Internal postings wrapper ─────────────────────────────────────────
+ 
+ enum PostingsIter {
+     Docs(DocsEnum),
+     Freqs(DocsFreqsEnum),
+ }
+ impl PostingsIter {
+     /// `needs_freq == false` over a DOCS_AND_FREQS field yields a no-freq
+@@ -716,20 +734,66 @@ impl<B: DocsBitmap> BitmapCursor<B> {
+         Some(d)
+     }
+ 
+     /// First doc >= target. Forward-only: discards the buffered tail and
+     /// re-seeks (the merge dance's resync pattern, M4 关键设计事实 8).
+     fn advance(&mut self, target: u32) -> Option<u32> {
+         self.pos = self.end;
+         self.next_from = target;
+         self.next()
+     }
++
++    /// 批量产出（spec 2026-07-26 Task 3）：把缓冲与后续 refill 的 doc
++    /// 拷入 dst 至填满或耗尽，返回产出数。维护 next_from 不变量
++    /// （= 最后产出 doc + 1），保证批读后 advance() 语义不变。
++    /// docs < max_doc <= i32::MAX，+1 不溢出。
++    fn next_many_to(&mut self, dst: &mut [u32]) -> usize {
++        let mut n = 0;
++        while n < dst.len() {
++            if self.pos >= self.end {
++                // 维护 next_from 不变量（= 已产出最后 doc + 1），
++                // 使 refill 的 docs_from seek 越过已消费区。
++                // brief 原版仅在循环尾更新，跨 refill 时 stale → 重复拉取。
++                if n > 0 {
++                    self.next_from = dst[n - 1] + 1;
++                }
++                if !self.refill() {
++                    break;
++                }
++            }
++            let take = (self.end - self.pos).min(dst.len() - n);
++            dst[n..n + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
++            self.pos += take;
++            n += take;
++        }
++        if n > 0 {
++            self.next_from = dst[n - 1] + 1;
++        }
++        n
++    }
++}
++
++/// BitmapCursor 叶子共用的块产出（RoaringDocIter / MaterializedDocIter）：
++/// 游标批读 + doc 游标簿记。耗尽后 doc 钉 NO_MORE_DOCS。
++fn cursor_next_block<B: DocsBitmap>(
++    cur: &mut BitmapCursor<B>,
++    doc: &mut i32,
++    out: &mut DocBlockBuf,
++) -> io::Result<usize> {
++    if *doc == NO_MORE_DOCS {
++        out.len = 0;
++        return Ok(0);
++    }
++    let n = cur.next_many_to(&mut out.docs);
++    *doc = if n == 0 { NO_MORE_DOCS } else { out.docs[n - 1] as i32 };
++    out.len = n;
++    Ok(n)
+ }
+ 
+ /// DocIter over a term's inline bitmap (M5 §2 Term 路径): wraps the
+ /// frozen view's batch cursor. freq() is 1 — the bitmap carries no freqs,
+ /// and needs_freq paths never get this iterator (correctness
+ /// requirement (e)).
+ pub struct RoaringDocIter {
+     cur: BitmapCursor<FrozenBitmap>,
+     doc: i32,
+ }
+@@ -761,20 +825,24 @@ impl DocIter for RoaringDocIter {
+ 
+     fn advance(&mut self, target: i32) -> io::Result<i32> {
+         if target > self.doc {
+             self.doc = match self.cur.advance(target.max(0) as u32) {
+                 Some(d) => d as i32,
+                 None => NO_MORE_DOCS,
+             };
+         }
+         Ok(self.doc)
+     }
++
++    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
++        cursor_next_block(&mut self.cur, &mut self.doc, out)
++    }
+ }
+ 
+ // ── Materialized (owned bitmap over a materialized hit set) ──────────
+ 
+ /// DocIter over an owned materialized bitmap: PointRange 段内命中
+ /// (M6 spec §3.3) 与 Bool 物化 fold 结果（P1-1：排除形容器级 andnot
+ /// 后顺序迭代，替代 ExcludingDocIter 逐候选 advance 丢批病理）共用。
+ /// 同 RoaringDocIter 的批量游标形状。freq() is 1 — 物化集不携带 freq，
+ /// `needs_freq` 路径不会路由到此。
+ pub struct MaterializedDocIter {
+@@ -809,20 +877,24 @@ impl DocIter for MaterializedDocIter {
+ 
+     fn advance(&mut self, target: i32) -> io::Result<i32> {
+         if target > self.doc {
+             self.doc = match self.cur.advance(target.max(0) as u32) {
+                 Some(d) => d as i32,
+                 None => NO_MORE_DOCS,
+             };
+         }
+         Ok(self.doc)
+     }
++
++    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
++        cursor_next_block(&mut self.cur, &mut self.doc, out)
++    }
+ }
+ 
+ // ── AND over views (M4 §5) ─────────────────────────────────────────────
+ 
+ /// One merge-intersect / merge-union source (M5 §2): a frozen-view batch
+ /// cursor, or a materialized doc slice (low-df clause or tier-1 fold
+ /// result). Both yield ascending docs with a forward-only advance.
+ pub enum DocSource {
+     Bitmap {
+         cur: BitmapCursor<FrozenBitmap>,
+@@ -1622,45 +1694,30 @@ impl DocIter for SegmentDocIter {
+         match self {
+             Self::Phrase(p) => p.matches(),
+             _ => Ok(true),
+         }
+     }
+     fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+         match self {
+             // Docs/Freqs 是 codec 类型（无 DocIter impl）：Task 1 内联
+             // 逐 doc 填充，Task 3 换成 codec 窗口批读。
+             Self::Docs(d) => {
+-                let mut n = 0;
+-                while n < DOC_BLOCK {
+-                    let doc = d.next_doc()?;
+-                    if doc == NO_MORE_DOCS {
+-                        break;
+-                    }
+-                    out.docs[n] = doc as u32;
+-                    n += 1;
+-                }
++                let n = d.next_docs(&mut out.docs)?;
+                 out.len = n;
+                 Ok(n)
+             }
+             Self::Freqs(f) => {
+-                let mut n = 0;
+-                while n < DOC_BLOCK {
+-                    let doc = f.next_doc()?;
+-                    if doc == NO_MORE_DOCS {
+-                        break;
+-                    }
+-                    out.docs[n] = doc as u32;
+-                    if f.decodes_freqs() {
+-                        out.freqs[n] = f.freq();
+-                    }
+-                    n += 1;
+-                }
++                let n = if f.decodes_freqs() {
++                    f.next_docs_and_freqs(&mut out.docs, &mut out.freqs)?
++                } else {
++                    f.next_docs(&mut out.docs)?
++                };
+                 out.len = n;
+                 Ok(n)
+             }
+             Self::All(a) => a.next_block(out),
+             Self::And(a) => a.next_block(out),
+             Self::Or(o) => o.next_block(out),
+             Self::Bitset(b) => b.next_block(out),
+             Self::Phrase(p) => p.next_block(out),
+             Self::Roaring(r) => r.next_block(out),
+             Self::RoaringAnd(a) => a.next_block(out),

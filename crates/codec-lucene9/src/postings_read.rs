@@ -693,6 +693,12 @@ impl DocsFreqsEnum {
     pub fn freq(&self) -> u32 {
         self.core.freq()
     }
+
+    /// Whether `freq()` will succeed (i.e., freq blocks were decoded).
+    /// Returns false for no-freq enums created via `docs_and_freqs_no_freq`.
+    pub fn decodes_freqs(&self) -> bool {
+        self.core.decode_freqs
+    }
 }
 
 /// EverythingEnum.skipPositions (:1031-1082), positions-only profile:

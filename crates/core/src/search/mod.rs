@@ -21,6 +21,9 @@ pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
 
 #[cfg(test)]
+mod block_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig, Schema};

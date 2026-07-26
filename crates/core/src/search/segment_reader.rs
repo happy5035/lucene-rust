@@ -129,3 +129,12 @@ pub(crate) fn bitmap_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RL_BITMAP").map_or(true, |v| v != "0"))
 }
+
+/// 块级迭代路径开关（spec 2026-07-26 §5）：默认 ON；`RL_BLOCK=0`
+/// 三个 driver 逐行回到 per-doc 路径。镜像 bitmap_enabled() 的
+/// OnceLock 形态——env 只作 runtime/bench 逃生门，测试直调显式
+/// drive 函数对拍（spec §7-2）。
+pub(crate) fn block_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RL_BLOCK").map_or(true, |v| v != "0"))
+}

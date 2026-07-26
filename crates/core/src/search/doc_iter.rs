@@ -14,6 +14,29 @@ use codec_lucene9::terms_read::TermEntry;
 use super::bitset::FixedBitSet;
 use super::segment_reader::SegmentReader;
 
+/// 块级迭代尺寸（spec 2026-07-26 §3）= PFOR PackedBlock 尺寸。
+pub const DOC_BLOCK: usize = 128;
+
+/// 调用方拥有的块填充缓冲（spec §3 偏差说明：填充式而非 §4b 原设计
+/// 的借出式，避开跨 &mut self 生命周期纠缠）。freqs 仅产出 freq 的
+/// 迭代器（DocsFreqsEnum 解码路径）填充；其余保持未定义，驱动方按
+/// needs_freq 决定是否透传。
+pub struct DocBlockBuf {
+    pub docs: [u32; DOC_BLOCK],
+    pub freqs: [u32; DOC_BLOCK],
+    pub len: usize,
+}
+
+impl DocBlockBuf {
+    pub fn new() -> DocBlockBuf {
+        DocBlockBuf {
+            docs: [0; DOC_BLOCK],
+            freqs: [0; DOC_BLOCK],
+            len: 0,
+        }
+    }
+}
+
 pub trait DocIter {
     fn doc_id(&self) -> i32;
     fn next_doc(&mut self) -> io::Result<i32>;
@@ -37,6 +60,27 @@ pub trait DocIter {
     /// 对同一候选 doc 至多调用一次。
     fn matches(&mut self) -> io::Result<bool> {
         Ok(true)
+    }
+    /// 块级产出（spec 2026-07-26）：填充 out，返回产出数（0 = 耗尽，
+    /// 此后永不再产块）。默认实现循环 next_doc()+matches() 填充——
+    /// 两阶段确认在产出侧吸收，block driver 不再调 matches()。
+    /// 覆写者契约：(1) out.docs[..n] 已 matches 过滤；(2) 块内严格升序；
+    /// (3) 跨块单调递增；(4) 携带 freq 的迭代器同步填 out.freqs[..n]。
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        let mut n = 0;
+        while n < DOC_BLOCK {
+            let d = self.next_doc()?;
+            if d == NO_MORE_DOCS {
+                break;
+            }
+            if !self.matches()? {
+                continue;
+            }
+            out.docs[n] = d as u32;
+            n += 1;
+        }
+        out.len = n;
+        Ok(n)
     }
 }
 
@@ -1578,6 +1622,53 @@ impl DocIter for SegmentDocIter {
         match self {
             Self::Phrase(p) => p.matches(),
             _ => Ok(true),
+        }
+    }
+    fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
+        match self {
+            // Docs/Freqs 是 codec 类型（无 DocIter impl）：Task 1 内联
+            // 逐 doc 填充，Task 3 换成 codec 窗口批读。
+            Self::Docs(d) => {
+                let mut n = 0;
+                while n < DOC_BLOCK {
+                    let doc = d.next_doc()?;
+                    if doc == NO_MORE_DOCS {
+                        break;
+                    }
+                    out.docs[n] = doc as u32;
+                    n += 1;
+                }
+                out.len = n;
+                Ok(n)
+            }
+            Self::Freqs(f) => {
+                let mut n = 0;
+                while n < DOC_BLOCK {
+                    let doc = f.next_doc()?;
+                    if doc == NO_MORE_DOCS {
+                        break;
+                    }
+                    out.docs[n] = doc as u32;
+                    if f.decodes_freqs() {
+                        out.freqs[n] = f.freq();
+                    }
+                    n += 1;
+                }
+                out.len = n;
+                Ok(n)
+            }
+            Self::All(a) => a.next_block(out),
+            Self::And(a) => a.next_block(out),
+            Self::Or(o) => o.next_block(out),
+            Self::Bitset(b) => b.next_block(out),
+            Self::Phrase(p) => p.next_block(out),
+            Self::Roaring(r) => r.next_block(out),
+            Self::RoaringAnd(a) => a.next_block(out),
+            Self::RoaringOr(o) => o.next_block(out),
+            Self::Materialized(p) => p.next_block(out),
+            Self::ConjOver(c) => c.next_block(out),
+            Self::DisjOver(d) => d.next_block(out),
+            Self::Excluding(e) => e.next_block(out),
         }
     }
 }

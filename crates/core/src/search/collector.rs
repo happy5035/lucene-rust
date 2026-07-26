@@ -11,6 +11,22 @@ pub trait Collector {
     fn needs_freq(&self) -> bool {
         false
     }
+    /// 块级消费（spec 2026-07-26）：默认逐 doc 回退兜底外部 collector。
+    /// `freqs = None` 时 freq 恒 1（needs_freq=false 驱动或无 freq 迭代器）。
+    fn collect_block(&mut self, docs: &[u32], freqs: Option<&[u32]>) {
+        match freqs {
+            Some(f) => {
+                for (i, &d) in docs.iter().enumerate() {
+                    self.collect(d as i32, f[i]);
+                }
+            }
+            None => {
+                for &d in docs {
+                    self.collect(d as i32, 1);
+                }
+            }
+        }
+    }
 }
 
 /// Total hit count (diff battery workhorse).
@@ -22,6 +38,9 @@ pub struct CountCollector {
 impl Collector for CountCollector {
     fn collect(&mut self, _doc: i32, _freq: u32) {
         self.count += 1;
+    }
+    fn collect_block(&mut self, docs: &[u32], _freqs: Option<&[u32]>) {
+        self.count += docs.len() as u64;
     }
 }
 

@@ -8,9 +8,35 @@ use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::collector::{Collector, FreqSumCollector};
-use super::doc_iter::DocIter;
+use super::doc_iter::{DocBlockBuf, DocIter, SegmentDocIter};
 use super::query::{self, Query};
 use super::reader::Reader;
+use super::segment_reader::block_enabled;
+
+/// 块驱动循环（spec §5）：每 128 docs 一次 enum 分发 + 一次 Result
+/// 检查。matches() 由 next_block 产出侧吸收，此处不调。doc_base 整体
+/// 加宽（Phase 2 可 SIMD）。pub(crate) 供 block_tests 直调对拍。
+pub(crate) fn drive_blocks<C: Collector>(
+    iter: &mut SegmentDocIter,
+    doc_base: u32,
+    needs_freq: bool,
+    collector: &mut C,
+) -> std::io::Result<()> {
+    let mut out = DocBlockBuf::new();
+    loop {
+        let n = iter.next_block(&mut out)?;
+        if n == 0 {
+            break;
+        }
+        if doc_base != 0 {
+            for d in out.docs[..n].iter_mut() {
+                *d += doc_base;
+            }
+        }
+        collector.collect_block(&out.docs[..n], needs_freq.then(|| &out.freqs[..n]));
+    }
+    Ok(())
+}
 
 pub struct Searcher {
     reader: Reader,
@@ -40,6 +66,10 @@ impl Searcher {
             let Some(mut iter) = query.segment_iterator(seg, needs_freq)? else {
                 continue;
             };
+            if block_enabled() {
+                drive_blocks(&mut iter, doc_base as u32, needs_freq, collector)?;
+                continue;
+            }
             loop {
                 let doc = iter.next_doc()?;
                 if doc == NO_MORE_DOCS {
@@ -65,6 +95,17 @@ impl Searcher {
                 continue;
             }
             if let Some(mut iter) = query.segment_iterator(seg, false)? {
+                if block_enabled() {
+                    let mut out = DocBlockBuf::new();
+                    loop {
+                        let n = iter.next_block(&mut out)?;
+                        if n == 0 {
+                            break;
+                        }
+                        total += n as u64;
+                    }
+                    continue;
+                }
                 loop {
                     if iter.next_doc()? == NO_MORE_DOCS {
                         break;

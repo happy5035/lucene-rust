@@ -70,3 +70,4 @@ Task 5: WIP checkpoint (commit 见下条) — 交接给另一 agent 完成
   接手清单: 修 DisjOver → cargo test 全绿（284+2）→ 走 task-5 评审（brief/report 在 .superpowers/sdd/）→ T6-T10 继续（plan: docs/superpowers/plans/2026-07-26-batch-iter.md）
   T1-T4 已完成且评审干净（2435f5d / 50b3e1b / 0bb726d / 50c02a3）
 提交纪律追加（用户指示）：.superpowers/sdd/ 已纳入版本控制（根 .gitignore 改为 .superpowers/* + !.superpowers/sdd/）——T5-T10 每个任务的 brief/report/review/review-package 与代码同提交，不再留本地 scratch
+坑记录：superpowers 的 task-brief / review-package 脚本每次运行会在 .superpowers/sdd/ 重建 .gitignore（内容 *）——提交新产物前先 rm 该文件，或直接 git add -f

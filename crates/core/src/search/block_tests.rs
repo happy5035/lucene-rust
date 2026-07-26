@@ -156,7 +156,7 @@ fn leaves_block_vs_per_doc_random() {
     }
 }
 
-use super::doc_iter::{block_andnot, block_intersect, kway_union};
+use super::doc_iter::{block_andnot, block_intersect, kway_union, ConjOverDocIter, DisjOverDocIter, ExcludingDocIter};
 
 fn run(f: impl Fn(&[u32], &[u32], &mut [u32]) -> (usize, usize, usize), a: &[u32], b: &[u32]) -> Vec<u32> {
     // 分片消费至耗尽（模拟组合器跨调用状态机）
@@ -267,4 +267,120 @@ fn algebra_consumed_coordinates_partial_fill() {
     full.extend_from_slice(&out[..n2]);
     assert_eq!(full, vec![2, 4, 6]);
     let _ = (ca2, cb2);
+}
+
+fn conj_over(children: Vec<Vec<u32>>) -> SegmentDocIter {
+    let subs: Vec<SegmentDocIter> = children.iter().map(|c| leaf(c)).collect();
+    SegmentDocIter::ConjOver(ConjOverDocIter::new(subs).unwrap())
+}
+
+fn disj_over(children: Vec<Vec<u32>>) -> SegmentDocIter {
+    let subs: Vec<SegmentDocIter> = children.iter().map(|c| leaf(c)).collect();
+    SegmentDocIter::DisjOver(DisjOverDocIter::new(subs).unwrap())
+}
+
+fn excl(main: Vec<u32>, prohibited: Vec<u32>) -> SegmentDocIter {
+    SegmentDocIter::Excluding(ExcludingDocIter::new(leaf(&main), leaf(&prohibited)))
+}
+
+fn expect_conj(sets: &[Vec<u32>]) -> Vec<u32> {
+    let mut r: Vec<u32> = sets[0].clone();
+    for s in &sets[1..] {
+        r.retain(|x| s.contains(x));
+    }
+    r
+}
+
+fn expect_disj(sets: &[Vec<u32>]) -> Vec<u32> {
+    let mut r: Vec<u32> = sets.iter().flatten().copied().collect();
+    r.sort_unstable();
+    r.dedup();
+    r
+}
+
+#[test]
+fn combinator_block_vs_per_doc_random() {
+    let mut lcg = Lcg(1234);
+    for round in 0..40 {
+        let k = 2 + (lcg.next_u32() % 3) as usize;
+        let sets: Vec<Vec<u32>> = (0..k)
+            .map(|_| {
+                let cnt = (lcg.next_u32() % 500) as usize;
+                lcg.doc_set(4_000, cnt)
+            })
+            .collect();
+        // ConjOver
+        let mut a = conj_over(sets.clone());
+        let mut b = conj_over(sets.clone());
+        assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "conj round={round}");
+        assert_eq!(stream_block(&mut conj_over(sets.clone())), expect_conj(&sets));
+        // DisjOver
+        let mut a = disj_over(sets.clone());
+        let mut b = disj_over(sets.clone());
+        assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "disj round={round}");
+        assert_eq!(stream_block(&mut disj_over(sets.clone())), expect_disj(&sets));
+        // Excluding
+        let (m, p) = (sets[0].clone(), sets[1].clone());
+        let expect: Vec<u32> = m.iter().filter(|x| !p.contains(x)).copied().collect();
+        let mut a = excl(m.clone(), p.clone());
+        let mut b = excl(m.clone(), p.clone());
+        assert_eq!(stream_block(&mut a), stream_per_doc(&mut b), "excl round={round}");
+        assert_eq!(stream_block(&mut excl(m, p)), expect);
+    }
+}
+
+#[test]
+fn combinator_edge_shapes() {
+    // 空交 / 空集子句 / 128 整数倍 / 全等 / 尾块
+    let e: Vec<u32> = vec![];
+    assert_eq!(stream_block(&mut conj_over(vec![vec![1, 2], e.clone()])), Vec::<u32>::new());
+    assert_eq!(stream_block(&mut disj_over(vec![e.clone(), vec![3]])), vec![3]);
+    let full: Vec<u32> = (0..256).collect();
+    assert_eq!(stream_block(&mut excl(full.clone(), e.clone())), full);
+    assert_eq!(stream_block(&mut excl(e.clone(), full.clone())), Vec::<u32>::new());
+    let a: Vec<u32> = (0..300).step_by(2).collect();
+    let b: Vec<u32> = (0..300).step_by(3).collect();
+    let expect: Vec<u32> = a.iter().filter(|x| !b.contains(x)).copied().collect();
+    assert_eq!(stream_block(&mut excl(a, b)), expect);
+}
+#[test]
+fn disj_debug_round0() {
+    // Reproduce round 0 of combinator_block_vs_per_doc_random
+    let mut lcg = Lcg(1234);
+    let k = 2 + (lcg.next_u32() % 3) as usize;
+    let sets: Vec<Vec<u32>> = (0..k)
+        .map(|_| {
+            let cnt = (lcg.next_u32() % 500) as usize;
+            lcg.doc_set(4_000, cnt)
+        })
+        .collect();
+    eprintln!("k={k}");
+    for (i, s) in sets.iter().enumerate() {
+        eprintln!("  child[{i}]: len={} first10={:?} last5={:?}", s.len(), &s[..s.len().min(10)], &s[s.len().saturating_sub(5)..]);
+    }
+    let expect = expect_disj(&sets);
+    eprintln!("expect: len={}", expect.len());
+
+    // stream_block with tracing
+    let mut it = disj_over(sets.clone());
+    let mut v = Vec::new();
+    let mut buf = super::doc_iter::DocBlockBuf::new();
+    let mut call = 0;
+    loop {
+        let n = it.next_block(&mut buf).unwrap();
+        if n == 0 { break; }
+        let block: Vec<u32> = buf.docs[..n].to_vec();
+        let is_sorted = block.windows(2).all(|w| w[0] <= w[1]);
+        let cross_ok = v.last().map_or(true, |&last| block[0] > last);
+        eprintln!("  block[{call}]: n={n} sorted={is_sorted} cross_ok={cross_ok} first={} last={}", block[0], block[n-1]);
+        if !is_sorted || !cross_ok {
+            eprintln!("    FAILING BLOCK: {block:?}");
+            if let Some(&last) = v.last() {
+                eprintln!("    prev_last={last}");
+            }
+        }
+        v.extend_from_slice(&buf.docs[..n]);
+        call += 1;
+    }
+    assert_eq!(v, expect);
 }

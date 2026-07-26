@@ -53,3 +53,19 @@ Task 8 (M7 终验): DONE
 M7 final verification: complete (commits f8781f6..371d2f0, final whole-branch review approved)
   verified: codec-lucene9 182 passed / 1 ignored; rustlucene-core 85 passed / 1 ignored; make log-test 7 variants green / 15 INTEROP_OK; searchbench three-way diff empty; release build clean
   critical fixes resolved: DisjOverDocIter::advance two-phase confirmation; ExcludingDocIter prohibited matches confirmation
+Task 1: complete (commits d089782..2435f5d, review clean — I-1 fixed: Freqs arm freqs fill + decodes_freqs accessor; review r2 approved)
+  deferred Minor: DocBlockBuf no Default derive; #[allow] attrs on reserved items (clean up when consumed)
+  Task 2 需知: DocsFreqsEnum::decodes_freqs 已随 Task 1 fix 落地（postings_read.rs:699），勿重复添加
+Task 2: complete (commits 2435f5d..50b3e1b, review clean, 279 green) — DONE_WITH_CONCERNS 裁决：brief 测试代码对 DOCS_AND_FREQS 字段误用 reader.docs()（per-doc 路径同样损坏，证明是测试构造器误用而非生产 bug），实现者拆分为 docs()/docs_and_freqs_no_freq()/docs_and_freqs() 三路，对拍意图完整保留且更强，裁决接受
+  deferred Minor: copy 循环可换 copy_from_slice（cosmetic）; 无 df=exact-128 测试词（take==0 经 step=4096 间接覆盖）
+Task 3: complete (commits 50b3e1b..0bb726d, review clean, 281 green) — DONE_WITH_CONCERNS 裁决：brief Step 3 next_many_to 的 next_from 更新时机 bug（中循环 refill 时 stale → 重叠重拉；末批 <128 docs 时真实可触发，非纯防御），实现者修正为 refill 前更新，裁决接受；BitsetDocIter 保持默认 fill 为 spec 已载偏差
+  deferred Minor: Roaring 叶子无直测（FrozenBitmap 难构造，Task 8 电池覆盖；cursor 逻辑经 Materialized 泛型同测）
+Task 4: complete (commits 0bb726d..50c02a3, review clean r2, 284 green) — I-1 fixed: consumed 坐标直钉测试（andnot 实际坐标 (3,1,2)：ia+=1 无条件消费过产出元素，续跑验证不丢不重）
+  deferred Minor: kway_union 线性找 min（k 小，Phase 2 profile 定）
+  deferred Minor: kway_union 线性找 min（k 小，Phase 2 profile 再定）；andnot resume 仅间接覆盖（直钉 tuple 已够）
+Task 5: WIP checkpoint (commit 见下条) — 交接给另一 agent 完成
+  状态: Excl/ConjOver 覆写 + BlockCursor + position_seg 已落地且对拍绿；DisjOverDocIter::next_block k 路块归并乱序（2 测试红）
+  红测试: block_tests::combinator_block_vs_per_doc_random（"disj round=0"）+ block_tests::disj_debug_round0（复现用，agent 调试时加的，可保留可并）
+  症状: 升序流到某点后，某 child 的剩余块被整体先行产出再回落（refill 后 heads/consumed 簿记错误疑似——kway_union 契约：consumed 每轮调用前清零，heads 传各游标未消费余量）
+  接手清单: 修 DisjOver → cargo test 全绿（284+2）→ 走 task-5 评审（brief/report 在 .superpowers/sdd/）→ T6-T10 继续（plan: docs/superpowers/plans/2026-07-26-batch-iter.md）
+  T1-T4 已完成且评审干净（2435f5d / 50b3e1b / 0bb726d / 50c02a3）

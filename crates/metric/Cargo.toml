@@ -9,6 +9,9 @@ codec-lucene9 = { path = "../codec-lucene9" }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 # 无 tempfile，用 std::env::temp_dir

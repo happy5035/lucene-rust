@@ -10,7 +10,7 @@ use crate::directory::FSDirectory;
 use crate::doc_values::{
     DATA_CODEC, DIRECT_MONOTONIC_BLOCK_SHIFT, DISI_BLOCK_SIZE, DISI_MAX_ARRAY_LENGTH,
     DISI_SENTINEL_BLOCK, META_CODEC, TERMS_DICT_BLOCK_SIZE, TERMS_DICT_REVERSE_INDEX_SIZE,
-    TYPE_NUMERIC, TYPE_SORTED, VERSION,
+    TYPE_BINARY, TYPE_NUMERIC, TYPE_SORTED, VERSION,
 };
 use crate::io::{ChecksumIndexInput, DataInput, IndexInput};
 use crate::packed::{DirectMonotonicReader, DirectReader};
@@ -42,10 +42,26 @@ struct SortedMeta {
     terms_addresses_length: i64,
 }
 
+/// readBinary (:226-248)：BINARY 字段元数据。
+#[derive(Debug)]
+struct BinaryMeta {
+    data_offset: i64,
+    data_length: i64,
+    docs_offset: i64, // -2 空, -1 稠密, 或 DISI 区起点
+    docs_length: i64,
+    num_values: u32,
+    min_length: i32,
+    max_length: i32,
+    addresses_meta: Option<Vec<u8>>, // DM meta（仅变长）
+    addresses_offset: i64,           // 仅变长
+    addresses_length: i64,           // 仅变长
+}
+
 #[derive(Debug)]
 enum DvEntry {
     Numeric(NumericMeta),
     Sorted(SortedMeta),
+    Binary(BinaryMeta),
 }
 
 #[derive(Debug)]
@@ -132,6 +148,42 @@ fn read_terms_meta(dvm: &mut ChecksumIndexInput, ords: NumericMeta) -> io::Resul
     })
 }
 
+/// readBinary (:226-248): parse BINARY field metadata from .dvm.
+fn read_binary_meta(dvm: &mut ChecksumIndexInput) -> io::Result<BinaryMeta> {
+    let data_offset = dvm.read_long()?;
+    let data_length = dvm.read_long()?;
+    let docs_offset = dvm.read_long()?;
+    let docs_length = dvm.read_long()?;
+    let _jump_table_entry_count = dvm.read_short()?;
+    let _dense_rank_power = dvm.read_byte()?;
+    let num_values = dvm.read_int()? as u32;
+    let min_length = dvm.read_int()?;
+    let max_length = dvm.read_int()?;
+    let (addresses_meta, addresses_offset, addresses_length) = if min_length < max_length {
+        let addr_offset = dvm.read_long()?;
+        let block_shift = dvm.read_vint()? as u32;
+        let num_addr = num_values as usize + 1;
+        let mut meta_bytes = vec![0u8; dm_meta_len(num_addr, block_shift)];
+        dvm.read_bytes(&mut meta_bytes)?;
+        let addr_length = dvm.read_long()?;
+        (Some(meta_bytes), addr_offset, addr_length)
+    } else {
+        (None, 0, 0)
+    };
+    Ok(BinaryMeta {
+        data_offset,
+        data_length,
+        docs_offset,
+        docs_length,
+        num_values,
+        min_length,
+        max_length,
+        addresses_meta,
+        addresses_offset,
+        addresses_length,
+    })
+}
+
 /// DirectMonotonic meta 内联字节数（块数公式，packed.rs:237-241 × 21B/块）。
 fn dm_meta_len(num_values: usize, block_shift: u32) -> usize {
     let num_blocks = if num_values == 0 {
@@ -164,6 +216,10 @@ impl DocValuesReader {
                 TYPE_NUMERIC => {
                     let m = read_numeric_meta(&mut dvm)?;
                     entries.push((field_number, DvEntry::Numeric(m)));
+                }
+                TYPE_BINARY => {
+                    let m = read_binary_meta(&mut dvm)?;
+                    entries.push((field_number, DvEntry::Binary(m)));
                 }
                 TYPE_SORTED => {
                     let ords = read_numeric_meta(&mut dvm)?;
@@ -239,7 +295,7 @@ impl DocValuesReader {
             .find(|(n, _)| *n == field_number)
             .and_then(|(_, e)| match e {
                 DvEntry::Numeric(m) => Some(m),
-                DvEntry::Sorted(_) => None,
+                _ => None,
             })
     }
 
@@ -249,7 +305,7 @@ impl DocValuesReader {
             .find(|(n, _)| *n == field_number)
             .and_then(|(_, e)| match e {
                 DvEntry::Sorted(m) => Some(m),
-                DvEntry::Numeric(_) => None,
+                _ => None,
             })
     }
 
@@ -456,6 +512,122 @@ impl DocValuesReader {
             }
         }
         Ok(terms)
+    }
+
+    /// BINARY field: returns (doc_id, bytes) pairs in doc order.
+    /// Mirrors Lucene90DocValuesProducer readBinary + BinaryDocValues iteration.
+    pub fn binary_values(&self, field_number: i32) -> io::Result<Vec<(u32, Vec<u8>)>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|(n, _)| *n == field_number)
+            .and_then(|(_, e)| match e {
+                DvEntry::Binary(m) => Some(m),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no BINARY DV entry for field {field_number}"),
+                )
+            })?;
+
+        if entry.num_values == 0 {
+            return Ok(vec![]);
+        }
+
+        // Decode doc IDs (DISI or dense)
+        let doc_ids: Vec<u32> = if entry.docs_offset == -1 {
+            // Dense: all docs 0..num_values have values
+            (0..entry.num_values).collect()
+        } else if entry.docs_offset == -2 {
+            return Ok(vec![]);
+        } else {
+            // Sparse: decode doc IDs from DISI region
+            let region = self.slice(entry.docs_offset, entry.docs_length)?;
+            let mut docs = Vec::with_capacity(entry.num_values as usize);
+            let mut pos = 0usize;
+            loop {
+                if pos + 4 > region.len() {
+                    return Err(corrupt("truncated DISI block header"));
+                }
+                let block_id = Self::read_u16_le(region, pos)? as u32;
+                let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
+                pos += 4;
+                if block_id == DISI_SENTINEL_BLOCK {
+                    break;
+                }
+                if cardinality <= DISI_MAX_ARRAY_LENGTH {
+                    for _ in 0..cardinality {
+                        docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
+                        pos += 2;
+                    }
+                } else if cardinality == DISI_BLOCK_SIZE {
+                    docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
+                } else {
+                    // DENSE: 256B rank table + 1024 LE longs
+                    if pos + 256 + 1024 * 8 > region.len() {
+                        return Err(corrupt("truncated DISI dense block"));
+                    }
+                    pos += 256; // rank table
+                    for word_index in 0..1024usize {
+                        let mut w = Self::read_u64_le(region, pos)?;
+                        pos += 8;
+                        while w != 0 {
+                            let bit = w.trailing_zeros();
+                            docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
+                            w &= w - 1;
+                        }
+                    }
+                }
+            }
+            if docs.len() != entry.num_values as usize {
+                return Err(corrupt(format!(
+                    "binary DISI docs count mismatch: expected {}, got {}",
+                    entry.num_values,
+                    docs.len()
+                )));
+            }
+            docs
+        };
+
+        // Decode values
+        let data = self.slice(entry.data_offset, entry.data_length)?;
+        let mut result = Vec::with_capacity(entry.num_values as usize);
+
+        if entry.min_length == entry.max_length {
+            // Fixed-length: slice directly by min_length
+            let len = entry.min_length as usize;
+            for (i, &doc_id) in doc_ids.iter().enumerate() {
+                let start = i * len;
+                let end = start + len;
+                if end > data.len() {
+                    return Err(corrupt("binary fixed-length data truncated"));
+                }
+                result.push((doc_id, data[start..end].to_vec()));
+            }
+        } else {
+            // Variable-length: use DirectMonotonic addresses
+            let addr_meta = entry.addresses_meta.as_ref().ok_or_else(|| {
+                corrupt("binary variable-length field missing addresses meta")
+            })?;
+            let addr_data = self.slice(entry.addresses_offset, entry.addresses_length)?;
+            let dm = DirectMonotonicReader::new(
+                addr_meta,
+                addr_data,
+                entry.num_values as usize + 1,
+                DIRECT_MONOTONIC_BLOCK_SHIFT,
+            )?;
+            for (i, &doc_id) in doc_ids.iter().enumerate() {
+                let start = dm.get(i as u64) as usize;
+                let end = dm.get(i as u64 + 1) as usize;
+                if end > data.len() {
+                    return Err(corrupt("binary variable-length data truncated"));
+                }
+                result.push((doc_id, data[start..end].to_vec()));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -784,6 +956,65 @@ mod tests {
         let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
         let err = r.sorted_dict(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_binary_dv_write_read() {
+        let root = write_index("bin-var", |w| {
+            // Variable-length values (triggers DirectMonotonic addresses)
+            let values = vec![
+                (0u32, b"hello".to_vec()),
+                (1u32, b"world!!".to_vec()),
+                (2u32, b"".to_vec()),
+            ];
+            w.add_binary_field(0, 3, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let bins = r.binary_values(0).unwrap();
+        assert_eq!(bins.len(), 3);
+        assert_eq!(bins[0], (0, b"hello".to_vec()));
+        assert_eq!(bins[1], (1, b"world!!".to_vec()));
+        assert_eq!(bins[2], (2, b"".to_vec()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_binary_dv_fixed_length() {
+        let root = write_index("bin-fixed", |w| {
+            // Equal-length values (no addresses, minLength == maxLength)
+            let values = vec![
+                (0u32, vec![0xDE, 0xAD]),
+                (1u32, vec![0xBE, 0xEF]),
+            ];
+            w.add_binary_field(0, 2, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let bins = r.binary_values(0).unwrap();
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins[0], (0, vec![0xDE, 0xAD]));
+        assert_eq!(bins[1], (1, vec![0xBE, 0xEF]));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_binary_dv_sparse() {
+        let root = write_index("bin-sparse", |w| {
+            // Sparse: max_doc=5 but only docs 1,3 have values (triggers DISI)
+            let values = vec![
+                (1u32, b"aaa".to_vec()),
+                (3u32, b"bbbbb".to_vec()),
+            ];
+            w.add_binary_field(0, 5, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let bins = r.binary_values(0).unwrap();
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins[0], (1, b"aaa".to_vec()));
+        assert_eq!(bins[1], (3, b"bbbbb".to_vec()));
         fs::remove_dir_all(&root).unwrap();
     }
 }

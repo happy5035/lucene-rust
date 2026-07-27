@@ -37,6 +37,7 @@ pub(crate) const VERSION: u32 = 0;
 
 /// .dvm type bytes (:166-170).
 pub(crate) const TYPE_NUMERIC: u8 = 0;
+pub(crate) const TYPE_BINARY: u8 = 1;
 pub(crate) const TYPE_SORTED: u8 = 2;
 
 /// DIRECT_MONOTONIC_BLOCK_SHIFT (:172): all DirectMonotonic sequences here.
@@ -155,6 +156,95 @@ impl DocValuesWriter {
         let ord_values: Vec<(u32, i64)> = ords.iter().map(|&(d, o)| (d, o as i64)).collect();
         self.write_values(max_doc, &ord_values, true)?;
         self.add_terms_dict(dict)
+    }
+
+    /// BINARY field: `values` are `(doc_id, bytes)` pairs sorted by doc.
+    /// Mirrors Lucene90DocValuesConsumer.addBinaryField (:421-486).
+    pub fn add_binary_field(
+        &mut self,
+        field_number: i32,
+        max_doc: u32,
+        values: &[(u32, Vec<u8>)],
+    ) -> io::Result<()> {
+        debug_assert!(values.windows(2).all(|w| w[0].0 < w[1].0));
+        debug_assert!(values.iter().all(|&(d, _)| d < max_doc));
+
+        self.meta.write_int(field_number)?;
+        self.meta.write_byte(TYPE_BINARY)?;
+
+        // 1. Value data: concatenated bytes (.dvd :435)
+        let data_offset = self.data.file_pointer();
+        self.meta.write_long(data_offset as i64)?; // dataOffset (:427)
+        let mut min_length = i32::MAX;
+        let mut max_length = 0i32;
+        for (_, bytes) in values {
+            self.data.write_bytes(bytes)?;
+            min_length = min_length.min(bytes.len() as i32);
+            max_length = max_length.max(bytes.len() as i32);
+        }
+        if values.is_empty() {
+            min_length = 0;
+        }
+        let data_length = self.data.file_pointer() - data_offset;
+        self.meta.write_long(data_length as i64)?; // dataLength (:440)
+
+        // 2. docsWithField DISI (:442-461)
+        let num_docs_with_field = values.len();
+        if num_docs_with_field == 0 {
+            self.meta.write_long(-2)?;
+            self.meta.write_long(0)?;
+            self.meta.write_short(-1)?;
+            self.meta.write_byte(-1i8 as u8)?;
+        } else if num_docs_with_field == max_doc as usize {
+            self.meta.write_long(-1)?;
+            self.meta.write_long(0)?;
+            self.meta.write_short(-1)?;
+            self.meta.write_byte(-1i8 as u8)?;
+        } else {
+            let offset = self.data.file_pointer();
+            self.meta.write_long(offset as i64)?;
+            let docs: Vec<u32> = values.iter().map(|&(d, _)| d).collect();
+            let jump_table_entry_count = write_indexed_disi(&mut self.data, &docs)?;
+            let length = self.data.file_pointer() - offset;
+            self.meta.write_long(length as i64)?;
+            self.meta.write_short(jump_table_entry_count)?;
+            self.meta.write_byte(DISI_DENSE_RANK_POWER)?;
+        }
+
+        // 3. numDocsWithField + minLength + maxLength (:463-465)
+        self.meta.write_int(num_docs_with_field as i32)?;
+        self.meta.write_int(min_length)?;
+        self.meta.write_int(max_length)?;
+
+        // 4. Addresses (DirectMonotonic), only for variable-length (:466-485)
+        if max_length > min_length {
+            let addr_offset = self.data.file_pointer();
+            self.meta.write_long(addr_offset as i64)?; // addressesOffset (:468)
+            self.meta.write_vint(DIRECT_MONOTONIC_BLOCK_SHIFT as i32)?; // (:469)
+
+            // Build addresses: [0, len0, len0+len1, ...]
+            let mut addresses: Vec<u64> = Vec::with_capacity(num_docs_with_field + 1);
+            let mut addr: u64 = 0;
+            addresses.push(0);
+            for (_, bytes) in values {
+                addr += bytes.len() as u64;
+                addresses.push(addr);
+            }
+            // DM meta into self.meta, packed data into temp buffer then append to .dvd
+            let mut addr_data = ChecksumIndexOutput::new(IndexOutput::in_memory());
+            direct_monotonic_write(
+                &mut self.meta,
+                &mut addr_data,
+                &addresses,
+                DIRECT_MONOTONIC_BLOCK_SHIFT,
+            )?;
+            let addr_bytes = addr_data.into_bytes();
+            self.data.write_bytes(&addr_bytes)?;
+            self.meta
+                .write_long((self.data.file_pointer() - addr_offset) as i64)?; // addressesLength (:484)
+        }
+
+        Ok(())
     }
 
     /// close (:106-125): .dvm EOF marker int(-1), footers for both files.

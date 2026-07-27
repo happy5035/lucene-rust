@@ -15,6 +15,7 @@
 | 1D 数值点 | `LongPoint` / `IntPoint` | BKD 树，范围查询 |
 | 数值列存 | `NumericDocValues` | 含稀疏字段（IndexedDISI 三分支：SPARSE / DENSE+跳表 / ALL） |
 | 排序列存 | `SortedDocValues` | 64 项/块前缀压缩 terms dict + 裸 LZ4 |
+| 二进制列存 | `BinaryDocValues` | 变长 DirectMonotonic 地址 + IndexedDISI，Lucene90 兼容 |
 | 存储字段 | `StoredField` | LZ4 BEST_SPEED，字符串 / int / long |
 
 同一字段可组合多种能力（如 `timestamp = LongPoint + NumericDV + stored`），对应 Java 同名多字段语义。
@@ -56,6 +57,158 @@
 - JNI 绑定（`crates/jni-binding`，cdylib）：`RustIndexWriter` 供 Java 进程内调用；除逐字段 API 外提供**批量 JSON 写入** `addJsonBatch(byte[][])`——原始 JSON 字节整批一次 JNI 穿越，解析 / 强转 / 过滤 / 绑定全在 Rust 内闭环
 - JSON 绑定层（`core/src/json.rs`）：schema spec 声明类型与索引配置（`name:type+mods[@json键]`、`$policy=` 指令），未知字段三策略：`strict`（过滤）/ `dynamic`（按值类型推断并自动注册，对齐 Lucene 动态字段语义）/ `stored-only`
 - 互操作脚本：`interop/verify-index.sh`、`interop/verify-log.sh`、`interop/compare-index.sh`（同语料双侧建索引 + CheckIndex + term 级 diff，`--json` 模式为 rust / java-jni / java 三方对比）；`make interop-test` / `log-test` / `bench` / `log-bench` / `compare`
+
+### 时序指标存储（`crates/metric`）
+
+字节级兼容 lts-metric V5 格式的时序指标写入/降采样/合并引擎，纯库 + JNI 暴露。
+
+**模块架构**：
+
+```
+crates/metric/src/
+├── algo/           # 纯算法层（零 IO）
+│   ├── gorilla.rs      # Gorilla 压缩（DoD + XOR，MSB-first bitstream）
+│   ├── series_hash.rs  # xxhash64(seed=0) + UTF-16 LE，两段 32-bit 拼接
+│   ├── downsample.rs   # 5 列聚合（count/sum/min/max/delta）+ 列式 Gorilla
+│   └── hll.rs          # HLL_4 基数估计（logK=12, ~1.6% SE）
+├── store/          # 存储层
+│   ├── schema.rs       # V5 Schema（7 字段）+ downsample Schema
+│   ├── series_writer.rs # series → Document → IndexWriter
+│   └── metadata.rs     # ShardMetadata serde（25 字段, camelCase, pretty-print）
+├── runtime/        # 运行时层
+│   ├── buffer.rs       # SeriesBuffer（HashMap 缓冲 + tokio 自动刷盘）
+│   ├── downsample_op.rs # downsample_shard（读 raw → 聚合 → 写 downsample）
+│   └── merge_op.rs     # merge_intra_shard + merge_cross_shard（流式 k-way 归并）
+└── jni.rs          # JNI 入口（feature = "jni"）
+```
+
+**核心能力**：
+
+| 能力 | 说明 |
+|------|------|
+| 写入 | SeriesBuffer 内存缓冲 → 按 series_hash 聚合 → Gorilla 压缩 → BinaryDocValues 存储 |
+| 降采样 | 5m/1h 粒度，5 列统计（count/sum/min/max/delta），Counter Reset 感知 |
+| 段内合并 | 同 shard 内相同 series 合并（排序 + 去重 + 重编码） |
+| 跨 shard 合并 | 流式 k-way 归并（index_sort 有序），同时生成 compact + 5m + 1h 三路输出 |
+| 基数估计 | HLL_4 sketch，用于 metadata.json 的 seriesEstimate |
+| 索引排序 | 写入时 index_sort(series_hash)，merge 输出保持有序 |
+
+**性能（1M series, 15s scrape, 5min flush, release mode）**：
+
+| 操作 | 吞吐 | 说明 |
+|------|------|------|
+| 写入 | ~1M pts/s | 含 Gorilla 编码 + IndexWriter flush |
+| 合并 | ~2.6M pts/s | 流式 k-way，峰值内存 ~1GB |
+| 读取解压 | ~18M samples/s | Gorilla decode |
+
+### Java JNI 使用教程
+
+**1. 编译 native 库**：
+
+```bash
+cargo build --release -p rustlucene-metric --features jni
+# 产出: target/release/librustlucene_metric.so (Linux) / .dylib (macOS)
+```
+
+**2. Java 侧声明 native 类**：
+
+```java
+package com.metric;
+
+public class RustMetric {
+    static {
+        System.loadLibrary("rustlucene_metric");
+    }
+
+    // 写入侧
+    public static native long openMetricWriter(String shardDir);
+    public static native boolean writePoint(long handle, String name, String labels, long time, double value);
+    public static native boolean flushBuffer(long handle);
+    public static native void closeMetricWriter(long handle);
+
+    // 降采样（Java 调度，Rust 执行）
+    public static native boolean downsample(String inputDir, String outputDir, long granularityMs);
+
+    // 合并（Java 调度，Rust 执行）
+    public static native boolean mergeIntraShard(String inputDir, String outputDir);
+    public static native boolean mergeCrossShard(String[] inputDirs, String compactDir, String ds5mDir, String ds1hDir);
+}
+```
+
+**3. 写入指标数据**：
+
+```java
+// 打开 writer（创建 shard 目录 + 初始化 SeriesBuffer）
+long handle = RustMetric.openMetricWriter("/data/metrics/2026-07-27/raw/shard_0");
+
+// 写入数据点
+// labels 格式: "$#$key1=val1$#$key2=val2$#$"（按 key 字典序，首尾各有 $#$）
+// 空 labels: "$#$"
+RustMetric.writePoint(handle, "cpu.usage", "$#$host=h1$#$region=us$#$", 1753596000000L, 72.5);
+RustMetric.writePoint(handle, "cpu.usage", "$#$host=h1$#$region=us$#$", 1753596015000L, 73.1);
+RustMetric.writePoint(handle, "mem.free",  "$#$host=h2$#$",           1753596000000L, 4096.0);
+
+// 刷盘（flush + commit，数据持久化到 shard 目录）
+RustMetric.flushBuffer(handle);
+
+// 继续写入下一个周期的数据...
+// （生产环境：每 5 分钟调一次 flushBuffer，产生一个新 segment）
+
+// 关闭（best-effort 最终 flush + 释放内存）
+RustMetric.closeMetricWriter(handle);
+```
+
+**4. 降采样（Java 决定时机，Rust 执行）**：
+
+```java
+// 对已 sealed 的 raw shard 做 5 分钟降采样
+RustMetric.downsample(
+    "/data/metrics/2026-07-27/raw/shard_0",
+    "/data/metrics/2026-07-27/downsample_5m/shard_0",
+    300000L  // 5 分钟 = 300,000 ms
+);
+
+// 1 小时降采样
+RustMetric.downsample(
+    "/data/metrics/2026-07-27/raw/shard_0",
+    "/data/metrics/2026-07-27/downsample_1h/shard_0",
+    3600000L  // 1 小时
+);
+```
+
+**5. 合并（Java 决定哪些 shard，Rust 执行）**：
+
+```java
+// 段内合并：同一 shard 内重复 series 合并
+RustMetric.mergeIntraShard(
+    "/data/metrics/2026-07-27/raw/shard_0",
+    "/data/metrics/2026-07-27/raw/shard_0_merged"
+);
+
+// 跨 shard 合并：多个 L0 shard → 1 compact + 5m + 1h（三路输出）
+RustMetric.mergeCrossShard(
+    new String[]{
+        "/data/metrics/2026-07-27/raw/shard_0",
+        "/data/metrics/2026-07-27/raw/shard_1",
+        "/data/metrics/2026-07-27/raw/shard_2"
+    },
+    "/data/metrics/2026-07-27/raw/compact_0",
+    "/data/metrics/2026-07-27/downsample_5m/compact_0",
+    "/data/metrics/2026-07-27/downsample_1h/compact_0"
+);
+```
+
+**6. 调度边界**：
+
+| 职责 | 归属 |
+|------|------|
+| 写入缓冲 + 刷盘 | Rust（SeriesBuffer + tokio 阈值触发） |
+| 降采样调度（何时、对哪个 shard） | Java |
+| 合并调度（何时、合并哪些 shard） | Java |
+| 目录管理（命名、复制、原子替换、清理） | Java |
+| 降采样/合并执行 | Rust（无状态，给路径→产路径） |
+
+**V5 存储格式**：每个 series 的全部时间点 Gorilla 压缩后存入一个 Lucene BinaryDocValues 字段（`gorilla_data`），配合 `series_hash`（NumericDV + LongPoint）实现按 series 检索。Schema 7 字段：`metric_name`(SortedDV) / `metric_labels`(Text+BinaryDV) / `series_hash`(LongPoint+NumericDV) / `time_min` / `time_max`(LongPoint+NumericDV) / `sample_count`(NumericDV) / `gorilla_data`(BinaryDV)。
 
 ## 核心数据结构
 
@@ -149,7 +302,7 @@ roaring（`--bitmap` 索引）vs 同索引纯 PFOR（`RL_BITMAP=0`）vs Java Luc
 - 查询结果与同语料 Java 索引**逐条 diff 一致**：term count、boolean and/or、prefix / wildcard / terms、point range、sort by DV、phrase、DV 基数 / 字典 hash
 - bitmap A/B 对拍：roaring 路径 vs 纯 PFOR 路径（`RL_BITMAP=0`）hit-counts 逐位一致；v1/v2 旧格式索引自动落档
 - 低层编码字节级 golden vectors 对齐 `ForUtil` / `ForDeltaUtil` / `PForUtil`；FST `.tip` 由 Java `FST.read` 读回逐条比对
-- `cargo test`：codec-lucene9 153 项 + rustlucene-core 46 项全绿
+- `cargo test`：codec-lucene9 192 项 + rustlucene-core 121 项 + rustlucene-metric 48 项全绿
 
 ## 快速开始
 
@@ -171,7 +324,8 @@ cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- forcemerge /tm
 - **段合并**：已实现 `forceMerge(1)`，会把当前全部段归并成一个新段、重建 `segments_N`、删除旧段文件；delete / 更新不在范围内。写侧仅 CREATE（空目录建索引），暂不支持追加打开已有索引
 - 无打分：写侧一律 omitNorms、不写 `.nvm/.nvd/.nrm`；读侧全部 ConstantScore
 - 读侧只保证读本系统写出的索引（无 `.liv` / norms / vector）；NRT 为 open 即快照、重开即刷新
-- 暂不支持：SortedSet / Binary / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet、可配目标段数的 merge 策略
+- 暂不支持：SortedSet / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet、可配目标段数的 merge 策略
 - bitmap 为实验性写侧开关（`--bitmap` 默认 off）：只加速 docs 维度，phrase / freq 永远落档 postings；multi-term 的 roaring 集成未做
+- **指标存储**：HLL wire format 为简化版（非 DataSketches 字节兼容，估计算法兼容）；metric 查询路径（按 metric_name+labels 拉取 series）暂未实现
 
-里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲、M6 嵌套 Bool + Point + forceMerge）；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。
+里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲、M6 嵌套 Bool + Point + forceMerge）；指标存储设计 `docs/superpowers/specs/rust-metric-storage-design.md`、实现计划 `docs/superpowers/plans/rust-metric-storage.md`；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。

@@ -14,6 +14,8 @@ pub enum FieldValue {
     Long(i64),
     /// IntPoint and/or NumericDocValues and/or stored int.
     Int(i32),
+    /// BinaryDocValues value (arbitrary bytes).
+    Bytes(Vec<u8>),
 }
 
 /// A document: an unordered bag of (field name, value) pairs.

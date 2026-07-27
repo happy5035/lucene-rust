@@ -261,6 +261,13 @@ pub struct PointsBuf {
     pub points: Vec<(i64, u32)>,
 }
 
+/// Binary DV buffer: (doc_id, bytes) pairs in doc order.
+#[derive(Default)]
+pub struct BinaryDvBuf {
+    pub docs: Vec<u32>,
+    pub values: Vec<Vec<u8>>,
+}
+
 /// Per-field indexing buffer. Which sub-buffers exist is driven by the spec:
 /// an inverted index (`dict`) for indexed fields, doc values buffers, and a
 /// points buffer — a field may combine several (Lucene same-name fields).
@@ -271,6 +278,7 @@ pub struct FieldBuf {
     pub doc_count: u32,
     pub numeric_dv: Option<NumericDvBuf>,
     pub sorted_dv: Option<SortedDvBuf>,
+    pub binary_dv: Option<BinaryDvBuf>,
     pub points: Option<PointsBuf>,
 }
 
@@ -281,6 +289,8 @@ impl FieldBuf {
             (spec.doc_values == codec_lucene9::DocValuesType::Numeric).then(NumericDvBuf::default);
         let sorted_dv =
             (spec.doc_values == codec_lucene9::DocValuesType::Sorted).then(SortedDvBuf::default);
+        let binary_dv =
+            (spec.doc_values == codec_lucene9::DocValuesType::Binary).then(BinaryDvBuf::default);
         let points = spec.points.map(|_| PointsBuf::default());
         Self {
             spec,
@@ -288,6 +298,7 @@ impl FieldBuf {
             doc_count: 0,
             numeric_dv,
             sorted_dv,
+            binary_dv,
             points,
         }
     }
@@ -450,6 +461,15 @@ impl DocWriter {
                         }
                     }
                 }
+                FieldValue::Bytes(b) => {
+                    if let Some(buf) = self.buffers[number as usize].as_mut() {
+                        if let Some(dv) = buf.binary_dv.as_mut() {
+                            dv.docs.push(doc_id);
+                            dv.values.push(b.clone());
+                            self.ram_bytes += 12 + b.len();
+                        }
+                    }
+                }
             }
         }
         if let Some(w) = sfw.as_deref_mut() {
@@ -585,6 +605,12 @@ impl DocWriter {
                     remap_parallel(&dv.docs, std::mem::take(&mut dv.term_ids), map);
                 dv.docs = docs;
                 dv.term_ids = term_ids;
+            }
+            if let Some(dv) = buf.binary_dv.as_mut() {
+                let (docs, values) =
+                    remap_parallel(&dv.docs, std::mem::take(&mut dv.values), map);
+                dv.docs = docs;
+                dv.values = values;
             }
             if let Some(pts) = buf.points.as_mut() {
                 for p in pts.points.iter_mut() {

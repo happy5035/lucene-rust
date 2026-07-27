@@ -101,6 +101,14 @@ impl FieldSpec {
         }
     }
 
+    /// BinaryDocValues-only field (arbitrary bytes).
+    pub fn binary_dv(name: &str) -> Self {
+        Self {
+            doc_values: DocValuesType::Binary,
+            ..Self::base(name)
+        }
+    }
+
     /// Stored-only field.
     pub fn stored(name: &str) -> Self {
         Self {

@@ -345,7 +345,20 @@ impl SegmentBuilder {
                             .collect();
                         dvw.add_sorted_field(number as i32, max_doc as u32, &dict, &ords)?;
                     }
-                    _ => unreachable!("only Numeric/Sorted DV are supported"),
+                    DocValuesType::Binary => {
+                        if let Some(dv) = buf.binary_dv.as_ref() {
+                            let pairs: Vec<(u32, Vec<u8>)> = dv
+                                .docs
+                                .iter()
+                                .copied()
+                                .zip(dv.values.iter().cloned())
+                                .collect();
+                            dvw.add_binary_field(number as i32, max_doc as u32, &pairs)?;
+                        } else {
+                            dvw.add_binary_field(number as i32, max_doc as u32, &[])?;
+                        }
+                    }
+                    _ => { /* None / SortedSet / SortedNumeric: skip */ }
                 }
             }
             dv_files = dvw.finish()?;
@@ -417,6 +430,7 @@ fn to_stored_field(value: &FieldValue) -> StoredField {
         FieldValue::Text(s) | FieldValue::Keyword(s) => StoredField::String(s.clone()),
         FieldValue::Long(v) => StoredField::Long(*v),
         FieldValue::Int(v) => StoredField::Int(*v),
+        FieldValue::Bytes(b) => StoredField::Bytes(b.clone()),
     }
 }
 
@@ -455,5 +469,37 @@ mod tests {
         assert_eq!(to_base36(35), "z");
         assert_eq!(to_base36(36), "10");
         assert_eq!(to_base36(36 * 36 + 1), "101");
+    }
+
+    #[test]
+    fn test_binary_dv_roundtrip() {
+        use crate::document::{Document, FieldValue};
+        use crate::index_writer::{IndexWriter, IndexWriterConfig};
+        use crate::schema::{FieldSpec, Schema};
+        use crate::search::Searcher;
+        use codec_lucene9::FSDirectory;
+
+        let root = std::env::temp_dir()
+            .join(format!("rustlucene-bin-dv-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("name").with_sorted_dv());
+        schema.add(FieldSpec::binary_dv("data"));
+
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        let mut doc = Document::new();
+        doc.add("name", FieldValue::Keyword("series1".to_string()));
+        doc.add("data", FieldValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        w.add_document(doc).unwrap();
+        w.commit().unwrap();
+        drop(w);
+
+        // Verify the index can be opened and has the expected doc count
+        let dir = FSDirectory::open(&root).unwrap();
+        let s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.max_doc(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

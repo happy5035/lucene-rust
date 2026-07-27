@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/codec-lucene9", "crates/jni-binding"]
+members = ["crates/core", "crates/codec-lucene9", "crates/jni-binding", "crates/metric"]
 
 [profile.release]
 opt-level = 3

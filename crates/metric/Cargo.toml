@@ -1,0 +1,12 @@
+[package]
+name = "rustlucene-metric"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustlucene-core = { path = "../core" }
+codec-lucene9 = { path = "../codec-lucene9" }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dev-dependencies]
+# 无 tempfile，用 std::env::temp_dir

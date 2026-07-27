@@ -228,8 +228,9 @@ fn write_value_xor(
     // 复用 prev leading/trailing 的条件
     if *prev_leading != 0xFF && leading >= *prev_leading && trailing >= *prev_trailing {
         bw.write_bit(false); // '0'
-        // 写 meaningful bits（xor 右移 trailing 后的低 meaningful 位）
-        bw.write_bits(xor >> trailing, meaningful);
+        // 写 prev window 大小的 bits（decoder 读 64 - prev_leading - prev_trailing 位）
+        let prev_meaningful = 64 - *prev_leading - *prev_trailing;
+        bw.write_bits(xor >> *prev_trailing, prev_meaningful);
     } else {
         bw.write_bit(true); // '1'
         bw.write_bits(leading as u64, 6);
@@ -257,6 +258,9 @@ pub fn decode(bytes: &[u8], sample_count: usize) -> Result<(Vec<i64>, Vec<f64>),
         return Ok((times, values));
     }
 
+    if bytes.len() < 20 + bitstream_len {
+        return Err(GorillaError::InvalidBitstream);
+    }
     let bitstream = &bytes[20..20 + bitstream_len];
     let mut br = BitReader::new(bitstream);
 
@@ -421,6 +425,26 @@ mod tests {
         assert_eq!(t, times);
         for (a, b) in v.iter().zip(values.iter()) {
             assert!((a - b).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_xor_reuse() {
+        // Values crafted so consecutive XORs have increasing leading zeros,
+        // triggering the reuse branch ('10') in write_value_xor.
+        let times = vec![0i64, 1000, 2000, 3000, 4000];
+        let values = vec![
+            0.0f64,
+            1.0,
+            1.0 + 1e-300,
+            1.0 + 1e-300 + 1e-310,
+            1.0 + 1e-300 + 1e-310 + 1e-315,
+        ];
+        let encoded = encode(&times, &values);
+        let (t, v) = decode(&encoded, times.len()).unwrap();
+        assert_eq!(t, times);
+        for (a, b) in v.iter().zip(values.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "value mismatch: {a} vs {b}");
         }
     }
 }

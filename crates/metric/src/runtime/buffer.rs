@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
+use tokio::task::JoinHandle;
 use rustlucene_core::index_writer::{IndexWriter, IndexWriterConfig};
 use rustlucene_core::schema::Schema;
 use xxhash_rust::xxh64::xxh64;
@@ -15,6 +18,27 @@ struct SeriesEntry {
     sorted_labels: Vec<(String, String)>,
     times: Vec<i64>,
     values: Vec<f64>,
+}
+
+/// Buffer 刷盘配置
+pub struct BufferConfig {
+    pub max_series: usize,
+    pub max_points_per_series: usize,
+    pub max_total_points: usize,
+    pub max_age_ms: u64,
+    pub tick_interval_ms: u64,
+}
+
+impl Default for BufferConfig {
+    fn default() -> Self {
+        Self {
+            max_series: 10_000,
+            max_points_per_series: 10_000,
+            max_total_points: 1_000_000,
+            max_age_ms: 60_000,
+            tick_interval_ms: 1_000,
+        }
+    }
 }
 
 /// SeriesBuffer：内存缓冲 series 写入，显式 flush 到 IndexWriter。
@@ -88,6 +112,31 @@ impl SeriesBuffer {
         self.flush()?;
         let mut writer = self.writer.lock();
         writer.commit()
+    }
+
+    /// 启动 tokio task 定时检查阈值并 flush。
+    /// 返回 JoinHandle，调用方 abort() 停止。
+    pub fn start_auto_flush(self: &Arc<Self>, config: BufferConfig) -> JoinHandle<()> {
+        let buf = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(config.tick_interval_ms));
+            loop {
+                interval.tick().await;
+                let should_flush = {
+                    let b = buf.buffer.read();
+                    if b.len() > config.max_series {
+                        true
+                    } else if b.values().map(|e| e.times.len()).sum::<usize>() > config.max_total_points {
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_flush {
+                    let _ = buf.flush();
+                }
+            }
+        })
     }
 }
 
@@ -176,5 +225,49 @@ mod tests {
         assert_eq!(total_docs, 1);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_auto_flush_triggers() {
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let root = temp_dir("auto_flush");
+            let buf = std::sync::Arc::new(
+                SeriesBuffer::create_v5(&root, IndexWriterConfig::default()).unwrap()
+            );
+
+            // 配置：1 个 series 即触发刷盘
+            let config = BufferConfig {
+                max_series: 1,
+                max_points_per_series: 100,
+                max_total_points: 1000,
+                max_age_ms: 60_000,
+                tick_interval_ms: 50,
+            };
+            let buf2 = buf.clone();
+            let handle = buf2.start_auto_flush(config);
+
+            // 写入 2 个 series（超过 max_series=1）
+            buf.write_point("m1", &[("k".into(), "v1".into())], 1000, 1.0);
+            buf.write_point("m2", &[("k".into(), "v2".into())], 1000, 2.0);
+
+            // 等待 tick
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // 验证 buffer 已被刷空
+            {
+                let b = buf.buffer.read();
+                assert_eq!(b.len(), 0, "buffer should be flushed");
+            }
+
+            handle.abort();
+            drop(buf);
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 }

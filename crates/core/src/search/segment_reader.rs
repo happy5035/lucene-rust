@@ -81,6 +81,31 @@ impl SegmentReader {
         r.binary_values(fi.number)
     }
 
+    /// Sorted DocValues for a field as (doc, term_bytes) ascending by doc.
+    /// Combines sorted_ords (doc → ord) with sorted_dict (ord → bytes).
+    /// Opens the .dvd/.dvm on demand. Unknown field → empty Vec.
+    pub fn sorted_values(&self, field: &str) -> io::Result<Vec<(u32, Vec<u8>)>> {
+        let Some(fi) = self.field_infos.by_name(field) else {
+            return Ok(Vec::new());
+        };
+        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
+        let ords = r.sorted_ords(fi.number)?;
+        if ords.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dict = r.sorted_dict(fi.number)?;
+        Ok(ords
+            .into_iter()
+            .map(|(doc, ord)| {
+                let bytes = dict
+                    .get(ord as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                (doc, bytes)
+            })
+            .collect())
+    }
+
     /// Term lookup: field resolution + terms-dict seek. Returns
     /// `(has_freqs, entry)`; `None` covers unknown field, non-indexed field
     /// (IndexOptions.NONE), and term-not-present — all empty-hit cases,

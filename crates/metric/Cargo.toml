@@ -12,3 +12,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 # 无 tempfile，用 std::env::temp_dir
+
+[[bench]]
+name = "write_throughput"
+harness = false

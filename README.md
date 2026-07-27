@@ -123,6 +123,13 @@ public class RustMetric {
     // 写入侧
     public static native long openMetricWriter(String shardDir);
     public static native boolean writePoint(long handle, String name, String labels, long time, double value);
+
+    // 批量写入：同一 series 多个点（推荐：减少 JNI 穿越）
+    public static native boolean writePoints(long handle, String name, String labels, long[] times, double[] values);
+
+    // 批量写入：多个 series 各一个点
+    public static native boolean writePointsMulti(long handle, String[] names, String[] labels, long[] times, double[] values);
+
     public static native boolean flushBuffer(long handle);
     public static native void closeMetricWriter(long handle);
 

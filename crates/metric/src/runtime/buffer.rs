@@ -99,6 +99,42 @@ impl SeriesBuffer {
         entry.values.push(value);
     }
 
+    /// 批量写入：同一 series 多个点（最常见场景：15s scrape，5min flush 周期内 20 个点）。
+    /// 一次锁获取完成整批写入，减少锁竞争。
+    pub fn write_points(&self, name: &str, sorted_labels: &[(String, String)], times: &[i64], values: &[f64]) {
+        let hash = series_hash(name, sorted_labels);
+        let mut buf = self.buffer.write();
+        let entry = buf.entry(hash).or_insert_with(|| SeriesEntry {
+            name: name.to_string(),
+            sorted_labels: sorted_labels.to_vec(),
+            times: Vec::with_capacity(times.len()),
+            values: Vec::with_capacity(values.len()),
+        });
+        entry.times.extend_from_slice(times);
+        entry.values.extend_from_slice(values);
+    }
+
+    /// 批量写入（labels_str 版本）：同一 series 多个点。
+    /// JNI 层调用，一次锁获取 + 一次 String 拷贝完成整批写入。
+    pub fn write_points_with_labels_str(&self, name: &str, labels_str: &str, times: &[i64], values: &[f64]) {
+        let name_bytes = encode_utf16_le(name);
+        let label_bytes = encode_utf16_le(labels_str);
+        let name_hash = xxh64(&name_bytes, 0);
+        let label_hash = xxh64(&label_bytes, 0);
+        let hash = ((name_hash as u32 as u64) << 32) | (label_hash as u32 as u64);
+
+        let sorted_labels = parse_labels_str(labels_str);
+        let mut buf = self.buffer.write();
+        let entry = buf.entry(hash).or_insert_with(|| SeriesEntry {
+            name: name.to_string(),
+            sorted_labels,
+            times: Vec::with_capacity(times.len()),
+            values: Vec::with_capacity(values.len()),
+        });
+        entry.times.extend_from_slice(times);
+        entry.values.extend_from_slice(values);
+    }
+
     /// 显式 flush：把所有缓冲的 series 写入 IndexWriter。
     pub fn flush(&self) -> io::Result<()> {
         let mut buf = self.buffer.write();
@@ -224,6 +260,86 @@ mod tests {
             assert_eq!(bins.len(), 1); // 1 个 series
             let (t, _v) = crate::algo::gorilla::decode(&bins[0].1, 2).unwrap();
             assert_eq!(t, vec![1000, 2000]);
+            total_docs += 1;
+        }
+        assert_eq!(total_docs, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_write_points_batch() {
+        let root = temp_dir("batch");
+        let buf = SeriesBuffer::create_v5(&root, IndexWriterConfig::default()).unwrap();
+
+        // Write 100 points to same series in one batch call
+        let labels = vec![("host".to_string(), "h1".to_string())];
+        let times: Vec<i64> = (0..100).map(|i| 1000 + i * 15000).collect();
+        let values: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
+
+        buf.write_points("cpu.usage", &labels, &times, &values);
+
+        // Also write 50 points to a second series
+        let labels2 = vec![("host".to_string(), "h2".to_string())];
+        let times2: Vec<i64> = (0..50).map(|i| 1000 + i * 15000).collect();
+        let values2: Vec<f64> = (0..50).map(|i| i as f64 * 1.5).collect();
+        buf.write_points("cpu.usage", &labels2, &times2, &values2);
+
+        buf.commit().unwrap();
+        drop(buf);
+
+        // Read back: should have 2 docs (2 series)
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let mut total_docs = 0;
+        for (_base, seg) in reader.leaves() {
+            let bins = seg.binary_values("gorilla_data").unwrap();
+            for (_, data) in bins {
+                let (t, v) = crate::algo::gorilla::decode(&data, if total_docs == 0 { 100 } else { 50 }).unwrap();
+                if total_docs == 0 {
+                    assert_eq!(t.len(), 100);
+                    assert_eq!(v.len(), 100);
+                    assert_eq!(t[0], 1000);
+                    assert_eq!(t[99], 1000 + 99 * 15000);
+                } else {
+                    assert_eq!(t.len(), 50);
+                    assert_eq!(v.len(), 50);
+                }
+            }
+            total_docs += seg.max_doc() as usize;
+        }
+        assert_eq!(total_docs, 2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_write_points_with_labels_str_batch() {
+        let root = temp_dir("batch_labels_str");
+        let buf = SeriesBuffer::create_v5(&root, IndexWriterConfig::default()).unwrap();
+
+        // Batch write 20 points via labels_str (simulates JNI writePoints path)
+        let times: Vec<i64> = (0..20).map(|i| 1_700_000_000_000 + i * 15_000).collect();
+        let values: Vec<f64> = (0..20).map(|i| 72.0 + i as f64 * 0.1).collect();
+
+        buf.write_points_with_labels_str("cpu.usage", "$#$host=h1$#$region=us$#$", &times, &values);
+
+        // Verify hash consistency: single-point writes to same series should merge
+        buf.write_point_with_labels_str("cpu.usage", "$#$host=h1$#$region=us$#$", 1_700_000_300_000, 99.0);
+
+        buf.commit().unwrap();
+        drop(buf);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let mut total_docs = 0;
+        for (_base, seg) in reader.leaves() {
+            let bins = seg.binary_values("gorilla_data").unwrap();
+            assert_eq!(bins.len(), 1); // same series → 1 doc
+            let (t, _v) = crate::algo::gorilla::decode(&bins[0].1, 21).unwrap();
+            assert_eq!(t.len(), 21); // 20 batch + 1 single
+            assert_eq!(t[0], 1_700_000_000_000);
+            assert_eq!(t[20], 1_700_000_300_000);
             total_docs += 1;
         }
         assert_eq!(total_docs, 1);

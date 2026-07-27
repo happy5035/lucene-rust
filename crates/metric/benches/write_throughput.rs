@@ -203,6 +203,32 @@ fn bench_pure_write_point(series: &[SeriesIdentity], total_calls: usize) -> (u12
     (elapsed, calls)
 }
 
+/// Scenario 6: Pure write_points batch throughput (no IO).
+/// Each call writes `batch_size` points for one series in a single lock acquisition.
+/// Models: 1M series × 20 pts via 1M batch calls vs 20M single calls.
+/// Returns (elapsed_ms, total_points, batch_calls).
+fn bench_pure_write_points_batch(series: &[SeriesIdentity], batch_size: usize) -> (u128, usize, usize) {
+    let root = temp_dir("pure_wp_batch");
+    let buf = SeriesBuffer::create_v5(&root, IndexWriterConfig::default()).unwrap();
+
+    let times: Vec<i64> = (0..batch_size).map(|c| cycle_time(c)).collect();
+
+    let start = Instant::now();
+
+    for (i, s) in series.iter().enumerate() {
+        let values: Vec<f64> = (0..batch_size).map(|c| point_value(i, c)).collect();
+        buf.write_points(&s.name, &s.labels, &times, &values);
+    }
+
+    let elapsed = start.elapsed().as_millis();
+    let total_points = series.len() * batch_size;
+    let batch_calls = series.len();
+    drop(buf);
+    let _ = std::fs::remove_dir_all(&root);
+
+    (elapsed, total_points, batch_calls)
+}
+
 /// Compute average gorilla-encoded size for a doc with `n` points.
 fn avg_gorilla_size(n: usize) -> usize {
     // Encode a representative series with n points at 15s intervals
@@ -316,6 +342,36 @@ fn main() {
     let tp5 = if time5 > 0 { (calls5 as u128 * 1000) / time5 } else { u128::MAX };
     println!("  Time: {} ms", format_number_u128(time5));
     println!("  Throughput: {} write_point calls/sec", format_number_u128(tp5));
+    println!();
+
+    // --- Scenario 6: Batch write_point vs write_points (JNI-crossing-equivalent) ---
+    let s6_batch_size = 20;
+    let s6_series_count = series_100k.len();
+    let s6_total_points = s6_series_count * s6_batch_size;
+    println!(
+        "Scenario 6: Batch comparison ({} series x {} pts = {} points)",
+        format_number(s6_series_count),
+        s6_batch_size,
+        format_number(s6_total_points)
+    );
+    println!("  A) write_point: {} individual calls (simulates {}M JNI crossings)",
+        format_number(s6_total_points), s6_total_points / 1_000_000);
+    let (time6a, calls6a) = bench_pure_write_point(&series_100k, s6_total_points);
+    let tp6a = if time6a > 0 { (calls6a as u128 * 1000) / time6a } else { u128::MAX };
+    println!("     Time: {} ms | Throughput: {} pts/sec", format_number_u128(time6a), format_number_u128(tp6a));
+
+    println!("  B) write_points: {} batch calls ({} pts/batch, 1 lock each)",
+        format_number(s6_series_count), s6_batch_size);
+    let (time6b, points6b, batches6b) = bench_pure_write_points_batch(&series_100k, s6_batch_size);
+    let tp6b = if time6b > 0 { (points6b as u128 * 1000) / time6b } else { u128::MAX };
+    println!("     Time: {} ms | Throughput: {} pts/sec | Batches: {}",
+        format_number_u128(time6b), format_number_u128(tp6b), format_number(batches6b));
+
+    if time6b > 0 && time6a > 0 {
+        let speedup = time6a as f64 / time6b as f64;
+        println!("  Speedup: {:.2}x (batch vs single) | Lock acquisitions: {} vs {}",
+            speedup, format_number(s6_series_count), format_number(s6_total_points));
+    }
     println!();
 
     // --- Analysis ---

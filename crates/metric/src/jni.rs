@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use jni::objects::{JClass, JObjectArray, JString};
+use jni::objects::{JClass, JDoubleArray, JLongArray, JObjectArray, JString, ReleaseMode};
 use jni::sys::{jboolean, jdouble, jlong};
 use jni::JNIEnv;
 
@@ -62,6 +62,121 @@ pub extern "system" fn Java_com_metric_RustMetric_writePoint(
         Err(_) => return 0,
     };
     buf.write_point_with_labels_str(&name, &labels, time, value);
+    1
+}
+
+/// Batch write: same series, multiple points.
+/// Reduces JNI crossings from N to 1 for a series with N points.
+/// `labels` is in "$#$k1=v1$#$k2=v2$#$" format.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_metric_RustMetric_writePoints(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    name: JString,
+    labels: JString,
+    times: JLongArray,
+    values: JDoubleArray,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    let buf = unsafe { &*(handle as *const SeriesBuffer) };
+    let name: String = match env.get_string(&name) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let labels: String = match env.get_string(&labels) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+
+    let times_len = match env.get_array_length(&times) {
+        Ok(l) => l as usize,
+        Err(_) => return 0,
+    };
+    let values_len = match env.get_array_length(&values) {
+        Ok(l) => l as usize,
+        Err(_) => return 0,
+    };
+    if times_len != values_len || times_len == 0 {
+        return 0;
+    }
+
+    let times_elems = match unsafe { env.get_array_elements(&times, ReleaseMode::NoCopyBack) } {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let values_elems = match unsafe { env.get_array_elements(&values, ReleaseMode::NoCopyBack) } {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let times_slice = unsafe { std::slice::from_raw_parts(times_elems.as_ptr(), times_elems.len()) };
+    let values_slice = unsafe { std::slice::from_raw_parts(values_elems.as_ptr(), values_elems.len()) };
+
+    buf.write_points_with_labels_str(&name, &labels, times_slice, values_slice);
+    1
+}
+
+/// Batch write: multiple series, one point each (fan-out pattern).
+/// names[i], labels[i], times[i], values[i] form one point.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "system" fn Java_com_metric_RustMetric_writePointsMulti(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    names: JObjectArray,
+    labels: JObjectArray,
+    times: JLongArray,
+    values: JDoubleArray,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    let buf = unsafe { &*(handle as *const SeriesBuffer) };
+
+    let count = match env.get_array_length(&times) {
+        Ok(l) => l as usize,
+        Err(_) => return 0,
+    };
+    if count == 0 {
+        return 0;
+    }
+
+    let times_elems = match unsafe { env.get_array_elements(&times, ReleaseMode::NoCopyBack) } {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let values_elems = match unsafe { env.get_array_elements(&values, ReleaseMode::NoCopyBack) } {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let times_slice = unsafe { std::slice::from_raw_parts(times_elems.as_ptr(), times_elems.len()) };
+    let values_slice = unsafe { std::slice::from_raw_parts(values_elems.as_ptr(), values_elems.len()) };
+
+    for i in 0..count {
+        let name_obj = match env.get_object_array_element(&names, i as i32) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let labels_obj = match env.get_object_array_element(&labels, i as i32) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let name: String = match env.get_string(&JString::from(name_obj)) {
+            Ok(s) => s.into(),
+            Err(_) => continue,
+        };
+        let labels: String = match env.get_string(&JString::from(labels_obj)) {
+            Ok(s) => s.into(),
+            Err(_) => continue,
+        };
+        buf.write_point_with_labels_str(&name, &labels, times_slice[i], values_slice[i]);
+    }
     1
 }
 

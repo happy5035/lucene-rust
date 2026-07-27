@@ -202,7 +202,7 @@ fn write_dod(bw: &mut BitWriter, dod: i64) {
         bw.write_bits((dod as u64) & 0x1FFFF, 17);
     } else if (-524287..=524287).contains(&dod) {
         bw.write_bits(0b1110, 4);
-        bw.write_bits((dod as u64) & 0x7FFFF, 20);
+        bw.write_bits((dod as u64) & 0xFFFFF, 20); // 20 bit 有符号补码
     } else {
         bw.write_bits(0b1111, 4);
         bw.write_bits(dod as u64, 64);
@@ -425,6 +425,36 @@ mod tests {
         assert_eq!(t, times);
         for (a, b) in v.iter().zip(values.iter()) {
             assert!((a - b).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_negative_dod() {
+        // Regression: negative dod in every width branch must sign-extend
+        // back. delta0 = 1000 (varint); the DoD sequence for points 2..=10 is
+        //   0, -2000, +500, -50500, +60000, -100000, +500000, -900000, +10_450_000
+        // covering: '0', 14b (neg+pos), 17b (neg+pos), 20b (neg+pos — the
+        // negative-20b path was previously corrupted by a 19-bit mask), and
+        // 64b (neg+pos).
+        let times = vec![
+            1_000_000i64,
+            1_001_000,  // delta 1000
+            1_002_000,  // dod 0
+            1_001_000,  // dod -2000   (14b)
+            1_000_500,  // dod +500    (14b)
+            949_500,    // dod -50500  (17b)
+            958_500,    // dod +60000  (17b)
+            867_500,    // dod -100000 (20b)
+            1_276_500,  // dod +500000 (20b)
+            785_500,    // dod -900000 (64b)
+            10_744_500, // dod +10_450_000 (64b)
+        ];
+        let values = vec![1.0f64; times.len()];
+        let encoded = encode(&times, &values);
+        let (t, v) = decode(&encoded, times.len()).unwrap();
+        assert_eq!(t, times);
+        for (a, b) in v.iter().zip(values.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
         }
     }
 

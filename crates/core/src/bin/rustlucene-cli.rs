@@ -19,8 +19,8 @@ use codec_lucene9::segment_infos::{SegmentCommitInfo, SegmentInfos};
 use codec_lucene9::FSDirectory;
 use rustlucene_core::search::{CountCollector, Occur, Query, Searcher};
 use rustlucene_core::{
-    commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig,
-    JsonBinder, Schema, SegmentBuilder,
+    commit_segments, BindOutcome, Document, FieldSpec, FieldValue, IndexSortField, IndexWriter,
+    IndexWriterConfig, JsonBinder, Schema, SegmentBuilder,
 };
 
 /// xorshift64* — keep in sync with JavaLuceneBench.XorShift.
@@ -1194,6 +1194,7 @@ fn logwrite(
     bigdict: bool,
     bitmap: Option<u32>,
     flush_every: Option<u32>,
+    sort_field: Option<String>,
 ) -> std::io::Result<()> {
     let vocab = vocab();
     let mut config = IndexWriterConfig::default();
@@ -1203,6 +1204,9 @@ fn logwrite(
     }
     if let Some(n) = flush_every {
         config.max_buffered_docs = n.max(1);
+    }
+    if let Some(f) = &sort_field {
+        config.index_sort = Some(IndexSortField::new(f));
     }
     let mut w = IndexWriter::create(index_dir, log_schema(positions, bigdict), config)?;
     let mut rng = XorShift::new(seed);
@@ -1482,11 +1486,16 @@ fn json_index(
     index_dir: &Path,
     schema_spec: &str,
     target_docs: Option<u64>,
+    sort_field: Option<String>,
 ) -> std::io::Result<()> {
     let (schema, aliases, policy) = Schema::parse(schema_spec)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let binder = JsonBinder::new(&schema, &aliases, policy);
-    let mut w = IndexWriter::create(index_dir, schema, IndexWriterConfig::default())?;
+    let mut cfg = IndexWriterConfig::default();
+    if let Some(f) = &sort_field {
+        cfg.index_sort = Some(IndexSortField::new(f));
+    }
+    let mut w = IndexWriter::create(index_dir, schema, cfg)?;
     let reader = std::io::BufReader::new(File::open(jsonl_file)?);
     let t0 = Instant::now();
     let (mut docs, mut skipped) = (0u64, 0u64);
@@ -1642,6 +1651,7 @@ fn main() -> std::io::Result<()> {
             let mut bitmap_flag = false;
             let mut bitmap_threshold: u32 = 4096;
             let mut flush_every: Option<u32> = None;
+            let mut sort_field: Option<String> = None;
             let mut rest = args[5..].iter();
             while let Some(a) = rest.next() {
                 match a.as_str() {
@@ -1656,6 +1666,10 @@ fn main() -> std::io::Result<()> {
                     "--flush-every" => {
                         let v = rest.next().unwrap_or_else(|| usage());
                         flush_every = Some(v.parse::<u32>().unwrap_or_else(|_| usage()));
+                    }
+                    "--sort" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        sort_field = Some(v.clone());
                     }
                     _ => usage(),
                 }
@@ -1673,6 +1687,7 @@ fn main() -> std::io::Result<()> {
                 bigdict,
                 bitmap,
                 flush_every,
+                sort_field,
             )
         }
         "jsonindex" => {
@@ -1680,6 +1695,7 @@ fn main() -> std::io::Result<()> {
                 usage();
             }
             let mut docs = None;
+            let mut sort_field = None;
             let mut rest = args[5..].iter();
             while let Some(a) = rest.next() {
                 match a.as_str() {
@@ -1687,10 +1703,20 @@ fn main() -> std::io::Result<()> {
                         let v = rest.next().unwrap_or_else(|| usage());
                         docs = Some(v.parse::<u64>().unwrap_or_else(|_| usage()));
                     }
+                    "--sort" => {
+                        let v = rest.next().unwrap_or_else(|| usage());
+                        sort_field = Some(v.clone());
+                    }
                     _ => usage(),
                 }
             }
-            json_index(Path::new(&args[2]), Path::new(&args[3]), &args[4], docs)
+            json_index(
+                Path::new(&args[2]),
+                Path::new(&args[3]),
+                &args[4],
+                docs,
+                sort_field,
+            )
         }
         "jsongen" => {
             if args.len() < 5 {

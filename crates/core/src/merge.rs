@@ -6,8 +6,11 @@ use std::io;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos};
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::segment_info::SegmentInfo;
-use codec_lucene9::{DocValuesType, FSDirectory, IndexOptions};
+use codec_lucene9::{
+    DocValuesType, FSDirectory, IndexOptions, IndexSortFieldInfo, MissingValue, SortFieldType,
+};
 
+use crate::sort::{cmp_keys, Key, Missing};
 use crate::IndexWriterConfig;
 
 use codec_lucene9::io::DataInput;
@@ -70,6 +73,44 @@ pub(crate) fn build_ord_remap(dicts: &[Vec<Vec<u8>>], global: &[Vec<u8>]) -> Vec
         .collect()
 }
 
+/// K-way 归并的 docID 排列（Lucene `MultiSorter` 对偶）：各源段已按 index sort
+/// 字段有序（Phase A 不变量），求全局有序下每段的 oldToNew 映射
+/// （`old_to_new[seg][oldDoc] = mergedDoc`）。收集全部 (seg, doc) 按
+/// `cmp_keys`（reverse + missing）排序，并列先按段序再按 docID（MultiSorter
+/// 的 readerIndex→docID tie-break），再顺序分配 merged docID。
+pub(crate) fn compute_merge_doc_maps(
+    keys_per_seg: &[Vec<Option<Key>>],
+    reverse: bool,
+    missing: Missing,
+) -> Vec<Vec<u32>> {
+    let mut old_to_new: Vec<Vec<u32>> = keys_per_seg
+        .iter()
+        .map(|keys| vec![0u32; keys.len()])
+        .collect();
+    let mut order: Vec<(usize, u32)> = Vec::new();
+    for (s, keys) in keys_per_seg.iter().enumerate() {
+        for d in 0..keys.len() {
+            order.push((s, d as u32));
+        }
+    }
+    order.sort_by(|&(s1, d1), &(s2, d2)| {
+        cmp_keys(
+            keys_per_seg[s1][d1 as usize],
+            keys_per_seg[s2][d2 as usize],
+            reverse,
+            missing,
+        )
+        .then_with(|| s1.cmp(&s2))
+        .then_with(|| d1.cmp(&d2))
+    });
+    let mut merged = 0u32;
+    for (s, d) in order {
+        old_to_new[s][d as usize] = merged;
+        merged += 1;
+    }
+    old_to_new
+}
+
 /// spec §4.2：各段 field infos 必须逐字段一致（同源 IndexWriter 产物的既有
 /// 不变量）；不一致即报错，不做全局重编号（MergeState.fieldInfos 的
 /// 同名合并在本系统是恒等）。
@@ -128,6 +169,7 @@ pub(crate) fn merge_postings(
     new_segment: &str,
     new_segment_id: &[u8; 16],
     bitmap_threshold: Option<u32>,
+    doc_maps: Option<&[Vec<u32>]>,
 ) -> io::Result<Vec<String>> {
     use codec_lucene9::postings::PostingsWriter;
     use codec_lucene9::postings_read::PostingsReader;
@@ -212,6 +254,12 @@ pub(crate) fn merge_postings(
                     continue;
                 }
                 let base = sources[i].doc_base;
+                let map_doc = |d: i32| -> u32 {
+                    match &doc_maps {
+                        Some(m) => m[i][d as usize],
+                        None => base + d as u32,
+                    }
+                };
                 let reader = readers[i].as_ref().expect("dict present ⇒ reader present");
                 match fi.index_options {
                     IndexOptions::Docs => {
@@ -221,7 +269,7 @@ pub(crate) fn merge_postings(
                             if d == NO_MORE_DOCS {
                                 break;
                             }
-                            docs.push(base + d as u32);
+                            docs.push(map_doc(d));
                             freqs.push(1); // DOCS 字段 freq 恒 1（ttf 不入盘）
                         }
                     }
@@ -232,7 +280,7 @@ pub(crate) fn merge_postings(
                             if d == NO_MORE_DOCS {
                                 break;
                             }
-                            docs.push(base + d as u32);
+                            docs.push(map_doc(d));
                             freqs.push(en.freq());
                         }
                     }
@@ -245,7 +293,7 @@ pub(crate) fn merge_postings(
                             if d == NO_MORE_DOCS {
                                 break;
                             }
-                            docs.push(base + d as u32);
+                            docs.push(map_doc(d));
                             let f = en.freq();
                             freqs.push(f);
                             let mut plist = Vec::with_capacity(f as usize);
@@ -261,6 +309,17 @@ pub(crate) fn merge_postings(
                     None => None,
                 };
             }
+            // index-sort merge: remapped docs interleave across segments, so
+            // restore ascending docID order (with freqs/positions in tow).
+            if doc_maps.is_some() {
+                let mut perm: Vec<usize> = (0..docs.len()).collect();
+                perm.sort_by_key(|&k| docs[k]);
+                docs = perm.iter().map(|&k| docs[k]).collect();
+                freqs = perm.iter().map(|&k| freqs[k]).collect();
+                if let Some(pl) = positions.as_mut() {
+                    *pl = perm.iter().map(|&k| std::mem::take(&mut pl[k])).collect();
+                }
+            }
             debug_assert!(
                 docs.windows(2).all(|w| w[0] < w[1]),
                 "concatenated ascending"
@@ -272,17 +331,44 @@ pub(crate) fn merge_postings(
     pw.finish()
 }
 
-/// stored 块级裸拷贝（spec §4.2 修正后方案；Lucene90CompressingStoredFieldsWriter
-/// .copyChunks :520-595 主路径——同 codec、无 delete ⇒ 恒可裸拷）。
+/// stored 归并：无 index sort 时块级裸拷贝（spec §4.2 修正后方案；
+/// Lucene90CompressingStoredFieldsWriter.copyChunks :520-595 主路径——同 codec、
+/// 无 delete ⇒ 恒可裸拷）。有 index sort 时裸拷贝无法重排，改用
+/// StoredFieldsReader 逐文档读回、按 merged 序重写（SortingCodecReader 对偶）。
 pub(crate) fn merge_stored(
     dir: &FSDirectory,
     sources: &[SegmentMergeSource],
     new_segment: &str,
     new_segment_id: &[u8; 16],
     total_max_doc: i32,
+    doc_maps: Option<&[Vec<u32>]>,
 ) -> io::Result<[String; 3]> {
-    use codec_lucene9::stored_fields::{StoredFieldsIndexReader, StoredFieldsWriter};
+    use codec_lucene9::stored_fields::{
+        StoredFieldsIndexReader, StoredFieldsReader, StoredFieldsWriter,
+    };
     let mut w = StoredFieldsWriter::new(dir, new_segment, *new_segment_id, "")?;
+
+    if let Some(doc_maps) = doc_maps {
+        // index-sort merge: read each source doc and write in merged order.
+        let readers: Vec<StoredFieldsReader> = sources
+            .iter()
+            .map(|s| StoredFieldsReader::open(dir, &s.name, &s.id))
+            .collect::<io::Result<_>>()?;
+        // inverse: mergedDoc -> (segment, srcDoc)
+        let mut inverse: Vec<(usize, u32)> = vec![(0, 0); total_max_doc as usize];
+        for (seg, map) in doc_maps.iter().enumerate() {
+            for (src, &merged) in map.iter().enumerate() {
+                inverse[merged as usize] = (seg, src as u32);
+            }
+        }
+        for (seg, src) in &inverse {
+            let fields = readers[*seg].document(*src)?;
+            w.write_document(&fields)?;
+        }
+        let stats = w.finish(total_max_doc, dir)?;
+        return Ok([stats.fdt_name, stats.fdx_name, stats.fdm_name]);
+    }
+
     for s in sources {
         let idx = StoredFieldsIndexReader::open(dir, &s.name, &s.id)?;
         let [fdt_name, _fdx, _fdm] = codec_lucene9::stored_fields::file_names(&s.name, "");
@@ -323,6 +409,7 @@ pub(crate) fn merge_doc_values(
     new_segment: &str,
     new_segment_id: &[u8; 16],
     total_max_doc: u32,
+    doc_maps: Option<&[Vec<u32>]>,
 ) -> io::Result<Vec<String>> {
     use codec_lucene9::doc_values::DocValuesWriter;
     use codec_lucene9::doc_values_read::DocValuesReader;
@@ -344,10 +431,17 @@ pub(crate) fn merge_doc_values(
         match fi.doc_values_type {
             DocValuesType::Numeric => {
                 let mut pairs: Vec<(u32, i64)> = Vec::new();
-                for (s, r) in sources.iter().zip(&readers) {
+                for (i, (s, r)) in sources.iter().zip(&readers).enumerate() {
                     for (d, v) in r.numeric_values(fi.number)? {
-                        pairs.push((s.doc_base + d, v));
+                        let doc = match &doc_maps {
+                            Some(m) => m[i][d as usize],
+                            None => s.doc_base + d,
+                        };
+                        pairs.push((doc, v));
                     }
+                }
+                if doc_maps.is_some() {
+                    pairs.sort_by_key(|&(d, _)| d);
                 }
                 w.add_numeric_field(fi.number, total_max_doc, &pairs)?;
             }
@@ -372,8 +466,15 @@ pub(crate) fn merge_doc_values(
                                 ),
                             )
                         })?;
-                        ords.push((sources[i].doc_base + d, *new_ord));
+                        let doc = match &doc_maps {
+                            Some(m) => m[i][d as usize],
+                            None => sources[i].doc_base + d,
+                        };
+                        ords.push((doc, *new_ord));
                     }
+                }
+                if doc_maps.is_some() {
+                    ords.sort_by_key(|&(d, _)| d);
                 }
                 let dict_refs: Vec<&[u8]> = global.iter().map(Vec::as_slice).collect();
                 w.add_sorted_field(fi.number, total_max_doc, &dict_refs, &ords)?;
@@ -398,6 +499,7 @@ pub(crate) fn merge_points(
     field_infos: &FieldInfos,
     new_segment: &str,
     new_segment_id: &[u8; 16],
+    doc_maps: Option<&[Vec<u32>]>,
 ) -> io::Result<Vec<String>> {
     use codec_lucene9::points::PointsWriter;
     use codec_lucene9::points_read::PointsReader;
@@ -422,8 +524,13 @@ pub(crate) fn merge_points(
         for (i, r) in readers.iter().enumerate() {
             let Some(r) = r else { continue };
             let base = sources[i].doc_base;
+            let map = doc_maps.map(|m| &m[i]);
             r.intersect(&fi.name, i64::MIN, i64::MAX, &mut |v, d| {
-                longs.push((v, base + d as u32));
+                let doc = match map {
+                    Some(m) => m[d as usize],
+                    None => base + d as u32,
+                };
+                longs.push((v, doc));
             })?;
         }
         if longs.is_empty() {
@@ -454,6 +561,71 @@ fn cleanup_segment_files(dir: &FSDirectory, segment_name: &str) -> io::Result<()
     Ok(())
 }
 
+/// 读取各源段的 index sort 键并求 K-way 归并 doc_maps（force_merge 的 index
+/// sort 路径）。numeric（Long/Int） sort 直接取 NumericDocValues 值；String
+/// sort 取 SortedDocValues ord 并经全局字典重映射（merge_sorted_dicts +
+/// build_ord_remap），使跨段 ord 可比。reverse/missing 从序列化的
+/// IndexSortFieldInfo 还原（与 Phase A flush 用的策略一致）。
+fn index_sort_doc_maps(
+    dir: &FSDirectory,
+    sources: &[SegmentMergeSource],
+    doc_counts: &[u32],
+    merged_fis: &FieldInfos,
+    sort_info: &IndexSortFieldInfo,
+) -> io::Result<Vec<Vec<u32>>> {
+    use codec_lucene9::doc_values_read::DocValuesReader;
+    const DV_SUFFIX: &str = "Lucene90_0";
+    let reverse = sort_info.reverse;
+    let missing = match sort_info.missing {
+        Some(MissingValue::StringFirst) => Missing::First,
+        Some(MissingValue::Long(i64::MIN)) => Missing::First,
+        Some(MissingValue::Int(i32::MIN)) => Missing::First,
+        _ => Missing::Last,
+    };
+    let fi = merged_fis.by_name(&sort_info.field).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("index sort field not found: {}", sort_info.field),
+        )
+    })?;
+    let readers: Vec<DocValuesReader> = sources
+        .iter()
+        .map(|s| DocValuesReader::open(dir, &s.name, &s.id, DV_SUFFIX))
+        .collect::<io::Result<_>>()?;
+    let keys_per_seg: Vec<Vec<Option<Key>>> = if sort_info.field_type == SortFieldType::String {
+        let dicts: Vec<Vec<Vec<u8>>> = readers
+            .iter()
+            .map(|r| r.sorted_dict(fi.number))
+            .collect::<io::Result<_>>()?;
+        let global = merge_sorted_dicts(&dicts);
+        let remap = build_ord_remap(&dicts, &global);
+        readers
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut keys: Vec<Option<Key>> = vec![None; doc_counts[i] as usize];
+                for (d, o) in r.sorted_ords(fi.number)? {
+                    keys[d as usize] = Some(Key::Ord(remap[i][o as usize]));
+                }
+                Ok(keys)
+            })
+            .collect::<io::Result<_>>()?
+    } else {
+        readers
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut keys: Vec<Option<Key>> = vec![None; doc_counts[i] as usize];
+                for (d, v) in r.numeric_values(fi.number)? {
+                    keys[d as usize] = Some(Key::Num(v));
+                }
+                Ok(keys)
+            })
+            .collect::<io::Result<_>>()?
+    };
+    Ok(compute_merge_doc_maps(&keys_per_seg, reverse, missing))
+}
+
 /// forceMerge(1)（M6 spec §4.1）：读当前 segments_N → 逐格式归并出一个新段 →
 /// 两段式提交（复用 index_writer::commit_infos 的 fsync + pending/rename 路径）→
 /// 成功后删旧段文件与全部旧 segments_N（Java on-commit 清理同款）。
@@ -482,6 +654,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         let mut doc_base = 0u32;
         let mut sources: Vec<SegmentMergeSource> = Vec::with_capacity(old_infos.segments.len());
         let mut all_fis: Vec<FieldInfos> = Vec::with_capacity(old_infos.segments.len());
+        let mut doc_counts: Vec<u32> = Vec::with_capacity(old_infos.segments.len());
         for sci in &old_infos.segments {
             let fis = FieldInfos::read(dir, &sci.info.name, &sci.info.id, "")?;
             sources.push(SegmentMergeSource {
@@ -491,6 +664,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
                 field_infos: FieldInfos::new(fis.fields.clone()),
             });
             all_fis.push(fis);
+            doc_counts.push(sci.info.doc_count as u32);
             doc_base += sci.info.doc_count as u32;
         }
         assert_field_infos_consistent(&all_fis)?;
@@ -498,11 +672,34 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         let total_max_doc = doc_base;
         let new_id = random_id();
 
+        // index sort：沿用源段持久化的 sort（各段 congruent），求 K-way 归并
+        // doc_maps；无 sort 则 doc_maps 为 None，走原 doc_base 拼接路径。
+        let merge_sort: Vec<IndexSortFieldInfo> = old_infos.segments[0].info.index_sort.clone();
+        let doc_maps: Option<Vec<Vec<u32>>> = if merge_sort.is_empty() {
+            None
+        } else {
+            Some(index_sort_doc_maps(
+                dir,
+                &sources,
+                &doc_counts,
+                &merged_fis,
+                &merge_sort[0],
+            )?)
+        };
+        let doc_maps_ref = doc_maps.as_deref();
+
         // .fnm 先行（全部文件同一 new_id）
         let fnm = merged_fis.write(dir, &new_name, &new_id, "")?;
         written.push(fnm.clone());
         // stored → postings → DV → points（关键代码事实 9）
-        let stored = merge_stored(dir, &sources, &new_name, &new_id, total_max_doc as i32)?;
+        let stored = merge_stored(
+            dir,
+            &sources,
+            &new_name,
+            &new_id,
+            total_max_doc as i32,
+            doc_maps_ref,
+        )?;
         written.extend(stored.iter().cloned());
         let bitmap_threshold = config.bitmap.then_some(
             config
@@ -516,6 +713,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
             &new_name,
             &new_id,
             bitmap_threshold,
+            doc_maps_ref,
         )?;
         written.extend(postings.iter().cloned());
         let dv = merge_doc_values(
@@ -525,9 +723,10 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
             &new_name,
             &new_id,
             total_max_doc,
+            doc_maps_ref,
         )?;
         written.extend(dv.iter().cloned());
-        let points = merge_points(dir, &sources, &merged_fis, &new_name, &new_id)?;
+        let points = merge_points(dir, &sources, &merged_fis, &new_name, &new_id, doc_maps_ref)?;
         written.extend(points.iter().cloned());
         // .si（diagnostics 只写稳定键，关键代码事实 7）
         let mut si = SegmentInfo::new(&new_name, new_id, total_max_doc as i32);
@@ -546,6 +745,7 @@ pub fn force_merge(dir: &FSDirectory, config: &IndexWriterConfig) -> io::Result<
         si.files.extend(dv);
         si.files.extend(points);
         si.files.insert(format!("{new_name}.si"));
+        si.index_sort = merge_sort;
         si.write(dir, "")?;
         written.push(format!("{new_name}.si"));
         Ok(SegmentCommitInfo::new(si, random_id()))
@@ -685,6 +885,43 @@ mod tests {
         assert_eq!(build_ord_remap(&dicts, &global), vec![vec![0, 1, 2]]);
     }
 
+    #[test]
+    fn merge_doc_maps_global_sort() {
+        use crate::sort::{Key, Missing};
+        // seg0: 10,30 ; seg1: 20,40 → global 10,20,30,40
+        let keys = vec![
+            vec![Some(Key::Num(10)), Some(Key::Num(30))],
+            vec![Some(Key::Num(20)), Some(Key::Num(40))],
+        ];
+        let maps = compute_merge_doc_maps(&keys, false, Missing::Last);
+        assert_eq!(maps[0], vec![0, 2]); // seg0d0→0, seg0d1→2
+        assert_eq!(maps[1], vec![1, 3]); // seg1d0→1, seg1d1→3
+    }
+
+    #[test]
+    fn merge_doc_maps_missing_last() {
+        use crate::sort::{Key, Missing};
+        // seg0: 10, missing ; seg1: 5 → global 5,10,missing
+        let keys = vec![vec![Some(Key::Num(10)), None], vec![Some(Key::Num(5))]];
+        let maps = compute_merge_doc_maps(&keys, false, Missing::Last);
+        assert_eq!(maps[1], vec![0]); // 5 → 0
+        assert_eq!(maps[0], vec![1, 2]); // 10 → 1, missing → 2
+    }
+
+    #[test]
+    fn merge_doc_maps_reverse() {
+        use crate::sort::{Key, Missing};
+        // seg0: 10,30 ; seg1: 20,40 → desc 40,30,20,10
+        let keys = vec![
+            vec![Some(Key::Num(10)), Some(Key::Num(30))],
+            vec![Some(Key::Num(20)), Some(Key::Num(40))],
+        ];
+        let maps = compute_merge_doc_maps(&keys, true, Missing::Last);
+        // 40(seg1d1)→0, 30(seg0d1)→1, 20(seg1d0)→2, 10(seg0d0)→3
+        assert_eq!(maps[0], vec![3, 1]);
+        assert_eq!(maps[1], vec![2, 0]);
+    }
+
     use codec_lucene9::field_infos::{DocValuesType, IndexOptions};
 
     fn fis(specs: &[(&str, IndexOptions, DocValuesType)]) -> FieldInfos {
@@ -806,6 +1043,7 @@ mod tests {
             "_m",
             &new_id,
             Some(2), // bitmap threshold：alpha df=5 >= 2
+            None,    // no index sort
         )
         .unwrap();
         assert!(files.iter().any(|f| f.ends_with(".doc")));
@@ -890,7 +1128,7 @@ mod tests {
         let new_id = random_id();
 
         // --- stored 裸拷贝 ---
-        let stored_files = merge_stored(&dir, &sources, "_m", &new_id, 5).unwrap();
+        let stored_files = merge_stored(&dir, &sources, "_m", &new_id, 5, None).unwrap();
         assert_eq!(stored_files, stored_fields_file_names("_m"));
         let idx = codec_lucene9::stored_fields::StoredFieldsIndexReader::open(&dir, "_m", &new_id)
             .unwrap();
@@ -904,7 +1142,8 @@ mod tests {
         assert_eq!(fdt.read_vint().unwrap(), 3, "chunk 1 rebased to doc_base 3");
 
         // --- DV 归并 ---
-        let dv_files = merge_doc_values(&dir, &sources, &merged_fis, "_m", &new_id, 5).unwrap();
+        let dv_files =
+            merge_doc_values(&dir, &sources, &merged_fis, "_m", &new_id, 5, None).unwrap();
         assert_eq!(dv_files.len(), 2);
         let dvr = codec_lucene9::doc_values_read::DocValuesReader::open(
             &dir,
@@ -933,7 +1172,7 @@ mod tests {
         );
 
         // --- points 归并（T-B PointsReader 全区间取点 + base 偏移 + 重写）---
-        let point_files = merge_points(&dir, &sources, &merged_fis, "_m", &new_id).unwrap();
+        let point_files = merge_points(&dir, &sources, &merged_fis, "_m", &new_id, None).unwrap();
         assert_eq!(point_files.len(), 3);
         // 复读：T-B PointsReader 全区间收集 → (value, doc) 多重集与输入一致
         let pr = codec_lucene9::points_read::PointsReader::open(&dir, "_m", &new_id, &merged_fis)
@@ -1059,6 +1298,90 @@ mod tests {
             1,
             "exactly one commit file: {files_after:?}"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// index sort 归并：两段各自按 ts 有序、跨段 ts 交错 → 归并后全局按 ts
+    /// 单调，查询结果与归并前一致。force_merge 从源段 .si 读取 sort。
+    #[test]
+    fn force_merge_index_sort_end_to_end() {
+        use crate::IndexSortField;
+        let root = temp_dir("fmsort");
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut schema = Schema::new();
+        schema.add(
+            FieldSpec::long_point("ts")
+                .with_numeric_dv()
+                .with_stored(true),
+        );
+        schema.add(FieldSpec::keyword("level").with_sorted_dv());
+        schema.add(FieldSpec::text("message"));
+        let mut cfg = IndexWriterConfig::default();
+        cfg.index_sort = Some(IndexSortField::new("ts"));
+        let mut w = IndexWriter::create(&root, schema, cfg).unwrap();
+        let put = |w: &mut IndexWriter, ts: i64, level: &str| {
+            let mut d = Document::new();
+            d.add("ts", FieldValue::Long(ts));
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d.add("message", FieldValue::Text(format!("m{ts}")));
+            w.add_document(d).unwrap();
+        };
+        // 段 0：ts 300,100,200（flush 排序为 100,200,300）
+        put(&mut w, 300, "INFO");
+        put(&mut w, 100, "INFO");
+        put(&mut w, 200, "WARN");
+        w.commit().unwrap();
+        // 段 1：ts 250,150（flush 排序为 150,250）
+        put(&mut w, 250, "INFO");
+        put(&mut w, 150, "WARN");
+        w.commit().unwrap();
+        drop(w);
+
+        let pre = {
+            let mut s = Searcher::open(&dir).unwrap();
+            assert_eq!(s.segment_count(), 2);
+            (
+                s.count(&Query::term("level", "INFO")).unwrap(),
+                s.count(&Query::term("level", "WARN")).unwrap(),
+                s.count(&Query::term("message", "m200")).unwrap(),
+            )
+        };
+
+        force_merge(&dir, &IndexWriterConfig::default()).unwrap();
+
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.segment_count(), 1);
+        assert_eq!(s.max_doc(), 5);
+        assert_eq!(
+            (
+                s.count(&Query::term("level", "INFO")).unwrap(),
+                s.count(&Query::term("level", "WARN")).unwrap(),
+                s.count(&Query::term("message", "m200")).unwrap(),
+            ),
+            pre,
+            "query counts preserved across index-sort merge"
+        );
+
+        // 全局有序：merged ts DV 按 docID 单调不减（100,150,200,250,300）
+        let (infos, _gen) = SegmentInfos::read_latest(&dir).unwrap();
+        let sci = &infos.segments[0];
+        assert!(!sci.info.index_sort.is_empty(), "merged .si declares sort");
+        let dvr = codec_lucene9::doc_values_read::DocValuesReader::open(
+            &dir,
+            &sci.info.name,
+            &sci.info.id,
+            "Lucene90_0",
+        )
+        .unwrap();
+        let fis = FieldInfos::read(&dir, &sci.info.name, &sci.info.id, "").unwrap();
+        let ts = fis.by_name("ts").unwrap();
+        let vals: Vec<i64> = dvr
+            .numeric_values(ts.number)
+            .unwrap()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(vals, vec![100, 150, 200, 250, 300]);
         fs::remove_dir_all(&root).unwrap();
     }
 

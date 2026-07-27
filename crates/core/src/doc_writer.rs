@@ -3,6 +3,7 @@ use codec_lucene9::StoredField;
 
 use crate::document::{Document, FieldValue};
 use crate::schema::{FieldSpec, Schema};
+use crate::sort::{DocMap, Key};
 use crate::tokenizer::WhitespaceTokens;
 
 /// Postings buffer for one term: parallel doc/freq arrays, ascending doc IDs.
@@ -531,6 +532,105 @@ impl DocWriter {
     pub fn field_buffer_mut(&mut self, number: u32) -> Option<&mut FieldBuf> {
         self.buffers[number as usize].as_mut()
     }
+
+    /// Builds the per-oldDoc sort keys for `number` from its DocValues buffer
+    /// (index sort phase A: the sort field must carry Numeric or Sorted DV).
+    /// Sorted DV keys use the rank in the *sorted* dictionary so key ordering
+    /// equals term-byte ordering (Lucene StringSorter compares ords). Docs
+    /// without a value map to None (placed per the field's Missing policy).
+    pub fn sort_keys(&self, number: u32) -> Option<Vec<Option<Key>>> {
+        let buf = self.buffers[number as usize].as_ref()?;
+        let mut keys: Vec<Option<Key>> = vec![None; self.max_doc as usize];
+        if let Some(dv) = buf.numeric_dv.as_ref() {
+            for (&d, &v) in dv.docs.iter().zip(dv.values.iter()) {
+                keys[d as usize] = Some(Key::Num(v));
+            }
+            return Some(keys);
+        }
+        if let Some(dv) = buf.sorted_dv.as_ref() {
+            // insertion-id -> sorted-rank (same remap finalize uses for ords)
+            let sorted = dv.dict.sorted_ids();
+            let mut remap = vec![0u32; dv.dict.len()];
+            for (ord, &id) in sorted.iter().enumerate() {
+                remap[id as usize] = ord as u32;
+            }
+            for (&d, &t) in dv.docs.iter().zip(dv.term_ids.iter()) {
+                keys[d as usize] = Some(Key::Ord(remap[t as usize]));
+            }
+            return Some(keys);
+        }
+        None
+    }
+
+    /// Applies the index-sort permutation to every field buffer in place:
+    /// each buffer's docIDs are mapped through `map.old_to_new` and re-sorted
+    /// ascending (carrying freqs/positions/values/term_ids along), so the
+    /// format writers — which all assume ascending docIDs — encode the
+    /// physically reordered segment unchanged. Points only need the docID
+    /// remap (the BKD writer sorts internally).
+    pub fn apply_doc_map(&mut self, map: &DocMap) {
+        for buf in self.buffers.iter_mut().flatten() {
+            if let Some(dict) = buf.dict.as_mut() {
+                for id in 0..dict.len() {
+                    remap_posting(&mut dict.recs[id].postings, map);
+                }
+            }
+            if let Some(dv) = buf.numeric_dv.as_mut() {
+                let (docs, values) = remap_parallel(&dv.docs, std::mem::take(&mut dv.values), map);
+                dv.docs = docs;
+                dv.values = values;
+            }
+            if let Some(dv) = buf.sorted_dv.as_mut() {
+                let (docs, term_ids) =
+                    remap_parallel(&dv.docs, std::mem::take(&mut dv.term_ids), map);
+                dv.docs = docs;
+                dv.term_ids = term_ids;
+            }
+            if let Some(pts) = buf.points.as_mut() {
+                for p in pts.points.iter_mut() {
+                    p.1 = map.old_to_new(p.1);
+                }
+            }
+        }
+    }
+}
+
+/// Remaps a PostingBuf through the permutation: docs go through old_to_new
+/// and the (doc, freq, positions) triples are re-sorted ascending by new doc.
+fn remap_posting(pb: &mut PostingBuf, map: &DocMap) {
+    let has_pos = !pb.positions.is_empty();
+    let n = pb.docs.len();
+    let mut triples: Vec<(u32, u32, Vec<u32>)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let new_doc = map.old_to_new(pb.docs[i]);
+        let freq = pb.freqs[i];
+        let pos = if has_pos {
+            std::mem::take(&mut pb.positions[i])
+        } else {
+            Vec::new()
+        };
+        triples.push((new_doc, freq, pos));
+    }
+    triples.sort_by_key(|t| t.0);
+    pb.docs = triples.iter().map(|t| t.0).collect();
+    pb.freqs = triples.iter().map(|t| t.1).collect();
+    if has_pos {
+        pb.positions = triples.into_iter().map(|t| t.2).collect();
+    }
+}
+
+/// Remaps a parallel (docs, values) pair through the permutation and re-sorts
+/// ascending by new doc. Old docs are unique within a field buffer, so new
+/// docs are too (no tie-breaking needed).
+fn remap_parallel<T>(docs: &[u32], values: Vec<T>, map: &DocMap) -> (Vec<u32>, Vec<T>) {
+    let mut pairs: Vec<(u32, T)> = docs
+        .iter()
+        .copied()
+        .zip(values)
+        .map(|(d, v)| (map.old_to_new(d), v))
+        .collect();
+    pairs.sort_by_key(|p| p.0);
+    pairs.into_iter().unzip()
 }
 
 fn err(msg: String) -> std::io::Error {

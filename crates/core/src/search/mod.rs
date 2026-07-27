@@ -26,7 +26,9 @@ mod block_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Document, FieldSpec, FieldValue, IndexWriter, IndexWriterConfig, Schema};
+    use crate::{
+        Document, FieldSpec, FieldValue, IndexSortField, IndexWriter, IndexWriterConfig, Schema,
+    };
     use codec_lucene9::FSDirectory;
     use std::fs;
     use std::path::PathBuf;
@@ -98,6 +100,179 @@ mod tests {
         // unknown field / stored-only field -> empty (Java TermQuery semantics)
         assert_eq!(s.count(&Query::term("nope", "x")).unwrap(), 0);
         assert_eq!(s.count(&Query::term("title", "stored")).unwrap(), 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Index sort on a NumericDocValues field physically reorders the segment:
+    /// unique-per-doc terms must resolve to their new (sorted-order) docIDs.
+    #[test]
+    fn index_sort_numeric_ascending() {
+        let root = temp_dir("sort-num");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::numeric_dv("ts"));
+        schema.add(FieldSpec::keyword("tid"));
+        schema.add(FieldSpec::text("message"));
+        let mut cfg = IndexWriterConfig::default();
+        cfg.index_sort = Some(IndexSortField::new("ts"));
+        let mut w = IndexWriter::create(&root, schema, cfg).unwrap();
+        // oldDocs 0,1,2 carry ts 30,10,20 → sorted order old1,old2,old0
+        for (ts, tid) in [(30i64, "a"), (10, "b"), (20, "c")] {
+            let mut d = Document::new();
+            d.add("ts", FieldValue::Long(ts));
+            d.add("tid", FieldValue::Keyword(tid.to_string()));
+            d.add("message", FieldValue::Text(format!("x{tid}")));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.max_doc(), 3);
+        // new docIDs: a(old0,ts30)->2, b(old1,ts10)->0, c(old2,ts20)->1
+        assert_eq!(s.top_docs(&Query::term("tid", "a"), 10).unwrap().1, vec![2]);
+        assert_eq!(s.top_docs(&Query::term("tid", "b"), 10).unwrap().1, vec![0]);
+        assert_eq!(s.top_docs(&Query::term("tid", "c"), 10).unwrap().1, vec![1]);
+        // text-field postings reordered too: xb(old1)->0, xc(old2)->1, xa(old0)->2
+        assert_eq!(
+            s.top_docs(&Query::term("message", "xb"), 10).unwrap().1,
+            vec![0]
+        );
+        assert_eq!(
+            s.top_docs(&Query::term("message", "xa"), 10).unwrap().1,
+            vec![2]
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn index_sort_numeric_reverse_missing_last() {
+        let root = temp_dir("sort-rev");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::numeric_dv("ts"));
+        schema.add(FieldSpec::keyword("tid"));
+        let mut cfg = IndexWriterConfig::default();
+        cfg.index_sort = Some(IndexSortField::new("ts").reverse());
+        let mut w = IndexWriter::create(&root, schema, cfg).unwrap();
+        // old0 ts=10, old1 missing, old2 ts=30 → desc with missing last:
+        // old2(30), old0(10), old1(missing)
+        let vals: [(Option<i64>, &str); 3] = [(Some(10), "a"), (None, "b"), (Some(30), "c")];
+        for (ts, tid) in vals {
+            let mut d = Document::new();
+            if let Some(v) = ts {
+                d.add("ts", FieldValue::Long(v));
+            }
+            d.add("tid", FieldValue::Keyword(tid.to_string()));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.top_docs(&Query::term("tid", "c"), 10).unwrap().1, vec![0]);
+        assert_eq!(s.top_docs(&Query::term("tid", "a"), 10).unwrap().1, vec![1]);
+        assert_eq!(s.top_docs(&Query::term("tid", "b"), 10).unwrap().1, vec![2]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn index_sort_sorted_docvalues_string() {
+        let root = temp_dir("sort-str");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::sorted_dv("level"));
+        schema.add(FieldSpec::keyword("tid"));
+        let mut cfg = IndexWriterConfig::default();
+        cfg.index_sort = Some(IndexSortField::new("level"));
+        let mut w = IndexWriter::create(&root, schema, cfg).unwrap();
+        // old0=WARN, old1=DEBUG, old2=INFO → asc by term bytes:
+        // DEBUG(old1), INFO(old2), WARN(old0)
+        for (level, tid) in [("WARN", "a"), ("DEBUG", "b"), ("INFO", "c")] {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d.add("tid", FieldValue::Keyword(tid.to_string()));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        assert_eq!(s.top_docs(&Query::term("tid", "b"), 10).unwrap().1, vec![0]);
+        assert_eq!(s.top_docs(&Query::term("tid", "c"), 10).unwrap().1, vec![1]);
+        assert_eq!(s.top_docs(&Query::term("tid", "a"), 10).unwrap().1, vec![2]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase D: field-sorted top-N on a segment index-sorted ascending by the
+    /// sort field. docID order == field order, so the first N hits are the
+    /// top-N and iteration stops early (total becomes a lower bound).
+    #[test]
+    fn top_docs_by_field_index_sorted_early_terminates() {
+        let root = temp_dir("topfield-sorted");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::numeric_dv("ts"));
+        schema.add(FieldSpec::keyword("tid"));
+        schema.add(FieldSpec::text("message"));
+        let mut cfg = IndexWriterConfig::default();
+        cfg.index_sort = Some(IndexSortField::new("ts"));
+        let mut w = IndexWriter::create(&root, schema, cfg).unwrap();
+        // 10 docs sharing term "common", ts in scrambled add order.
+        let ts = [50i64, 10, 40, 20, 30, 90, 70, 80, 60, 100];
+        for (i, v) in ts.iter().enumerate() {
+            let mut d = Document::new();
+            d.add("ts", FieldValue::Long(*v));
+            d.add("tid", FieldValue::Keyword(format!("t{i}")));
+            d.add("message", FieldValue::Text("common".to_string()));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let res = s
+            .top_docs_by_field(&Query::term("message", "common"), "ts", 3)
+            .unwrap();
+        // Ascending index sort → docIDs 0,1,2 hold ts 10,20,30.
+        assert_eq!(res.hits, vec![(0, 10), (1, 20), (2, 30)]);
+        assert!(res.early_terminated);
+        // Early stop: only the first 4 hits visited (3 kept + 1 triggering stop).
+        assert_eq!(res.total, 4);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Phase D: the same top-N on an unsorted segment uses the full-scan
+    /// bounded-heap path — accurate total, no early termination, and the
+    /// smallest-N values still win regardless of physical doc order.
+    #[test]
+    fn top_docs_by_field_unsorted_full_scan() {
+        let root = temp_dir("topfield-unsorted");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::numeric_dv("ts"));
+        schema.add(FieldSpec::keyword("tid"));
+        schema.add(FieldSpec::text("message"));
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        let ts = [50i64, 10, 40, 20, 30, 90, 70, 80, 60, 100];
+        for (i, v) in ts.iter().enumerate() {
+            let mut d = Document::new();
+            d.add("ts", FieldValue::Long(*v));
+            d.add("tid", FieldValue::Keyword(format!("t{i}")));
+            d.add("message", FieldValue::Text("common".to_string()));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut s = Searcher::open(&dir).unwrap();
+        let res = s
+            .top_docs_by_field(&Query::term("message", "common"), "ts", 3)
+            .unwrap();
+        // Smallest 3 ts: 10(doc1), 20(doc3), 30(doc4) in original doc order.
+        assert_eq!(res.hits, vec![(1, 10), (3, 20), (4, 30)]);
+        assert!(!res.early_terminated);
+        assert_eq!(res.total, 10);
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 
 use codec_lucene9::doc_values::DocValuesWriter;
@@ -6,12 +7,13 @@ use codec_lucene9::points::PointsWriter;
 use codec_lucene9::postings::PostingsWriter;
 use codec_lucene9::segment_info::SegmentInfo;
 use codec_lucene9::segment_infos::{random_id, SegmentCommitInfo};
-use codec_lucene9::stored_fields::{self, StoredFieldsWriter};
-use codec_lucene9::{DocValuesType, FSDirectory};
+use codec_lucene9::stored_fields::{self, StoredField, StoredFieldsWriter};
+use codec_lucene9::{DocValuesType, FSDirectory, IndexSortFieldInfo, MissingValue, SortFieldType};
 
 use crate::doc_writer::DocWriter;
-use crate::document::Document;
+use crate::document::{Document, FieldValue};
 use crate::schema::Schema;
+use crate::sort::{self, DocMap, IndexSortField};
 
 /// Per-field attribute entries the PerField reader requires on indexed fields
 /// (PerFieldPostingsFormat.java:73-78; observed in Java-written .fnm).
@@ -44,6 +46,13 @@ pub struct SegmentBuilder {
     sfw: Option<StoredFieldsWriter>,
     /// M3 §4: Some(t) → finalize 时对 df >= t 的 term 写内联 bitmap。
     bitmap_threshold: Option<u32>,
+    /// Index sort (Lucene setIndexSort): when Some, finalize physically
+    /// reorders the segment's docs by this field.
+    index_sort: Option<IndexSortField>,
+    /// Per-oldDoc retained stored fields, populated only when `index_sort` is
+    /// active (stored fields can't be streamed in original order then — they
+    /// are written in sorted order at finalize). Parallel to docID.
+    stored_docs: Vec<Vec<(String, FieldValue)>>,
 }
 
 impl SegmentBuilder {
@@ -58,6 +67,8 @@ impl SegmentBuilder {
             dw: DocWriter::new(),
             sfw: None,
             bitmap_threshold: None,
+            index_sort: None,
+            stored_docs: Vec::new(),
         }
     }
 
@@ -71,6 +82,12 @@ impl SegmentBuilder {
         self.bitmap_threshold = threshold;
     }
 
+    /// Index sort: `Some(field)` → physically reorder the segment's docs by
+    /// `field` (which must carry Numeric or Sorted DocValues) at finalize.
+    pub fn set_index_sort(&mut self, sort: Option<IndexSortField>) {
+        self.index_sort = sort;
+    }
+
     /// Approximate RAM held by the indexing buffers (postings/docvalues/
     /// points arenas) plus one stored-fields compression chunk cushion.
     pub fn ram_bytes(&self) -> usize {
@@ -78,6 +95,19 @@ impl SegmentBuilder {
     }
 
     pub fn add_document(&mut self, schema: &Schema, doc: Document) -> io::Result<()> {
+        if self.index_sort.is_some() {
+            // index sort: retain stored fields in RAM (filtered to stored
+            // fields) and index without streaming stored — finalize writes
+            // them back in sorted order.
+            let stored: Vec<(String, FieldValue)> = doc
+                .fields
+                .iter()
+                .filter(|(name, _)| schema.get(name).map(|s| s.stored).unwrap_or(false))
+                .cloned()
+                .collect();
+            self.stored_docs.push(stored);
+            return self.dw.add_document(schema, doc, None);
+        }
         if self.sfw.is_none() {
             self.sfw = Some(StoredFieldsWriter::new(
                 &self.dir,
@@ -103,8 +133,67 @@ impl SegmentBuilder {
             mut dw,
             sfw,
             bitmap_threshold,
+            index_sort,
+            stored_docs,
         } = self;
         let max_doc = dw.max_doc as i32;
+
+        // Index sort: resolve the sort field, compute the docID permutation
+        // and apply it to the RAM buffers before any format encoding (the
+        // writers below all assume ascending docIDs, so they then emit the
+        // physically reordered segment unchanged). No sort ⇒ map stays None.
+        // Also build the codec IndexSortFieldInfo for .si persistence.
+        let mut si_index_sort: Vec<IndexSortFieldInfo> = Vec::new();
+        let doc_map: Option<DocMap> = match &index_sort {
+            Some(sort) => {
+                let field_num = dw
+                    .fields()
+                    .iter()
+                    .position(|f| f.name == sort.field)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("index sort field not found: {}", sort.field),
+                        )
+                    })? as u32;
+                let keys = dw.sort_keys(field_num).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "index sort field {} has no Numeric/Sorted DocValues",
+                            sort.field
+                        ),
+                    )
+                })?;
+                // Value type + missing sentinel for .si, from the DV buffer kind.
+                let buf = dw.field_buffer(field_num);
+                let (field_type, missing) = if buf.and_then(|b| b.sorted_dv.as_ref()).is_some() {
+                    let mv = match sort.missing {
+                        sort::Missing::First => MissingValue::StringFirst,
+                        sort::Missing::Last => MissingValue::StringLast,
+                    };
+                    (SortFieldType::String, Some(mv))
+                } else {
+                    let mv = match sort.missing {
+                        sort::Missing::First => MissingValue::Long(i64::MIN),
+                        sort::Missing::Last => MissingValue::Long(i64::MAX),
+                    };
+                    (SortFieldType::Long, Some(mv))
+                };
+                si_index_sort.push(IndexSortFieldInfo {
+                    field: sort.field.clone(),
+                    field_type,
+                    reverse: sort.reverse,
+                    missing,
+                });
+                let map = sort::compute(max_doc as u32, &keys, sort.reverse, sort.missing);
+                if let Some(m) = &map {
+                    dw.apply_doc_map(m);
+                }
+                map
+            }
+            None => None,
+        };
 
         // 1. .fnm — fields in field-number order. Written first (attributes
         //    are known upfront: Lucene912/0 for indexed, Lucene90/0 for DV).
@@ -145,9 +234,36 @@ impl SegmentBuilder {
         let field_infos = FieldInfos::new(field_infos_vec);
         let fnm_file = field_infos.write(&dir, &seg_name, &seg_id, "")?;
 
-        // 2. Stored fields: .fdt data already streamed; finish writes
-        //    the last chunk plus .fdx/.fdm.
-        let sfw = sfw.expect("sfw is created on first add_document");
+        // 2. Stored fields. Without index sort the .fdt data was streamed
+        //    during add_document; with index sort it was retained in RAM
+        //    (stored_docs) and is written here in sorted (newToOld) order.
+        //    finish writes the last chunk plus .fdx/.fdm either way.
+        let sfw = if index_sort.is_some() {
+            let mut w = StoredFieldsWriter::new(&dir, &seg_name, seg_id, "")?;
+            let name_to_num: HashMap<&str, u32> = dw
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(n, f)| (f.name.as_str(), n as u32))
+                .collect();
+            for new_doc in 0..max_doc as usize {
+                let old_doc = doc_map
+                    .as_ref()
+                    .map(|m| m.new_to_old(new_doc as u32) as usize)
+                    .unwrap_or(new_doc);
+                let fields: Vec<(u32, StoredField)> = stored_docs[old_doc]
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let num = *name_to_num.get(name.as_str())?;
+                        Some((num, to_stored_field(value)))
+                    })
+                    .collect();
+                w.write_document(&fields)?;
+            }
+            w
+        } else {
+            sfw.expect("sfw is created on first add_document")
+        };
         sfw.finish(max_doc, &dir)?;
         let stored_files = stored_fields::file_names(&seg_name, "");
 
@@ -280,6 +396,7 @@ impl SegmentBuilder {
         si.files.extend(dv_files);
         si.files.extend(point_files);
         si.files.insert(format!("{seg_name}.si"));
+        si.index_sort = si_index_sort;
         si.write(&dir, "")?;
 
         Ok(Some(SegmentCommitInfo::new(si, random_id())))
@@ -291,6 +408,16 @@ fn field_has_terms(dw: &DocWriter, number: usize) -> bool {
     dw.field_buffer(number as u32)
         .map(|b| b.doc_count > 0)
         .unwrap_or(false)
+}
+
+/// Maps a field value to its stored-fields representation (mirrors the inline
+/// mapping in DocWriter::add_document).
+fn to_stored_field(value: &FieldValue) -> StoredField {
+    match value {
+        FieldValue::Text(s) | FieldValue::Keyword(s) => StoredField::String(s.clone()),
+        FieldValue::Long(v) => StoredField::Long(*v),
+        FieldValue::Int(v) => StoredField::Int(*v),
+    }
 }
 
 /// Point field with at least one point in this segment?

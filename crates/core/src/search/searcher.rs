@@ -6,6 +6,7 @@ use std::io;
 
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
+use codec_lucene9::segment_info::SortFieldType;
 
 use super::collector::{Collector, FreqSumCollector};
 use super::doc_iter::{DocBlockBuf, DocIter, SegmentDocIter};
@@ -36,6 +37,15 @@ pub(crate) fn drive_blocks<C: Collector>(
         collector.collect_block(&out.docs[..n], needs_freq.then(|| &out.freqs[..n]));
     }
     Ok(())
+}
+
+/// Field-sorted top-N result (Phase D). `hits` are (global docID, field
+/// value) ascending by value. `total` is the hit count — a lower bound when
+/// `early_terminated` is true (index-sort early stop skipped the tail).
+pub struct TopFieldHits {
+    pub total: u64,
+    pub early_terminated: bool,
+    pub hits: Vec<(i32, i64)>,
 }
 
 pub struct Searcher {
@@ -179,6 +189,94 @@ impl Searcher {
             }
         }
         Ok((total, docs))
+    }
+
+    /// Field-sorted top-N (TopFieldCollector analog, Phase D). Returns the
+    /// global top-N hits ordered by numeric `field` ascending (docID
+    /// tiebreak), plus a hit total. When a segment is index-sorted ascending
+    /// by `field`, its hits arrive in field order so only the first N are
+    /// visited (early termination); `early_terminated` then marks `total` as
+    /// a lower bound (Lucene TotalHitsRelation.GREATER_THAN_OR_EQUAL_TO).
+    /// Missing values sort last. Reverse-sorted segments fall back to a full
+    /// scan (docID order is descending field order, so no early stop).
+    pub fn top_docs_by_field(
+        &mut self,
+        query: &Query,
+        field: &str,
+        n: usize,
+    ) -> io::Result<TopFieldHits> {
+        const MISSING: i64 = i64::MAX;
+        let mut total = 0u64;
+        let mut early_terminated = false;
+        // Per-segment local top-N candidates: (value, global_doc).
+        let mut candidates: Vec<(i64, i32)> = Vec::new();
+        for (doc_base, seg) in self.reader.leaves() {
+            let sorted_asc = seg.index_sort().first().is_some_and(|sf| {
+                sf.field == field && !sf.reverse && sf.field_type != SortFieldType::String
+            });
+            let values: std::collections::HashMap<u32, i64> =
+                seg.numeric_values(field)?.into_iter().collect();
+            let value_of = |d: u32| values.get(&d).copied().unwrap_or(MISSING);
+            let Some(mut iter) = query.segment_iterator(seg, false)? else {
+                continue;
+            };
+            if sorted_asc {
+                // docID order == field order: first N hits are the local
+                // top-N; the rest have value >= the Nth and can't qualify.
+                let mut taken = 0usize;
+                loop {
+                    let doc = iter.next_doc()?;
+                    if doc == NO_MORE_DOCS {
+                        break;
+                    }
+                    if !iter.matches()? {
+                        continue;
+                    }
+                    total += 1;
+                    if taken < n {
+                        candidates.push((value_of(doc as u32), doc_base + doc));
+                        taken += 1;
+                    } else {
+                        early_terminated = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Full scan: bounded max-heap keeping the smallest N (value,doc).
+            let mut heap: std::collections::BinaryHeap<(i64, i32)> =
+                std::collections::BinaryHeap::new();
+            loop {
+                let doc = iter.next_doc()?;
+                if doc == NO_MORE_DOCS {
+                    break;
+                }
+                if !iter.matches()? {
+                    continue;
+                }
+                total += 1;
+                let gdoc = doc_base + doc;
+                let v = value_of(doc as u32);
+                if heap.len() < n {
+                    heap.push((v, gdoc));
+                } else if let Some(&(top_v, top_d)) = heap.peek() {
+                    // Replace the worst kept entry if this one is better
+                    // (smaller value, or equal value with smaller docID).
+                    if (v, gdoc) < (top_v, top_d) {
+                        heap.pop();
+                        heap.push((v, gdoc));
+                    }
+                }
+            }
+            candidates.extend(heap.into_iter());
+        }
+        candidates.sort();
+        candidates.truncate(n);
+        Ok(TopFieldHits {
+            total,
+            early_terminated,
+            hits: candidates.into_iter().map(|(v, d)| (d, v)).collect(),
+        })
     }
 
     /// ConstantScore TermQuery: freq_sum = total_term_freq from TermEntry

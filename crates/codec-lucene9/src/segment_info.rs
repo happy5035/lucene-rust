@@ -25,6 +25,75 @@ const NO: i8 = -1;
 pub const STORED_FIELDS_MODE_ATTRIBUTE: &str = "Lucene90StoredFieldsFormat.mode";
 pub const STORED_FIELDS_MODE_BEST_SPEED: &str = "BEST_SPEED";
 
+/// SortField.Provider.NAME — the SPI provider name written before every
+/// index-sort field (all built-in numeric/string sorters share it,
+/// search/SortField.java:170).
+const SORT_PROVIDER_NAME: &str = "SortField";
+
+/// Sort field value type as serialized in `.si` (Lucene `SortField.Type`,
+/// written via `Type.toString()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortFieldType {
+    Int,
+    Long,
+    Float,
+    Double,
+    String,
+}
+
+impl SortFieldType {
+    fn as_str(self) -> &'static str {
+        match self {
+            SortFieldType::Int => "INT",
+            SortFieldType::Long => "LONG",
+            SortFieldType::Float => "FLOAT",
+            SortFieldType::Double => "DOUBLE",
+            SortFieldType::String => "STRING",
+        }
+    }
+
+    fn parse(s: &str) -> io::Result<Self> {
+        Ok(match s {
+            "INT" => SortFieldType::Int,
+            "LONG" => SortFieldType::Long,
+            "FLOAT" => SortFieldType::Float,
+            "DOUBLE" => SortFieldType::Double,
+            "STRING" => SortFieldType::String,
+            other => {
+                return Err(corrupt(format!(
+                    "unsupported index sort field type: {other}"
+                )));
+            }
+        })
+    }
+}
+
+/// The serialized missing-value sentinel for an index-sort field
+/// (`SortField.serialize`'s hasMissing=1 branch). Numeric types carry the
+/// sentinel (MIN/MAX for first/last); STRING carries an explicit flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingValue {
+    Int(i32),
+    Long(i64),
+    /// FLOAT missing, stored as sortable-int bits (NumericUtils).
+    FloatSortable(i32),
+    /// DOUBLE missing, stored as sortable-long bits (NumericUtils).
+    DoubleSortable(i64),
+    StringFirst,
+    StringLast,
+}
+
+/// One index-sort field as persisted in `.si` (Lucene `SortField` serialized
+/// via `SortField.Provider`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSortFieldInfo {
+    pub field: String,
+    pub field_type: SortFieldType,
+    pub reverse: bool,
+    /// None = hasMissing=0 (Lucene uses the type's default sentinel).
+    pub missing: Option<MissingValue>,
+}
+
 /// index/SegmentInfo.java (writer side).
 pub struct SegmentInfo {
     /// e.g. "_0" ("_" + base36(counter), IndexWriter.java:2051-2064).
@@ -44,6 +113,10 @@ pub struct SegmentInfo {
     /// prefix (checked, :214-219).
     pub files: BTreeSet<String>,
     pub attributes: BTreeMap<String, String>,
+    /// Index sort (Lucene SegmentInfo.getIndexSort): the fields this
+    /// segment's docs are physically ordered by. Empty = unsorted
+    /// (numSortFields=0).
+    pub index_sort: Vec<IndexSortFieldInfo>,
 }
 
 impl SegmentInfo {
@@ -59,6 +132,7 @@ impl SegmentInfo {
             diagnostics: BTreeMap::new(),
             files: BTreeSet::new(),
             attributes: BTreeMap::new(),
+            index_sort: Vec::new(),
         }
     }
 
@@ -110,16 +184,35 @@ impl SegmentInfo {
         out.write_map_of_strings(&self.diagnostics)?;
         out.write_set_of_strings(&self.files)?;
         out.write_map_of_strings(&self.attributes)?;
-        // no index sort
-        out.write_vint(0)?;
+        // IndexSort section (Lucene99SegmentInfoFormat.write :223-234).
+        out.write_vint(self.index_sort.len() as i32)?;
+        for sf in &self.index_sort {
+            out.write_string(SORT_PROVIDER_NAME)?;
+            out.write_string(&sf.field)?;
+            out.write_string(sf.field_type.as_str())?;
+            out.write_int(if sf.reverse { 1 } else { 0 })?;
+            match sf.missing {
+                None => out.write_int(0)?,
+                Some(mv) => {
+                    out.write_int(1)?;
+                    match mv {
+                        MissingValue::Int(v) => out.write_int(v)?,
+                        MissingValue::Long(v) => out.write_long(v)?,
+                        MissingValue::FloatSortable(bits) => out.write_int(bits)?,
+                        MissingValue::DoubleSortable(bits) => out.write_long(bits)?,
+                        MissingValue::StringFirst => out.write_int(1)?,
+                        MissingValue::StringLast => out.write_int(0)?,
+                    }
+                }
+            }
+        }
         write_footer(&mut out)?;
         out.flush()?;
         Ok(file_name)
     }
 
     /// Lucene99SegmentInfoFormat.read/parseSegmentInfo (:91-168): mirror of
-    /// [`SegmentInfo::write`]. The index sort must be absent (we never
-    /// write one).
+    /// [`SegmentInfo::write`], including the IndexSort section.
     pub fn read(
         dir: &FSDirectory,
         name: &str,
@@ -152,10 +245,45 @@ impl SegmentInfo {
         let files = input.read_set_of_strings()?;
         let attributes = input.read_map_of_strings()?;
         let num_sort_fields = input.read_vint()?;
-        if num_sort_fields != 0 {
+        if num_sort_fields < 0 {
             return Err(corrupt(format!(
-                "unsupported: index sort ({num_sort_fields} fields)"
+                "invalid index sort field count: {num_sort_fields}"
             )));
+        }
+        let mut index_sort: Vec<IndexSortFieldInfo> = Vec::new();
+        for _ in 0..num_sort_fields {
+            let provider = input.read_string()?;
+            if provider != SORT_PROVIDER_NAME {
+                return Err(corrupt(format!(
+                    "unsupported index sort provider: {provider}"
+                )));
+            }
+            let field = input.read_string()?;
+            let field_type = SortFieldType::parse(&input.read_string()?)?;
+            let reverse = input.read_int()? == 1;
+            let missing = if input.read_int()? == 1 {
+                Some(match field_type {
+                    SortFieldType::Int => MissingValue::Int(input.read_int()?),
+                    SortFieldType::Long => MissingValue::Long(input.read_long()?),
+                    SortFieldType::Float => MissingValue::FloatSortable(input.read_int()?),
+                    SortFieldType::Double => MissingValue::DoubleSortable(input.read_long()?),
+                    SortFieldType::String => {
+                        if input.read_int()? == 1 {
+                            MissingValue::StringFirst
+                        } else {
+                            MissingValue::StringLast
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+            index_sort.push(IndexSortFieldInfo {
+                field,
+                field_type,
+                reverse,
+                missing,
+            });
         }
         check_footer(&mut input)?;
         Ok(SegmentInfo {
@@ -169,6 +297,7 @@ impl SegmentInfo {
             diagnostics,
             files,
             attributes,
+            index_sort,
         })
     }
 }
@@ -234,6 +363,57 @@ mod tests {
         );
         // wrong id rejected
         assert!(SegmentInfo::read(&dir, "_0", &[9u8; 16], "").is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn si_index_sort_round_trip() {
+        let root = temp_dir("si_sort");
+        let dir = FSDirectory::open(&root).unwrap();
+
+        // numeric LONG sort, reverse, missing-last sentinel
+        let mut si = SegmentInfo::new("_0", [7u8; 16], 10);
+        si.files.insert("_0.si".to_string());
+        si.index_sort.push(IndexSortFieldInfo {
+            field: "timestamp".to_string(),
+            field_type: SortFieldType::Long,
+            reverse: true,
+            missing: Some(MissingValue::Long(i64::MAX)),
+        });
+        si.write(&dir, "").unwrap();
+        let back = SegmentInfo::read(&dir, "_0", &[7u8; 16], "").unwrap();
+        assert_eq!(back.index_sort.len(), 1);
+        assert_eq!(back.index_sort[0].field, "timestamp");
+        assert_eq!(back.index_sort[0].field_type, SortFieldType::Long);
+        assert!(back.index_sort[0].reverse);
+        assert_eq!(
+            back.index_sort[0].missing,
+            Some(MissingValue::Long(i64::MAX))
+        );
+
+        // string sort, ascending, missing-first
+        let mut si2 = SegmentInfo::new("_1", [8u8; 16], 10);
+        si2.files.insert("_1.si".to_string());
+        si2.index_sort.push(IndexSortFieldInfo {
+            field: "level".to_string(),
+            field_type: SortFieldType::String,
+            reverse: false,
+            missing: Some(MissingValue::StringFirst),
+        });
+        si2.write(&dir, "").unwrap();
+        let back2 = SegmentInfo::read(&dir, "_1", &[8u8; 16], "").unwrap();
+        assert_eq!(back2.index_sort[0].field, "level");
+        assert_eq!(back2.index_sort[0].field_type, SortFieldType::String);
+        assert!(!back2.index_sort[0].reverse);
+        assert_eq!(back2.index_sort[0].missing, Some(MissingValue::StringFirst));
+
+        // unsorted round-trips empty
+        let mut si3 = SegmentInfo::new("_2", [9u8; 16], 10);
+        si3.files.insert("_2.si".to_string());
+        si3.write(&dir, "").unwrap();
+        let back3 = SegmentInfo::read(&dir, "_2", &[9u8; 16], "").unwrap();
+        assert!(back3.index_sort.is_empty());
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

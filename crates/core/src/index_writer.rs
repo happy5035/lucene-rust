@@ -7,6 +7,7 @@ use codec_lucene9::FSDirectory;
 use crate::document::Document;
 use crate::schema::Schema;
 use crate::segment_builder::SegmentBuilder;
+use crate::sort::IndexSortField;
 
 pub struct IndexWriterConfig {
     /// Flush when this many docs are buffered (Lucene default: disabled / RAM-based).
@@ -23,6 +24,11 @@ pub struct IndexWriterConfig {
     /// df threshold for the inline bitmap (spec §4: 4096 对齐 level-1 skip
     /// 粒度 32×128).
     pub bitmap_threshold: u32,
+    /// Index sort (Lucene IndexWriterConfig.setIndexSort): when Some, each
+    /// flushed segment's docs are physically reordered by this field. The
+    /// field must carry NumericDocValues or SortedDocValues. None (default)
+    /// keeps append-only docID order.
+    pub index_sort: Option<IndexSortField>,
 }
 
 impl Default for IndexWriterConfig {
@@ -32,6 +38,7 @@ impl Default for IndexWriterConfig {
             max_ram_bytes: 512 * 1024 * 1024,
             bitmap: false,
             bitmap_threshold: 4096,
+            index_sort: None,
         }
     }
 }
@@ -87,6 +94,7 @@ impl IndexWriter {
             } else {
                 None
             });
+            b.set_index_sort(self.config.index_sort.clone());
             self.builder = Some(b);
             self.segment_counter += 1;
         }

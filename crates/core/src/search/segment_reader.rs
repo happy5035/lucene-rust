@@ -5,19 +5,27 @@
 use std::io;
 
 use codec_lucene9::directory::FSDirectory;
+use codec_lucene9::doc_values_read::DocValuesReader;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::points_read::PointsReader;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
 use codec_lucene9::roaring::FrozenBitmap;
+use codec_lucene9::segment_info::IndexSortFieldInfo;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
+const DV_SUFFIX: &str = "Lucene90_0";
+
 pub struct SegmentReader {
+    dir: FSDirectory,
+    segment: String,
+    segment_id: [u8; 16],
     max_doc: i32,
     field_infos: FieldInfos,
     terms: TermsDict,
     postings: PostingsReader,
     points: Option<PointsReader>,
+    index_sort: Vec<IndexSortFieldInfo>,
 }
 
 impl SegmentReader {
@@ -29,16 +37,38 @@ impl SegmentReader {
         let postings = PostingsReader::open(dir, segment, segment_id)?;
         let points = PointsReader::open(dir, segment, segment_id, &field_infos)?;
         Ok(SegmentReader {
+            dir: dir.clone(),
+            segment: segment.clone(),
+            segment_id: *segment_id,
             max_doc: sci.info.doc_count,
             field_infos,
             terms,
             postings,
             points,
+            index_sort: sci.info.index_sort.clone(),
         })
     }
 
     pub fn max_doc(&self) -> i32 {
         self.max_doc
+    }
+
+    /// Segment-level index sort metadata (empty = unsorted). Phase D early
+    /// termination keys off this: a segment sorted by field F yields hits in
+    /// docID order == F order, so field-sorted top-N can stop after N hits.
+    pub(crate) fn index_sort(&self) -> &[IndexSortFieldInfo] {
+        &self.index_sort
+    }
+
+    /// Numeric DocValues for a field as (doc, value) ascending by doc.
+    /// Opens the .dvd/.dvm on demand (no random-access cache yet — top-N
+    /// reads each sorted segment once). Unknown field → empty Vec.
+    pub(crate) fn numeric_values(&self, field: &str) -> io::Result<Vec<(u32, i64)>> {
+        let Some(fi) = self.field_infos.by_name(field) else {
+            return Ok(Vec::new());
+        };
+        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
+        r.numeric_values(fi.number)
     }
 
     /// Term lookup: field resolution + terms-dict seek. Returns

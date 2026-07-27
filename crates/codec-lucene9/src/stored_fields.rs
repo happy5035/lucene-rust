@@ -17,7 +17,7 @@ use crate::codec_util::{
     check_footer, check_footer_structure, check_index_header, write_footer, write_index_header,
 };
 use crate::directory::FSDirectory;
-use crate::io::{ChecksumIndexOutput, DataInput};
+use crate::io::{ChecksumIndexOutput, DataInput, IndexInput};
 use crate::packed::{DirectMonotonicReader, direct_monotonic_write};
 
 /// Lucene90StoredFieldsFormat.Mode.BEST_SPEED parameters
@@ -52,6 +52,7 @@ const HOUR_ENCODING: u8 = 0x80;
 const DAY_ENCODING: u8 = 0xC0;
 
 /// A single stored field value.
+#[derive(Debug, Clone, PartialEq)]
 pub enum StoredField {
     String(String),
     Bytes(Vec<u8>),
@@ -157,6 +158,77 @@ fn write_vint_raw(out: &mut Vec<u8>, v: i32) {
     write_vlong_raw(out, v as u32 as u64);
 }
 
+/// Inverse of [`write_tlong`] (Lucene90 ...Reader.readTLong).
+fn read_tlong(input: &mut impl DataInput) -> io::Result<i64> {
+    let header = input.read_byte()?;
+    let encoding = header & 0xC0;
+    let mut zigzag = (header & 0x1f) as u64;
+    if header & 0x20 != 0 {
+        let upper = input.read_vlong()? as u64;
+        zigzag |= upper << 5;
+    }
+    let value = (zigzag >> 1) as i64 ^ -((zigzag & 1) as i64);
+    let multiplier = match encoding {
+        0 => 1,
+        SECOND_ENCODING => SECOND,
+        HOUR_ENCODING => HOUR,
+        DAY_ENCODING => DAY,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid tlong encoding {other:#x}"),
+            ));
+        }
+    };
+    Ok(value * multiplier)
+}
+
+/// Inverse of [`write_zfloat`] (Lucene90 ...Reader.readZFloat).
+fn read_zfloat(input: &mut impl DataInput) -> io::Result<f32> {
+    let b = input.read_byte()?;
+    if b & 0x80 != 0 {
+        // small integer value [-1..125]
+        return Ok(((b & 0x7f) as i32 - 1) as f32);
+    }
+    if b == 0xFF {
+        let mut bytes = [0u8; 4];
+        input.read_bytes(&mut bytes)?;
+        return Ok(f32::from_bits(u32::from_le_bytes(bytes)));
+    }
+    // positive float: high byte + LE short (bits 8..24) + low byte
+    let mid = (input.read_short()? as u16) as u32;
+    let low = input.read_byte()? as u32;
+    let bits = ((b as u32) << 24) | (mid << 8) | low;
+    Ok(f32::from_bits(bits))
+}
+
+/// Inverse of [`write_zdouble`] (Lucene90 ...Reader.readZDouble).
+fn read_zdouble(input: &mut impl DataInput) -> io::Result<f64> {
+    let b = input.read_byte()?;
+    if b & 0x80 != 0 {
+        // small integer value [-1..124]
+        return Ok(((b & 0x7f) as i32 - 1) as f64);
+    }
+    if b == 0xFE {
+        let mut bytes = [0u8; 4];
+        input.read_bytes(&mut bytes)?;
+        return Ok(f32::from_bits(u32::from_le_bytes(bytes)) as f64);
+    }
+    if b == 0xFF {
+        let mut bytes = [0u8; 8];
+        input.read_bytes(&mut bytes)?;
+        return Ok(f64::from_bits(u64::from_le_bytes(bytes)));
+    }
+    // positive double: high byte + LE int (bits 24..56) + LE short + low byte
+    let mut int_bytes = [0u8; 4];
+    input.read_bytes(&mut int_bytes)?;
+    let mid_hi = u32::from_le_bytes(int_bytes) as u64;
+    let mid_lo = (input.read_short()? as u16) as u64;
+    let low = input.read_byte()? as u64;
+    let bits = ((b as u64) << 56) | (mid_hi << 24) | (mid_lo << 8) | low;
+    Ok(f64::from_bits(bits))
+}
+
 fn write_zint_raw(out: &mut Vec<u8>, v: i32) {
     write_vlong_raw(out, ((v << 1) ^ (v >> 31)) as u32 as u64);
 }
@@ -248,6 +320,83 @@ fn write_ints32(out: &mut ChecksumIndexOutput, values: &[i32]) -> io::Result<()>
         out.write_int(v)?;
     }
     Ok(())
+}
+
+/// Inverse of [`write_ints8`]: de-interleave 128-value blocks (8-bit lanes).
+fn load_ints8(input: &mut impl DataInput, count: usize) -> io::Result<Vec<i32>> {
+    let mut out = vec![0i32; count];
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..16 {
+            let l = input.read_long()? as u64;
+            for b in 0..8 {
+                out[k + b * 16 + i] = ((l >> (56 - b * 8)) & 0xff) as i32;
+            }
+        }
+        k += SF_BLOCK;
+    }
+    for item in out.iter_mut().skip(k) {
+        *item = input.read_byte()? as i32;
+    }
+    Ok(out)
+}
+
+/// Inverse of [`write_ints16`]: de-interleave 128-value blocks (16-bit lanes).
+fn load_ints16(input: &mut impl DataInput, count: usize) -> io::Result<Vec<i32>> {
+    let mut out = vec![0i32; count];
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..32 {
+            let l = input.read_long()? as u64;
+            for s in 0..4 {
+                out[k + s * 32 + i] = ((l >> (48 - s * 16)) & 0xffff) as i32;
+            }
+        }
+        k += SF_BLOCK;
+    }
+    for item in out.iter_mut().skip(k) {
+        *item = (input.read_short()? as u16) as i32;
+    }
+    Ok(out)
+}
+
+/// Inverse of [`write_ints32`]: de-interleave 128-value blocks (32-bit lanes).
+fn load_ints32(input: &mut impl DataInput, count: usize) -> io::Result<Vec<i32>> {
+    let mut out = vec![0i32; count];
+    let mut k = 0;
+    while k + SF_BLOCK <= count {
+        for i in 0..64 {
+            let l = input.read_long()? as u64;
+            out[k + i] = (l >> 32) as u32 as i32;
+            out[k + 64 + i] = (l & 0xffff_ffff) as u32 as i32;
+        }
+        k += SF_BLOCK;
+    }
+    for item in out.iter_mut().skip(k) {
+        *item = input.read_int()?;
+    }
+    Ok(out)
+}
+
+/// Inverse of [`save_ints`] (Lucene90CompressingStoredFieldsReader.loadInts).
+/// `count` is known from the chunk's numDocs.
+fn load_ints(input: &mut impl DataInput, count: usize) -> io::Result<Vec<i32>> {
+    if count == 1 {
+        return Ok(vec![input.read_vint()?]);
+    }
+    match input.read_byte()? {
+        0 => {
+            let v = input.read_vint()?;
+            Ok(vec![v; count])
+        }
+        8 => load_ints8(input, count),
+        16 => load_ints16(input, count),
+        32 => load_ints32(input, count),
+        bpv => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid stored-fields ints bpv {bpv}"),
+        )),
+    }
 }
 
 /// Lucene90CompressingStoredFieldsWriter.saveInts (:199-205).
@@ -765,6 +914,154 @@ impl StoredFieldsIndexReader {
         let sp = self.sp_dm();
         (sp.get(chunk as u64), sp.get(chunk as u64 + 1))
     }
+
+    /// Locates the chunk holding `doc`: returns (chunk_index,
+    /// chunk_start_file_pointer, chunk_doc_base). Binary search over the
+    /// cumulative docs sequence (docsDM[c] <= doc < docsDM[c+1]).
+    pub fn locate(&self, doc: u32) -> (usize, u64, u32) {
+        let dm = self.docs_dm();
+        let mut lo = 0usize;
+        let mut hi = self.num_chunks; // exclusive upper bound on chunk index
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if dm.get(mid as u64 + 1) <= doc as u64 {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let chunk = lo;
+        let base = dm.get(chunk as u64) as u32;
+        let sp = self.sp_dm();
+        (chunk, sp.get(chunk as u64), base)
+    }
+}
+
+/// Decompresses one LZ4 sub-block written by [`compress_lz4`]. `expected_len`
+/// is the sub-block's decompressed size (CHUNK_SIZE for full sub-blocks, the
+/// remainder for the last). Preset-dict chunks (dict_length > 0, possible in
+/// Java-written indexes) are not supported — this system's writer always uses
+/// an empty dict.
+fn decompress_subblock(input: &mut impl DataInput, expected_len: usize) -> io::Result<Vec<u8>> {
+    let dict_length = input.read_vint()?;
+    let block_length = input.read_vint()?;
+    let dict_comp_len = input.read_vint()? as usize;
+    // compress_lz4 writes both compressed lengths before any payload bytes.
+    let data_comp_len = if expected_len > 0 {
+        input.read_vint()? as usize
+    } else {
+        0
+    };
+    let mut dict_comp = vec![0u8; dict_comp_len];
+    input.read_bytes(&mut dict_comp)?;
+    if dict_length != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "preset-dict stored fields are not supported",
+        ));
+    }
+    if expected_len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut data_comp = vec![0u8; data_comp_len];
+    input.read_bytes(&mut data_comp)?;
+    lz4::block::decompress(&data_comp, Some(block_length))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("lz4 decompress: {e}")))
+}
+
+/// Per-document stored-fields reader (Lucene90CompressingStoredFieldsReader
+/// .document() analog). Used by index-sort merge to rewrite stored fields in
+/// the merged (sorted) order — the raw-chunk-copy path can't reorder.
+pub struct StoredFieldsReader {
+    dir: FSDirectory,
+    segment: String,
+    idx: StoredFieldsIndexReader,
+}
+
+impl StoredFieldsReader {
+    pub fn open(dir: &FSDirectory, segment: &str, id: &[u8; 16]) -> io::Result<Self> {
+        let idx = StoredFieldsIndexReader::open(dir, segment, id)?;
+        Ok(Self {
+            dir: dir.clone(),
+            segment: segment.to_string(),
+            idx,
+        })
+    }
+
+    /// Reads one document's stored fields as (field_number, value) pairs in
+    /// write order.
+    pub fn document(&self, doc: u32) -> io::Result<Vec<(u32, StoredField)>> {
+        let (_chunk, start_fp, _chunk_base) = self.idx.locate(doc);
+        let [fdt_name, _fdx, _fdm] = file_names(&self.segment, "");
+        let mut fdt = self.dir.open_input(&fdt_name)?;
+        fdt.seek(start_fp)?;
+        let doc_base = fdt.read_vint()? as u32;
+        let code = fdt.read_vint()?;
+        let num_docs = (code >> 2) as usize;
+        let sliced = code & 1 != 0;
+        let num_stored = load_ints(&mut fdt, num_docs)?;
+        let lengths = load_ints(&mut fdt, num_docs)?;
+        let total_len: usize = lengths.iter().map(|&l| l as usize).sum();
+
+        let mut data: Vec<u8> = Vec::with_capacity(total_len);
+        if sliced {
+            let mut remaining = total_len;
+            while remaining > 0 {
+                let this = remaining.min(CHUNK_SIZE);
+                data.extend(decompress_subblock(&mut fdt, this)?);
+                remaining -= this;
+            }
+        } else {
+            data = decompress_subblock(&mut fdt, total_len)?;
+        }
+
+        let doc_in_chunk = (doc - doc_base) as usize;
+        if doc_in_chunk >= num_docs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("doc {doc} out of chunk (base {doc_base}, {num_docs} docs)"),
+            ));
+        }
+        let offset: usize = lengths[..doc_in_chunk].iter().map(|&l| l as usize).sum();
+        let len = lengths[doc_in_chunk] as usize;
+        let doc_bytes = data[offset..offset + len].to_vec();
+        let mut input = IndexInput::in_memory(doc_bytes);
+
+        let mut fields = Vec::with_capacity(num_stored[doc_in_chunk] as usize);
+        for _ in 0..num_stored[doc_in_chunk] {
+            let info_and_bits = input.read_vlong()?;
+            let field_num = (info_and_bits >> 3) as u32;
+            let type_tag = info_and_bits & 0x7;
+            let value = match type_tag {
+                TYPE_STRING => {
+                    let n = input.read_vint()? as usize;
+                    let mut b = vec![0u8; n];
+                    input.read_bytes(&mut b)?;
+                    StoredField::String(String::from_utf8(b).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("utf8: {e}"))
+                    })?)
+                }
+                TYPE_BYTE_ARR => {
+                    let n = input.read_vint()? as usize;
+                    let mut b = vec![0u8; n];
+                    input.read_bytes(&mut b)?;
+                    StoredField::Bytes(b)
+                }
+                TYPE_NUMERIC_INT => StoredField::Int(input.read_zint()?),
+                TYPE_NUMERIC_FLOAT => StoredField::Float(read_zfloat(&mut input)?),
+                TYPE_NUMERIC_LONG => StoredField::Long(read_tlong(&mut input)?),
+                TYPE_NUMERIC_DOUBLE => StoredField::Double(read_zdouble(&mut input)?),
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown stored field type tag {other}"),
+                    ));
+                }
+            };
+            fields.push((field_num, value));
+        }
+        Ok(fields)
+    }
 }
 
 impl StoredFieldsWriter {
@@ -790,6 +1087,60 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn stored_fields_reader_round_trip() {
+        let root = temp_dir("sfreader");
+        let dir = FSDirectory::open(&root).unwrap();
+        let id = [3u8; 16];
+        let mut w = StoredFieldsWriter::new(&dir, "_0", id, "").unwrap();
+        w.write_document(&[
+            (0, StoredField::String("hello world".into())),
+            (1, StoredField::Long(1_234_567_890_123)),
+        ])
+        .unwrap();
+        w.write_document(&[
+            (2, StoredField::Int(-42)),
+            (0, StoredField::String("second".into())),
+        ])
+        .unwrap();
+        w.write_document(&[]).unwrap();
+        w.write_document(&[
+            (3, StoredField::Bytes(vec![1, 2, 3, 255])),
+            (1, StoredField::Long(-999)),
+            (4, StoredField::Float(1.5)),
+            (5, StoredField::Double(0.1)),
+        ])
+        .unwrap();
+        w.finish(4, &dir).unwrap();
+
+        let r = StoredFieldsReader::open(&dir, "_0", &id).unwrap();
+        assert_eq!(
+            r.document(0).unwrap(),
+            vec![
+                (0, StoredField::String("hello world".into())),
+                (1, StoredField::Long(1_234_567_890_123))
+            ]
+        );
+        assert_eq!(
+            r.document(1).unwrap(),
+            vec![
+                (2, StoredField::Int(-42)),
+                (0, StoredField::String("second".into()))
+            ]
+        );
+        assert_eq!(r.document(2).unwrap(), vec![]);
+        assert_eq!(
+            r.document(3).unwrap(),
+            vec![
+                (3, StoredField::Bytes(vec![1, 2, 3, 255])),
+                (1, StoredField::Long(-999)),
+                (4, StoredField::Float(1.5)),
+                (5, StoredField::Double(0.1))
+            ]
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// 写三个 chunk（2+2+1 docs），用新 reader 复读块索引。

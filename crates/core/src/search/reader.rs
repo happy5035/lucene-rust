@@ -45,7 +45,7 @@ impl Reader {
     }
 
     /// Leaves in commit order with their doc bases (DirectoryReader.leaves).
-    pub(crate) fn leaves(&mut self) -> impl Iterator<Item = (i32, &mut SegmentReader)> {
+    pub fn leaves(&mut self) -> impl Iterator<Item = (i32, &mut SegmentReader)> {
         self.doc_bases.iter().copied().zip(self.segments.iter_mut())
     }
 }

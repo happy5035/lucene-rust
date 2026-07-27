@@ -63,12 +63,22 @@ impl SegmentReader {
     /// Numeric DocValues for a field as (doc, value) ascending by doc.
     /// Opens the .dvd/.dvm on demand (no random-access cache yet — top-N
     /// reads each sorted segment once). Unknown field → empty Vec.
-    pub(crate) fn numeric_values(&self, field: &str) -> io::Result<Vec<(u32, i64)>> {
+    pub fn numeric_values(&self, field: &str) -> io::Result<Vec<(u32, i64)>> {
         let Some(fi) = self.field_infos.by_name(field) else {
             return Ok(Vec::new());
         };
         let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
         r.numeric_values(fi.number)
+    }
+
+    /// Binary DocValues for a field as (doc, bytes) ascending by doc.
+    /// Opens the .dvd/.dvm on demand. Unknown field → empty Vec.
+    pub fn binary_values(&self, field: &str) -> io::Result<Vec<(u32, Vec<u8>)>> {
+        let Some(fi) = self.field_infos.by_name(field) else {
+            return Ok(Vec::new());
+        };
+        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
+        r.binary_values(fi.number)
     }
 
     /// Term lookup: field resolution + terms-dict seek. Returns

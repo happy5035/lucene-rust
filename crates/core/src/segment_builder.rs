@@ -502,4 +502,45 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn test_binary_dv_read_back() {
+        use crate::document::{Document, FieldValue};
+        use crate::index_writer::{IndexWriter, IndexWriterConfig};
+        use crate::schema::{FieldSpec, Schema};
+        use crate::search::reader::Reader;
+        use codec_lucene9::FSDirectory;
+
+        let root = std::env::temp_dir()
+            .join(format!("rustlucene-bin-dv-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("name").with_sorted_dv());
+        schema.add(FieldSpec::binary_dv("data"));
+
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        let mut doc = Document::new();
+        doc.add("name", FieldValue::Keyword("s1".to_string()));
+        doc.add("data", FieldValue::Bytes(vec![0xDE, 0xAD]));
+        w.add_document(doc).unwrap();
+        let mut doc2 = Document::new();
+        doc2.add("name", FieldValue::Keyword("s2".to_string()));
+        doc2.add("data", FieldValue::Bytes(vec![0xBE, 0xEF, 0x00]));
+        w.add_document(doc2).unwrap();
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        for (_doc_base, seg) in reader.leaves() {
+            let bins = seg.binary_values("data").unwrap();
+            assert_eq!(bins.len(), 2);
+            let by_doc: std::collections::HashMap<u32, Vec<u8>> = bins.into_iter().collect();
+            assert_eq!(by_doc.get(&0), Some(&vec![0xDE, 0xAD]));
+            assert_eq!(by_doc.get(&1), Some(&vec![0xBE, 0xEF, 0x00]));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

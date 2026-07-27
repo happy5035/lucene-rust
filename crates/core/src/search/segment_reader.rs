@@ -81,6 +81,22 @@ impl SegmentReader {
         r.binary_values(fi.number)
     }
 
+    /// Binary DocValues for a field in packed form: `(doc_ids, data, offsets)`
+    /// where `data` is one contiguous buffer and `offsets[i]` is the
+    /// `(start, end)` of doc `doc_ids[i]`'s value within `data`. Ascending by
+    /// doc. Avoids one allocation per doc — useful when holding a whole field
+    /// (e.g. shard merge). Unknown field → empty.
+    pub fn binary_values_packed(
+        &self,
+        field: &str,
+    ) -> io::Result<(Vec<u32>, Vec<u8>, Vec<(usize, usize)>)> {
+        let Some(fi) = self.field_infos.by_name(field) else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
+        r.binary_values_packed(fi.number)
+    }
+
     /// Sorted DocValues for a field as (doc, term_bytes) ascending by doc.
     /// Combines sorted_ords (doc → ord) with sorted_dict (ord → bytes).
     /// Opens the .dvd/.dvm on demand. Unknown field → empty Vec.

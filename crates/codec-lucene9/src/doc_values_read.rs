@@ -629,6 +629,128 @@ impl DocValuesReader {
         }
         Ok(result)
     }
+
+    /// BINARY field, packed form: `(doc_ids, data, offsets)`. `data` is the
+    /// field's contiguous value region (one allocation); `offsets[i]` is the
+    /// `(start, end)` byte range of the i-th value within `data`, parallel to
+    /// `doc_ids`. Avoids the per-value `Vec` allocation that [`binary_values`]
+    /// performs — callers that hold a whole field (e.g. a shard merge) keep one
+    /// buffer and slice on demand. Doc order is ascending docID.
+    pub fn binary_values_packed(
+        &self,
+        field_number: i32,
+    ) -> io::Result<(Vec<u32>, Vec<u8>, Vec<(usize, usize)>)> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|(n, _)| *n == field_number)
+            .and_then(|(_, e)| match e {
+                DvEntry::Binary(m) => Some(m),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no BINARY DV entry for field {field_number}"),
+                )
+            })?;
+
+        if entry.num_values == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        if entry.docs_offset == -2 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        // Decode doc IDs (DISI or dense) — same logic as binary_values.
+        let doc_ids: Vec<u32> = if entry.docs_offset == -1 {
+            (0..entry.num_values).collect()
+        } else {
+            let region = self.slice(entry.docs_offset, entry.docs_length)?;
+            let mut docs = Vec::with_capacity(entry.num_values as usize);
+            let mut pos = 0usize;
+            loop {
+                if pos + 4 > region.len() {
+                    return Err(corrupt("truncated DISI block header"));
+                }
+                let block_id = Self::read_u16_le(region, pos)? as u32;
+                let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
+                pos += 4;
+                if block_id == DISI_SENTINEL_BLOCK {
+                    break;
+                }
+                if cardinality <= DISI_MAX_ARRAY_LENGTH {
+                    for _ in 0..cardinality {
+                        docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
+                        pos += 2;
+                    }
+                } else if cardinality == DISI_BLOCK_SIZE {
+                    docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
+                } else {
+                    if pos + 256 + 1024 * 8 > region.len() {
+                        return Err(corrupt("truncated DISI dense block"));
+                    }
+                    pos += 256;
+                    for word_index in 0..1024usize {
+                        let mut w = Self::read_u64_le(region, pos)?;
+                        pos += 8;
+                        while w != 0 {
+                            let bit = w.trailing_zeros();
+                            docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
+                            w &= w - 1;
+                        }
+                    }
+                }
+            }
+            if docs.len() != entry.num_values as usize {
+                return Err(corrupt(format!(
+                    "binary DISI docs count mismatch: expected {}, got {}",
+                    entry.num_values,
+                    docs.len()
+                )));
+            }
+            docs
+        };
+
+        // Contiguous value region (single owned copy of the field's data).
+        let data = self
+            .slice(entry.data_offset, entry.data_length)?
+            .to_vec();
+
+        // Per-value (start, end) offsets into `data`.
+        let mut offsets = Vec::with_capacity(entry.num_values as usize);
+        if entry.min_length == entry.max_length {
+            let len = entry.min_length as usize;
+            for i in 0..entry.num_values as usize {
+                let start = i * len;
+                let end = start + len;
+                if end > data.len() {
+                    return Err(corrupt("binary fixed-length data truncated"));
+                }
+                offsets.push((start, end));
+            }
+        } else {
+            let addr_meta = entry.addresses_meta.as_ref().ok_or_else(|| {
+                corrupt("binary variable-length field missing addresses meta")
+            })?;
+            let addr_data = self.slice(entry.addresses_offset, entry.addresses_length)?;
+            let dm = DirectMonotonicReader::new(
+                addr_meta,
+                addr_data,
+                entry.num_values as usize + 1,
+                DIRECT_MONOTONIC_BLOCK_SHIFT,
+            )?;
+            for i in 0..entry.num_values as usize {
+                let start = dm.get(i as u64) as usize;
+                let end = dm.get(i as u64 + 1) as usize;
+                if end > data.len() {
+                    return Err(corrupt("binary variable-length data truncated"));
+                }
+                offsets.push((start, end));
+            }
+        }
+        Ok((doc_ids, data, offsets))
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use rustlucene_core::index_writer::{IndexWriter, IndexWriterConfig};
 use rustlucene_core::schema::Schema;
+use rustlucene_core::IndexSortField;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::algo::series_hash::series_hash;
@@ -56,8 +57,11 @@ impl SeriesBuffer {
         })
     }
 
-    /// 用 V5 schema 创建。
+    /// 用 V5 schema 创建。强制按 series_hash（numeric DV）做 index sort，
+    /// 使每个刷盘段物理上按 series_hash 有序——跨 shard 流式 k-way 归并的前提。
     pub fn create_v5(path: &std::path::Path, config: IndexWriterConfig) -> io::Result<Self> {
+        let mut config = config;
+        config.index_sort = Some(IndexSortField::new("series_hash"));
         Self::create(path, v5_schema(), config)
     }
 

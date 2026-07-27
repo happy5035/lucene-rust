@@ -25,11 +25,6 @@ pub struct DownsampleStats {
 /// write results to output shard directory.
 ///
 /// `granularity_ms` is the downsample interval (e.g. 300_000 for 5m).
-///
-/// Known limitation: metric_labels is written as empty string because
-/// the V5 schema stores labels as indexed text (no DV), making them
-/// unreadable at merge/downsample time. The downsample shard's primary
-/// use is query-time aggregation (series_hash + time range + downsample_data).
 pub fn downsample_shard(
     input_raw_dir: &Path,
     output_downsample_dir: &Path,
@@ -55,6 +50,7 @@ pub fn downsample_shard(
         let counts = seg.numeric_values("sample_count")?;
         let gorilla_datas = seg.binary_values("gorilla_data")?;
         let metric_names = seg.sorted_values("metric_name")?;
+        let labels_data = seg.binary_values("metric_labels")?;
 
         input_docs += seg.max_doc() as usize;
 
@@ -64,6 +60,7 @@ pub fn downsample_shard(
         let tmax_map: std::collections::HashMap<u32, i64> = time_maxs.into_iter().collect();
         let count_map: std::collections::HashMap<u32, i64> = counts.into_iter().collect();
         let name_map: std::collections::HashMap<u32, Vec<u8>> = metric_names.into_iter().collect();
+        let labels_map: std::collections::HashMap<u32, Vec<u8>> = labels_data.into_iter().collect();
 
         for (doc_id, gorilla_bytes) in &gorilla_datas {
             let doc_id = *doc_id;
@@ -106,8 +103,11 @@ pub fn downsample_shard(
             // Write output doc
             let mut doc = Document::new();
             doc.add("metric_name", FieldValue::Keyword(metric_name));
-            // Known limitation: metric_labels not recoverable from input shard
-            doc.add("metric_labels", FieldValue::Text(String::new()));
+            let labels_str = labels_map
+                .get(&doc_id)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            doc.add("metric_labels", FieldValue::Text(labels_str));
             doc.add("series_hash", FieldValue::Long(series_hash));
             doc.add("time_min", FieldValue::Long(ds_time_min));
             doc.add("time_max", FieldValue::Long(ds_time_max));

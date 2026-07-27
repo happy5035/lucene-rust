@@ -406,6 +406,17 @@ impl DocWriter {
                             buf.doc_count += 1;
                         }
                     }
+                    // If this text field also has Binary DV, store raw bytes
+                    // (Lucene TextField + BinaryDocValuesField same-name pattern).
+                    if spec.doc_values == codec_lucene9::DocValuesType::Binary {
+                        if let Some(buf) = self.buffers[number as usize].as_mut() {
+                            if let Some(dv) = buf.binary_dv.as_mut() {
+                                dv.docs.push(doc_id);
+                                dv.values.push(text.as_bytes().to_vec());
+                                self.ram_bytes += 12 + text.len();
+                            }
+                        }
+                    }
                     if spec.stored {
                         if let Some(w) = sfw.as_deref_mut() {
                             w.write_field(number, &StoredField::String(text));

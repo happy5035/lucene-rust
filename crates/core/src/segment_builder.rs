@@ -543,4 +543,43 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn test_text_field_with_binary_dv() {
+        use crate::document::{Document, FieldValue};
+        use crate::index_writer::{IndexWriter, IndexWriterConfig};
+        use crate::schema::{FieldSpec, Schema};
+        use crate::search::reader::Reader;
+        use codec_lucene9::FSDirectory;
+
+        let root = std::env::temp_dir()
+            .join(format!("rustlucene-text-bindv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::text("labels").with_binary_dv());
+
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        let mut doc = Document::new();
+        doc.add("labels", FieldValue::Text("hello world".to_string()));
+        w.add_document(doc).unwrap();
+        let mut doc2 = Document::new();
+        doc2.add("labels", FieldValue::Text("host=h1,job=test".to_string()));
+        w.add_document(doc2).unwrap();
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        for (_doc_base, seg) in reader.leaves() {
+            // Binary DV returns the raw text bytes
+            let bins = seg.binary_values("labels").unwrap();
+            assert_eq!(bins.len(), 2);
+            let by_doc: std::collections::HashMap<u32, Vec<u8>> = bins.into_iter().collect();
+            assert_eq!(by_doc.get(&0), Some(&b"hello world".to_vec()));
+            assert_eq!(by_doc.get(&1), Some(&b"host=h1,job=test".to_vec()));
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

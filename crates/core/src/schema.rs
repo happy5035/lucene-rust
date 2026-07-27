@@ -142,6 +142,13 @@ impl FieldSpec {
         self
     }
 
+    /// Adds BinaryDocValues to this field (e.g. a TextField whose raw bytes
+    /// must be readable at merge/downsample time — Lucene same-name pattern).
+    pub fn with_binary_dv(mut self) -> Self {
+        self.doc_values = DocValuesType::Binary;
+        self
+    }
+
     /// Marks this field stored (or not).
     pub fn with_stored(mut self, stored: bool) -> Self {
         self.stored = stored;

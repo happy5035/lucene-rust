@@ -12,6 +12,11 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+jni = ["dep:jni"]
 
 [dev-dependencies]
 # 无 tempfile，用 std::env::temp_dir

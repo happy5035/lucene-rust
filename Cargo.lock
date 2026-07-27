@@ -354,6 +354,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "codec-lucene9",
+ "jni",
  "parking_lot",
  "rustlucene-core",
  "serde",

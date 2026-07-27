@@ -7,6 +7,7 @@ edition = "2021"
 rustlucene-core = { path = "../core" }
 codec-lucene9 = { path = "../codec-lucene9" }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 # 无 tempfile，用 std::env::temp_dir

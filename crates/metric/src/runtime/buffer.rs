@@ -135,6 +135,29 @@ impl SeriesBuffer {
         entry.values.extend_from_slice(values);
     }
 
+    /// 批量写入：多个 series 各若干点，一次锁获取完成整批写入。
+    /// 每个元素为 (name, labels_str, time, value)。JNI 二进制打包路径调用：
+    /// 一次 JNI 穿越 + 一次锁获取写入 N 个点（跨多个 series）。
+    pub fn write_batch_raw(&self, points: &[(String, String, i64, f64)]) {
+        let mut buf = self.buffer.write();
+        for (name, labels_str, time, value) in points {
+            let name_bytes = encode_utf16_le(name);
+            let label_bytes = encode_utf16_le(labels_str);
+            let name_hash = xxh64(&name_bytes, 0);
+            let label_hash = xxh64(&label_bytes, 0);
+            let hash = ((name_hash as u32 as u64) << 32) | (label_hash as u32 as u64);
+
+            let entry = buf.entry(hash).or_insert_with(|| SeriesEntry {
+                name: name.clone(),
+                sorted_labels: parse_labels_str(labels_str),
+                times: Vec::new(),
+                values: Vec::new(),
+            });
+            entry.times.push(*time);
+            entry.values.push(*value);
+        }
+    }
+
     /// 显式 flush：把所有缓冲的 series 写入 IndexWriter。
     pub fn flush(&self) -> io::Result<()> {
         let mut buf = self.buffer.write();
@@ -343,6 +366,45 @@ mod tests {
             total_docs += 1;
         }
         assert_eq!(total_docs, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_write_batch_raw() {
+        let root = temp_dir("batch_raw");
+        let buf = SeriesBuffer::create_v5(&root, IndexWriterConfig::default()).unwrap();
+
+        // 1000 points across 100 series (10 points each), one batch call
+        let mut points: Vec<(String, String, i64, f64)> = Vec::with_capacity(1000);
+        for series in 0..100 {
+            for i in 0..10 {
+                let name = format!("metric.{}", series % 5);
+                let labels = format!("$#$host=h{}$#$", series);
+                let time = 1_700_000_000_000 + i * 15_000;
+                let value = series as f64 + i as f64 * 0.1;
+                points.push((name, labels, time, value));
+            }
+        }
+        buf.write_batch_raw(&points);
+
+        buf.commit().unwrap();
+        drop(buf);
+
+        // Read back: 100 series → 100 docs, each with 10 points
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let mut total_docs = 0;
+        for (_base, seg) in reader.leaves() {
+            let bins = seg.binary_values("gorilla_data").unwrap();
+            for (_, data) in bins {
+                let (t, v) = crate::algo::gorilla::decode(&data, 10).unwrap();
+                assert_eq!(t.len(), 10);
+                assert_eq!(v.len(), 10);
+            }
+            total_docs += seg.max_doc() as usize;
+        }
+        assert_eq!(total_docs, 100);
 
         let _ = std::fs::remove_dir_all(&root);
     }

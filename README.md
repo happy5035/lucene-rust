@@ -130,6 +130,10 @@ public class RustMetric {
     // 批量写入：多个 series 各一个点
     public static native boolean writePointsMulti(long handle, String[] names, String[] labels, long[] times, double[] values);
 
+    // 推荐：二进制打包批量写入（1 次 JNI 穿越 = N 个点，跨多个 series）
+    // 返回成功写入的点数，出错返回 -1
+    public static native long writeBatch(long handle, byte[] packedPoints);
+
     public static native boolean flushBuffer(long handle);
     public static native void closeMetricWriter(long handle);
 
@@ -163,6 +167,36 @@ RustMetric.flushBuffer(handle);
 
 // 关闭（best-effort 最终 flush + 释放内存）
 RustMetric.closeMetricWriter(handle);
+```
+
+**推荐：二进制打包批量写入**（实时收到来自多个 series 的点时，攒一批后单次 JNI 穿越写入）：
+
+```java
+// 二进制协议（小端）每个点：
+//   name_len: u16 (2 字节) + name (UTF-8)
+//   labels_len: u16 (2 字节) + labels (UTF-8)
+//   time: i64 (8 字节)
+//   value: f64 (8 字节)
+
+// Java 侧打包工具
+public static byte[] packPoints(List<MetricPoint> points) {
+    ByteBuffer buf = ByteBuffer.allocate(points.size() * 64).order(ByteOrder.LITTLE_ENDIAN);
+    for (MetricPoint p : points) {
+        byte[] nameBytes = p.name.getBytes(StandardCharsets.UTF_8);
+        byte[] labelBytes = p.labels.getBytes(StandardCharsets.UTF_8);
+        buf.putShort((short) nameBytes.length);
+        buf.put(nameBytes);
+        buf.putShort((short) labelBytes.length);
+        buf.put(labelBytes);
+        buf.putLong(p.time);
+        buf.putDouble(p.value);
+    }
+    return Arrays.copyOf(buf.array(), buf.position());
+}
+
+// 使用
+byte[] batch = packPoints(collectedPoints);        // 收集的一批点（跨多个 series）
+long written = RustMetric.writeBatch(handle, batch);  // 一次 JNI 穿越 = N 个点
 ```
 
 **4. 降采样（Java 决定时机，Rust 执行）**：

@@ -180,6 +180,83 @@ pub extern "system" fn Java_com_metric_RustMetric_writePointsMulti(
     1
 }
 
+/// Binary-packed batch write: multiple series, one point each.
+/// One JNI crossing for N points. Java packs all points into a single byte[].
+///
+/// Binary protocol per point:
+///   name_len: u16 LE (2 bytes)
+///   name: UTF-8 bytes (name_len bytes)
+///   labels_len: u16 LE (2 bytes)
+///   labels: UTF-8 bytes (labels_len bytes)
+///   time: i64 LE (8 bytes)
+///   value: f64 LE (8 bytes)
+///
+/// Total per point: 2 + name_len + 2 + labels_len + 8 + 8 = 20 + name_len + labels_len
+///
+/// All points are parsed first, then buffered via a single lock acquisition
+/// ([`SeriesBuffer::write_batch_raw`]). Returns number of points successfully
+/// buffered, or -1 on error.
+#[no_mangle]
+pub extern "system" fn Java_com_metric_RustMetric_writeBatch(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    data: jni::objects::JByteArray,
+) -> jlong {
+    if handle == 0 {
+        return -1;
+    }
+    let buf = unsafe { &*(handle as *const SeriesBuffer) };
+
+    // One copy from JVM heap to Rust
+    let bytes = match env.convert_byte_array(&data) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+
+    // Parse all points first (no lock held during parsing)
+    let mut points: Vec<(String, String, i64, f64)> = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= bytes.len() {
+        // name
+        let name_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        if pos + name_len > bytes.len() {
+            break;
+        }
+        let name = std::str::from_utf8(&bytes[pos..pos + name_len]).unwrap_or("");
+        pos += name_len;
+
+        // labels
+        if pos + 2 > bytes.len() {
+            break;
+        }
+        let labels_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        pos += 2;
+        if pos + labels_len > bytes.len() {
+            break;
+        }
+        let labels = std::str::from_utf8(&bytes[pos..pos + labels_len]).unwrap_or("");
+        pos += labels_len;
+
+        // time + value
+        if pos + 16 > bytes.len() {
+            break;
+        }
+        let time = i64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let value = f64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        points.push((name.to_string(), labels.to_string(), time, value));
+    }
+
+    let count = points.len() as jlong;
+    // Single lock acquisition for all points
+    buf.write_batch_raw(&points);
+    count
+}
+
 /// Flush buffered data and commit to disk.
 /// Returns 1 on success, 0 on failure or null handle.
 #[no_mangle]

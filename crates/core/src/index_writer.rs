@@ -150,7 +150,7 @@ impl IndexWriter {
         Ok(())
     }
 
-    /// Schema accessor (needed by search to construct MemoryLeafReader).
+    /// Schema accessor (needed by search to construct MemoryLeafAccess).
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -613,6 +613,203 @@ mod tests {
         let r = guard.search(&Query::MatchAll, None, 10).unwrap();
         assert_eq!(r.total, 500);
         drop(guard);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ── Migrated from memory_reader.rs (Task 7) ─────────────────────
+    // These tests exercise the unified LeafAccess path via IndexWriter::search().
+
+    fn mem_schema() -> Schema {
+        let mut s = Schema::new();
+        s.add(FieldSpec::keyword("level"));
+        s.add(FieldSpec::keyword("tid"));
+        s.add(FieldSpec::text("message"));
+        s.add(FieldSpec::long_point("ts").with_numeric_dv());
+        s
+    }
+
+    fn build_mem_writer(tag: &str) -> IndexWriter {
+        let root = temp_dir(tag);
+        let schema = mem_schema();
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            let level = if i % 2 == 0 { "INFO" } else { "WARN" };
+            let mut doc = Document::new();
+            doc.add("level", FieldValue::Keyword(level.to_string()));
+            doc.add("tid", FieldValue::Keyword(format!("tid-{i}")));
+            doc.add("message", FieldValue::Text(format!("w{} common", i % 3)));
+            doc.add("ts", FieldValue::Long(1000 + i as i64));
+            w.add_document(doc).unwrap();
+        }
+        w
+    }
+
+    #[test]
+    fn unified_term_query() {
+        let w = build_mem_writer("unified-term");
+        assert_eq!(w.search(&Query::term("level", "INFO"), None, 10).unwrap().total, 5);
+        assert_eq!(w.search(&Query::term("level", "WARN"), None, 10).unwrap().total, 5);
+        assert_eq!(w.search(&Query::term("level", "DEBUG"), None, 10).unwrap().total, 0);
+        assert_eq!(w.search(&Query::term("tid", "tid-7"), None, 10).unwrap().total, 1);
+        assert_eq!(w.search(&Query::term("message", "common"), None, 10).unwrap().total, 10);
+        assert_eq!(w.search(&Query::term("message", "w0"), None, 10).unwrap().total, 4);
+    }
+
+    #[test]
+    fn unified_matchall() {
+        let w = build_mem_writer("unified-matchall");
+        let r = w.search(&Query::MatchAll, None, 5).unwrap();
+        assert_eq!(r.total, 10);
+        assert_eq!(r.docs, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn unified_and_or() {
+        let w = build_mem_writer("unified-andor");
+
+        // AND: w0 ∩ common = docs with both = {0,3,6,9}
+        let q = Query::and("message", &["w0", "common"]);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 4);
+
+        // AND with missing term → 0
+        let q = Query::and("message", &["w0", "nosuch"]);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 0);
+
+        // OR: w0 ∪ w1 = {0,1,3,4,6,7,9}
+        let q = Query::or("message", &["w0", "w1"]);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 7);
+    }
+
+    #[test]
+    fn unified_prefix() {
+        let w = build_mem_writer("unified-prefix");
+
+        // prefix "w" matches w0, w1, w2 → all 10 docs
+        assert_eq!(w.search(&Query::prefix("message", "w"), None, 10).unwrap().total, 10);
+        // prefix "w0" matches only w0 → 4 docs
+        assert_eq!(w.search(&Query::prefix("message", "w0"), None, 10).unwrap().total, 4);
+        // prefix "tid-1" matches tid-1 only
+        assert_eq!(w.search(&Query::prefix("tid", "tid-1"), None, 10).unwrap().total, 1);
+    }
+
+    #[test]
+    fn unified_wildcard() {
+        let w = build_mem_writer("unified-wildcard");
+
+        assert_eq!(w.search(&Query::wildcard("message", "w*"), None, 10).unwrap().total, 10);
+        assert_eq!(w.search(&Query::wildcard("message", "w?"), None, 10).unwrap().total, 10);
+        assert_eq!(w.search(&Query::wildcard("level", "INF*"), None, 10).unwrap().total, 5);
+        assert_eq!(w.search(&Query::wildcard("level", "????"), None, 10).unwrap().total, 10);
+    }
+
+    #[test]
+    fn unified_point_range() {
+        let w = build_mem_writer("unified-pointrange");
+
+        // ts values: 1000..1009
+        let q = Query::point_range("ts", 1002, 1005);
+        let r = w.search(&q, None, 10).unwrap();
+        assert_eq!(r.total, 4);
+        assert_eq!(r.docs, vec![2, 3, 4, 5]);
+
+        // Full range
+        let q = Query::point_range("ts", 0, 9999);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 10);
+
+        // Empty range
+        let q = Query::point_range("ts", 2000, 3000);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 0);
+    }
+
+    #[test]
+    fn unified_bool_query() {
+        use crate::search::query::Occur;
+        let w = build_mem_writer("unified-bool");
+
+        // MUST level=INFO AND message=w0 → docs 0,6
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("level", "INFO")),
+            (Occur::Must, Query::term("message", "w0")),
+        ]);
+        let r = w.search(&q, None, 10).unwrap();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.docs, vec![0, 6]);
+
+        // SHOULD: level=INFO OR level=WARN → all 10
+        let q = Query::bool(vec![
+            (Occur::Should, Query::term("level", "INFO")),
+            (Occur::Should, Query::term("level", "WARN")),
+        ]);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 10);
+
+        // MUST + MUST_NOT: message=common NOT level=WARN → INFO docs = 5
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "common")),
+            (Occur::MustNot, Query::term("level", "WARN")),
+        ]);
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 5);
+    }
+
+    #[test]
+    fn unified_phrase_query() {
+        let root = temp_dir("unified-phrase");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::text_with_positions("message"));
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+
+        let docs_text = [
+            "quick brown fox",   // 0: "quick brown" hit
+            "quick fox brown",   // 1: not adjacent
+            "quick quick brown", // 2: 2nd quick aligns
+        ];
+        for text in &docs_text {
+            let mut doc = Document::new();
+            doc.add("message", FieldValue::Text(text.to_string()));
+            w.add_document(doc).unwrap();
+        }
+
+        let q = Query::phrase("message", &["quick", "brown"]);
+        let r = w.search(&q, None, 10).unwrap();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.docs, vec![0, 2]);
+
+        let q = Query::phrase("message", &["quick", "fox"]);
+        let r = w.search(&q, None, 10).unwrap();
+        assert_eq!(r.docs, vec![1]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unified_unknown_field_returns_zero() {
+        let w = build_mem_writer("unified-unknownfield");
+        assert_eq!(w.search(&Query::term("nope", "x"), None, 10).unwrap().total, 0);
+        assert_eq!(w.search(&Query::prefix("nope", "x"), None, 10).unwrap().total, 0);
+    }
+
+    #[test]
+    fn unified_searchable_immediately_after_each_write() {
+        let root = temp_dir("unified-immediate");
+        let schema = mem_schema();
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+
+        for i in 0..5u32 {
+            let mut doc = Document::new();
+            doc.add("level", FieldValue::Keyword("INFO".to_string()));
+            doc.add("tid", FieldValue::Keyword(format!("tid-{i}")));
+            doc.add("message", FieldValue::Text("hello world".to_string()));
+            doc.add("ts", FieldValue::Long(i as i64));
+            w.add_document(doc).unwrap();
+
+            assert_eq!(
+                w.search(&Query::term("level", "INFO"), None, 10).unwrap().total,
+                (i + 1) as u64
+            );
+            assert_eq!(
+                w.search(&Query::MatchAll, None, 10).unwrap().total,
+                (i + 1) as u64
+            );
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

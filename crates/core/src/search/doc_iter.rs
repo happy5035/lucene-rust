@@ -500,6 +500,125 @@ impl DocIter for BitsetDocIter {
     }
 }
 
+// ── In-memory positions iterator ─────────────────────────────────────
+
+/// In-memory positions iterator: adapts pre-built doc/freq/positions data
+/// to the same interface as codec's `PositionsEnum`, allowing PhraseDocIter
+/// to work unchanged over RAM buffers.
+pub struct MemPositionsEnum {
+    docs: Vec<u32>,
+    positions: Vec<Vec<u32>>, // positions[doc_idx] = sorted position list
+    doc_idx: usize,
+    pos_idx: usize,
+    doc: i32,
+}
+
+impl MemPositionsEnum {
+    pub fn new(docs: Vec<u32>, positions: Vec<Vec<u32>>) -> Self {
+        Self { docs, positions, doc_idx: 0, pos_idx: 0, doc: -1 }
+    }
+
+    pub fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    pub fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc_idx >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.doc_idx] as i32;
+        self.doc_idx += 1;
+        self.pos_idx = 0;
+        Ok(self.doc)
+    }
+
+    pub fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.doc_idx..].binary_search(&t) {
+            Ok(i) => {
+                self.doc_idx += i;
+                self.doc = self.docs[self.doc_idx] as i32;
+                self.doc_idx += 1;
+                self.pos_idx = 0;
+            }
+            Err(i) => {
+                self.doc_idx += i;
+                if self.doc_idx >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.doc_idx] as i32;
+                    self.doc_idx += 1;
+                    self.pos_idx = 0;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+
+    pub fn freq(&self) -> u32 {
+        if self.doc < 0 || self.doc == NO_MORE_DOCS {
+            return 0;
+        }
+        // doc_idx points past the current doc
+        self.positions[self.doc_idx - 1].len() as u32
+    }
+
+    pub fn next_position(&mut self) -> io::Result<u32> {
+        let positions = &self.positions[self.doc_idx - 1];
+        let p = positions[self.pos_idx];
+        self.pos_idx += 1;
+        Ok(p)
+    }
+}
+
+/// Unified positions enum: wraps either a disk `PositionsEnum` (codec) or
+/// an in-memory `MemPositionsEnum`. PhraseDocIter is generic over this.
+pub enum PositionsEnumLike {
+    Disk(PositionsEnum),
+    Mem(MemPositionsEnum),
+}
+
+impl PositionsEnumLike {
+    pub fn doc_id(&self) -> i32 {
+        match self {
+            Self::Disk(e) => e.doc_id(),
+            Self::Mem(e) => e.doc_id(),
+        }
+    }
+
+    pub fn next_doc(&mut self) -> io::Result<i32> {
+        match self {
+            Self::Disk(e) => e.next_doc(),
+            Self::Mem(e) => e.next_doc(),
+        }
+    }
+
+    pub fn advance(&mut self, target: i32) -> io::Result<i32> {
+        match self {
+            Self::Disk(e) => e.advance(target),
+            Self::Mem(e) => e.advance(target),
+        }
+    }
+
+    pub fn freq(&self) -> u32 {
+        match self {
+            Self::Disk(e) => e.freq(),
+            Self::Mem(e) => e.freq(),
+        }
+    }
+
+    pub fn next_position(&mut self) -> io::Result<u32> {
+        match self {
+            Self::Disk(e) => e.next_position(),
+            Self::Mem(e) => e.next_position(),
+        }
+    }
+}
+
 // ── Phrase (slop=0) ─────────────────────────────────────────────────────
 
 /// phrase approximation 源（M7 §2.2）：全 term 有内联 bitmap 时 roaring
@@ -509,11 +628,11 @@ enum PhraseApprox {
     Bitmap { docs: Vec<u32>, cursor: usize },
 }
 
-/// One phrase term occurrence: an independent EverythingEnum + its offset
+/// One phrase term occurrence: an independent positions enum + its offset
 /// in the phrase. Repeated terms get independent enums, which makes them
 /// naturally correct (spec M2 §6; PhrasePositions :24-58).
 struct Occurrence {
-    en: PositionsEnum,
+    en: PositionsEnumLike,
     offset: u32,
 }
 
@@ -583,9 +702,9 @@ impl PhraseDocIter {
         let approx_bitmaps = if all_bitmap { Some(views) } else { None };
         // LeafAccess::positions_enum 返回 SegmentDocIter（磁盘侧把单个
         // PositionsEnum 包进单词 PhraseDocIter）；from_entries 需要裸
-        // PositionsEnum 做跨 term 位置验证，故解包还原（L=SegmentReader
+        // PositionsEnumLike 做跨 term 位置验证，故解包还原（L=SegmentReader
         // 时与旧 inherent 路径逐字节一致）。
-        let mut entries: Vec<(u32, u32, PositionsEnum)> = Vec::with_capacity(sought.len());
+        let mut entries: Vec<(u32, u32, PositionsEnumLike)> = Vec::with_capacity(sought.len());
         for (df, offset, entry) in sought {
             let it = seg.positions_enum(&entry)?;
             let pen = it.into_positions_enum().ok_or_else(|| {
@@ -605,7 +724,7 @@ impl PhraseDocIter {
     /// `approx_bitmaps`: when all terms have inline bitmaps, the roaring AND
     /// materialized candidate sequence; None → postings conjunction approx.
     pub fn from_entries(
-        entries: Vec<(u32, u32, PositionsEnum)>,
+        entries: Vec<(u32, u32, PositionsEnumLike)>,
         approx_bitmaps: Option<Vec<FrozenBitmap>>,
     ) -> PhraseDocIter {
         let approx = match approx_bitmaps {
@@ -631,11 +750,11 @@ impl PhraseDocIter {
     }
 
     /// Inverse of the `LeafAccess::positions_enum` wrapping: extract the
-    /// single wrapped `PositionsEnum` when this is a one-term phrase (the
+    /// single wrapped `PositionsEnumLike` when this is a one-term phrase (the
     /// shape every `positions_enum` impl produces). Returns `None` for a
     /// genuine multi-term phrase. Used by the generic `PhraseDocIter::new`
     /// to rebuild a multi-term phrase from per-term positions iterators.
-    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnum> {
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnumLike> {
         if self.occ.len() == 1 {
             let mut occ = self.occ;
             Some(occ.pop().unwrap().en)
@@ -1691,10 +1810,10 @@ pub enum SegmentDocIter {
 }
 
 impl SegmentDocIter {
-    /// Extract a wrapped `PositionsEnum` from a single-term `Phrase`
+    /// Extract a wrapped `PositionsEnumLike` from a single-term `Phrase`
     /// iterator (the shape `LeafAccess::positions_enum` produces); `None`
     /// for any other variant. See `PhraseDocIter::into_positions_enum`.
-    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnum> {
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnumLike> {
         match self {
             SegmentDocIter::Phrase(p) => p.into_positions_enum(),
             _ => None,

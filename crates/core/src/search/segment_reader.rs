@@ -13,7 +13,7 @@ use codec_lucene9::roaring::FrozenBitmap;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
-use super::doc_iter::{PhraseDocIter, SegmentDocIter};
+use super::doc_iter::{PhraseDocIter, PositionsEnumLike, SegmentDocIter};
 use super::leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
 
 pub struct SegmentReader {
@@ -218,7 +218,7 @@ impl LeafAccess for SegmentReader {
     fn positions_enum(&self, entry: &TermEntry) -> io::Result<SegmentDocIter> {
         let en = SegmentReader::positions_enum(self, entry)?;
         Ok(SegmentDocIter::Phrase(PhraseDocIter::from_entries(
-            vec![(entry.doc_freq, 0, en)],
+            vec![(entry.doc_freq, 0, PositionsEnumLike::Disk(en))],
             None,
         )))
     }

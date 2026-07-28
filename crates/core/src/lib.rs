@@ -12,6 +12,7 @@ pub mod doc_writer;
 pub mod document;
 pub mod index_writer;
 pub mod json;
+pub mod memory_access;
 pub mod memory_reader;
 pub mod merge;
 pub mod schema;

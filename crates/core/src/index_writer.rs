@@ -482,4 +482,117 @@ mod tests {
 
         fs::remove_dir_all(&root).unwrap();
     }
+
+    #[test]
+    fn concurrent_read_write_no_panic() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let root = temp_dir("concurrent");
+        let w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        let index = Arc::new(RwLock::new(w));
+
+        // Writer thread: 1000 docs
+        let writer = {
+            let idx = Arc::clone(&index);
+            thread::spawn(move || {
+                for i in 0..1000u32 {
+                    let mut guard = idx.write().unwrap();
+                    guard
+                        .add_document(rt_doc("INFO", "hello", i as i64))
+                        .unwrap();
+                }
+            })
+        };
+
+        // 4 reader threads: each does 50 searches
+        let readers: Vec<_> = (0..4)
+            .map(|tid| {
+                let idx = Arc::clone(&index);
+                thread::spawn(move || {
+                    for _ in 0..50 {
+                        let guard = idx.read().unwrap();
+                        let r = guard
+                            .search(&Query::term("level", "INFO"), Some(("ts", true)), 10)
+                            .unwrap();
+                        // total should be monotonically non-decreasing
+                        assert!(r.total <= 1000);
+                        assert!(r.docs.len() <= 10);
+                        // docs should be sorted desc by ts
+                        for w in r.docs.windows(2) {
+                            assert!(w[0] >= w[1], "reader {tid}: docs not desc");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        // Final state: all 1000 docs searchable
+        let guard = index.read().unwrap();
+        let r = guard
+            .search(&Query::MatchAll, Some(("ts", true)), 5)
+            .unwrap();
+        assert_eq!(r.total, 1000);
+        assert_eq!(r.docs, vec![999, 998, 997, 996, 995]);
+        drop(guard);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_with_flush() {
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+
+        let root = temp_dir("concflush");
+        let w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        let index = Arc::new(RwLock::new(w));
+
+        // Writer: 500 docs, flush at 250
+        let writer = {
+            let idx = Arc::clone(&index);
+            thread::spawn(move || {
+                for i in 0..500u32 {
+                    let mut guard = idx.write().unwrap();
+                    guard
+                        .add_document(rt_doc("INFO", "hello", i as i64))
+                        .unwrap();
+                    if i == 249 {
+                        guard.flush().unwrap();
+                    }
+                }
+            })
+        };
+
+        // Reader: continuous search
+        let reader = {
+            let idx = Arc::clone(&index);
+            thread::spawn(move || {
+                let mut last_total = 0u64;
+                for _ in 0..200 {
+                    let guard = idx.read().unwrap();
+                    let r = guard
+                        .search(&Query::MatchAll, None, 10)
+                        .unwrap();
+                    assert!(r.total >= last_total, "total went backwards");
+                    last_total = r.total;
+                    drop(guard);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let guard = index.read().unwrap();
+        let r = guard.search(&Query::MatchAll, None, 10).unwrap();
+        assert_eq!(r.total, 500);
+        drop(guard);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

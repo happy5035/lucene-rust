@@ -162,9 +162,11 @@ impl IndexWriter {
     /// Raw stored-field bytes of an unflushed buffered document.
     /// Returns None if the builder has no SFW or the doc is out of range.
     pub fn buffered_stored_bytes(&self, local_id: u32) -> Option<&[u8]> {
-        self.builder
-            .as_ref()
-            .and_then(|b| b.sfw_buffered_doc_bytes(local_id))
+        self.builder.as_ref().and_then(|b| {
+            let flushed = b.sfw_flushed_doc_count().max(0) as u32;
+            let buffer_idx = local_id.checked_sub(flushed)?;
+            b.sfw_buffered_doc_bytes(buffer_idx)
+        })
     }
 
     /// Maps a global doc_id to where its stored fields live.
@@ -479,6 +481,52 @@ mod tests {
             other => panic!("expected Buffer, got {other:?}"),
         }
         assert!(matches!(w.document_location(8), DocLocation::NotFound));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn buffered_stored_bytes_after_sfw_chunk_flush() {
+        let root = temp_dir("sfwflush");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+
+        // 1100 docs with a stored text field exceeds MAX_DOCS_PER_CHUNK
+        // (1024), forcing the SFW to flush at least one chunk to disk. Each
+        // doc carries a unique message so we can verify the right slot.
+        for i in 0..1100u32 {
+            w.add_document(rt_doc("INFO", &format!("msg-{i}"), 1000 + i as i64))
+                .unwrap();
+        }
+
+        // The SFW must have flushed a chunk; docs [flushed..1100) remain in
+        // the unflushed buffer.
+        let flushed = w.builder.as_ref().unwrap().sfw_flushed_doc_count();
+        assert!(
+            flushed >= 1024,
+            "expected an SFW chunk flush, flushed={flushed}"
+        );
+        let flushed = flushed as u32;
+
+        // Docs in the flushed region are not in the unflushed buffer.
+        assert!(w.buffered_stored_bytes(0).is_none());
+        assert!(w.buffered_stored_bytes(flushed - 1).is_none());
+
+        // Docs in the unflushed portion resolve to their own bytes (offset
+        // rebased by the flushed doc count). Before the fix, local_id was
+        // passed straight through, indexing into the wrong buffer slot.
+        for local_id in [flushed, flushed + 1, 1099] {
+            let bytes = w
+                .buffered_stored_bytes(local_id)
+                .unwrap_or_else(|| panic!("no buffered bytes for local_id {local_id}"));
+            let needle = format!("msg-{local_id}");
+            assert!(
+                bytes.windows(needle.len()).any(|win| win == needle.as_bytes()),
+                "bytes for local_id {local_id} do not contain {needle:?}"
+            );
+        }
+
+        // Out of range.
+        assert!(w.buffered_stored_bytes(1100).is_none());
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -131,6 +131,8 @@ impl SegmentReader {
     pub fn numeric_dv(&self, field: &str, doc: u32) -> Option<i64> {
         let fi = self.field_infos.by_name(field)?;
         let dv = self.doc_values.as_ref()?;
+        // Note: reads all (doc, value) pairs per call. For high-frequency use,
+        // a per-search cache would be appropriate. Acceptable for <100 QPS.
         let pairs = dv.numeric_values(fi.number).ok()?;
         // pairs is Vec<(u32, i64)> sorted by doc — binary search
         pairs

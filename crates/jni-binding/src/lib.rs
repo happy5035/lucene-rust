@@ -318,6 +318,8 @@ pub extern "system" fn Java_RustIndexWriter_nativeClose(
     if ptr == 0 {
         return 0;
     }
+    // SAFETY CONTRACT: Java must ensure no reader threads are mid-nativeSearch/nativeDocument
+    // before calling close. Dropping the RwLock while readers hold it is UB.
     let handle = unsafe { Box::from_raw(ptr as *mut WriterHandle) };
     if let Ok(ws) = handle.write_state.lock() {
         if ws.current.is_some() {

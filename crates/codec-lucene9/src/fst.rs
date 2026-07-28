@@ -517,6 +517,19 @@ pub struct FstArc {
     pub target: i64,
 }
 
+use crate::automaton::{WildcardDfa, DEAD};
+
+/// A candidate block found by FST-DFA intersection. The caller must load
+/// the block at `output`-encoded fp and verify full terms against the DFA
+/// starting from `dfa_state`.
+#[derive(Clone, Debug)]
+pub struct IntersectCandidate {
+    pub prefix: Vec<u8>,
+    pub output: Vec<u8>,
+    pub depth: usize,
+    pub dfa_state: u32,
+}
+
 /// Read side of a compiled FST image: reverse arc traversal over the
 /// variable-length node format. A node's address is the offset of its last
 /// byte; arcs are read backwards in ascending label order.
@@ -578,15 +591,14 @@ impl FstReader {
         Ok(v)
     }
 
-    /// FST.readArc (:943-991) over a whole node: arcs in ascending label
-    /// order plus the position just below the node, which is what
-    /// BIT_TARGET_NEXT resolves to (:966-990).
-    fn read_node(&self, addr: u64) -> io::Result<(Vec<FstArc>, i64)> {
+    /// Parse node at `addr` into the provided scratch Vec (cleared first).
+    /// Avoids per-call Vec allocation in hot loops (trace_path, lookup).
+    fn read_node_into(&self, addr: u64, arcs: &mut Vec<FstArc>) -> io::Result<i64> {
         if addr as usize >= self.bytes.len() {
             return Err(corrupt("FST node address out of bounds"));
         }
+        arcs.clear();
         let mut pos = addr as i64;
-        let mut arcs = Vec::new();
         loop {
             let flags = self.bytes[pos as usize];
             pos -= 1;
@@ -627,12 +639,12 @@ impl FstReader {
                 break;
             }
         }
-        for arc in &mut arcs {
+        for arc in arcs.iter_mut() {
             if arc.target == i64::MIN {
                 arc.target = pos;
             }
         }
-        Ok((arcs, pos))
+        Ok(pos)
     }
 
     /// findTargetArc linear scan (:1100-1126): labels ascend, so the first
@@ -651,11 +663,12 @@ impl FstReader {
         }
         let mut out = Vec::new();
         let mut node = self.start_node as i64;
+        let mut arcs: Vec<FstArc> = Vec::with_capacity(8);
         for (i, &b) in input.iter().enumerate() {
             if node <= 0 {
                 return Ok(None); // walked into an end node: not accepted
             }
-            let (arcs, _) = self.read_node(node as u64)?;
+            self.read_node_into(node as u64, &mut arcs)?;
             let Some(arc) = Self::find_arc(&arcs, b) else {
                 return Ok(None);
             };
@@ -691,11 +704,12 @@ impl FstReader {
         }
         let mut out: Vec<u8> = Vec::new();
         let mut node = self.start_node as i64;
+        let mut arcs: Vec<FstArc> = Vec::with_capacity(8);
         for (i, &b) in input.iter().enumerate() {
             if node <= 0 {
                 break;
             }
-            let (arcs, _) = self.read_node(node as u64)?;
+            self.read_node_into(node as u64, &mut arcs)?;
             let Some(arc) = Self::find_arc(&arcs, b) else {
                 break;
             };
@@ -712,6 +726,54 @@ impl FstReader {
             node = arc.target;
         }
         Ok(frames)
+    }
+
+    /// Walk the FST guided by a DFA, pruning arcs with no valid transition.
+    /// Returns candidate blocks (final arcs) where the DFA state is alive.
+    pub fn intersect_candidates(
+        &self,
+        dfa: &WildcardDfa,
+    ) -> io::Result<Vec<IntersectCandidate>> {
+        let mut candidates = Vec::new();
+        if self.start_node == 0 {
+            return Ok(candidates);
+        }
+        let mut arcs: Vec<FstArc> = Vec::with_capacity(8);
+        // Stack entries: (node_addr, dfa_state, prefix, accumulated_output)
+        let mut stack: Vec<(u64, u32, Vec<u8>, Vec<u8>)> = Vec::new();
+        stack.push((self.start_node, 0, Vec::new(), Vec::new()));
+
+        while let Some((node, state, prefix, out)) = stack.pop() {
+            self.read_node_into(node, &mut arcs)?;
+            for arc in &arcs {
+                let next = dfa.transition(state, arc.label);
+                if next == DEAD {
+                    continue;
+                }
+                let mut new_prefix = prefix.clone();
+                new_prefix.push(arc.label);
+                let mut new_out = out.clone();
+                if let Some(o) = &arc.output {
+                    new_out.extend_from_slice(o);
+                }
+                if arc.is_final {
+                    let mut full_out = new_out.clone();
+                    if let Some(fo) = &arc.final_output {
+                        full_out.extend_from_slice(fo);
+                    }
+                    candidates.push(IntersectCandidate {
+                        prefix: new_prefix.clone(),
+                        output: full_out,
+                        depth: new_prefix.len(),
+                        dfa_state: next,
+                    });
+                }
+                if arc.target > 0 {
+                    stack.push((arc.target as u64, next, new_prefix, new_out));
+                }
+            }
+        }
+        Ok(candidates)
     }
 }
 
@@ -1254,5 +1316,36 @@ mod tests {
             );
         }
         assert_eq!(reader.lookup(b"z").unwrap(), None);
+    }
+
+    #[test]
+    fn intersect_candidates_prunes_and_finds() {
+        use crate::automaton::WildcardDfa;
+
+        // Build a small FST with terms: "apple", "apply", "banana", "band"
+        let (fst_reader, _) = fst_reader(&[
+            (b"apple", Some(&[1, 0][..])),
+            (b"apply", Some(&[2, 0][..])),
+            (b"banana", Some(&[3, 0][..])),
+            (b"band", Some(&[4, 0][..])),
+        ]);
+
+        // Pattern "app*" should find candidates covering "apple" and "apply"
+        let dfa = WildcardDfa::compile(b"app*");
+        let candidates = fst_reader.intersect_candidates(&dfa).unwrap();
+        // At least one candidate whose prefix starts with "app"
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|c| c.prefix.starts_with(b"app")));
+
+        // Pattern "b?n*" should find candidates covering "banana" and "band"
+        let dfa2 = WildcardDfa::compile(b"b?n*");
+        let candidates2 = fst_reader.intersect_candidates(&dfa2).unwrap();
+        assert!(!candidates2.is_empty());
+        assert!(candidates2.iter().all(|c| c.prefix.starts_with(b"b")));
+
+        // Pattern "z*" should find nothing
+        let dfa3 = WildcardDfa::compile(b"z*");
+        let candidates3 = fst_reader.intersect_candidates(&dfa3).unwrap();
+        assert!(candidates3.is_empty());
     }
 }

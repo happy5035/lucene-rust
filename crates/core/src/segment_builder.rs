@@ -81,6 +81,12 @@ impl SegmentBuilder {
         self.sfw.as_ref().map_or(0, |s| s.flushed_doc_count())
     }
 
+    /// Raw stored-field bytes of the n-th unflushed buffered document.
+    /// Returns None if no SFW exists or n is out of range.
+    pub fn sfw_buffered_doc_bytes(&self, n: u32) -> Option<&[u8]> {
+        self.sfw.as_ref().and_then(|s| s.buffered_doc_bytes(n))
+    }
+
     /// Approximate RAM held by the indexing buffers (postings/docvalues/
     /// points arenas) plus one stored-fields compression chunk cushion.
     pub fn ram_bytes(&self) -> usize {

@@ -154,6 +154,19 @@ impl IndexWriter {
         &self.schema
     }
 
+    /// Directory path accessor (for stored-field disk reads).
+    pub fn dir_path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Raw stored-field bytes of an unflushed buffered document.
+    /// Returns None if the builder has no SFW or the doc is out of range.
+    pub fn buffered_stored_bytes(&self, local_id: u32) -> Option<&[u8]> {
+        self.builder
+            .as_ref()
+            .and_then(|b| b.sfw_buffered_doc_bytes(local_id))
+    }
+
     /// Maps a global doc_id to where its stored fields live.
     pub fn document_location(&self, global_id: u32) -> DocLocation {
         let mut base: u32 = 0;

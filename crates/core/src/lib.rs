@@ -20,7 +20,7 @@ pub mod segment_builder;
 pub mod tokenizer;
 
 pub use document::{Document, FieldValue};
-pub use index_writer::{commit_segments, IndexWriter, IndexWriterConfig};
+pub use index_writer::{commit_segments, DocLocation, IndexWriter, IndexWriterConfig};
 pub use json::{BindOutcome, FieldPolicy, JsonBinder};
 pub use schema::{FieldSpec, PointSpec, Schema};
 pub use segment_builder::SegmentBuilder;

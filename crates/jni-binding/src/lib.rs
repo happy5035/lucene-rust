@@ -582,40 +582,40 @@ fn read_zdouble(data: &mut &[u8]) -> Result<f64, String> {
     let first = data[0];
     *data = &data[1..];
 
-    if first >= 0x80 {
-        // Small integer [-1..124]: single byte
-        Ok((first & 0x7f) as i32 as f64 - 1.0)
-    } else if first == 0xFE {
+    if first == 0xFE {
         // Float-accurate: 4 bytes LE f32 bits
         if data.len() < 4 {
             return Err("truncated zdouble float".into());
         }
-        let bits = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         *data = &data[4..];
-        Ok(f32::from_bits(bits as u32) as f64)
+        Ok(f32::from_bits(bits) as f64)
     } else if first == 0xFF {
         // Negative double: 8 bytes LE
         if data.len() < 8 {
             return Err("truncated zdouble negative".into());
         }
-        let bits = i64::from_le_bytes([
+        let bits = u64::from_le_bytes([
             data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
         *data = &data[8..];
-        Ok(f64::from_bits(bits as u64))
+        Ok(f64::from_bits(bits))
+    } else if first >= 0x80 {
+        // Small integer [-1..124]: single byte
+        Ok((first & 0x7f) as i32 as f64 - 1.0)
     } else {
-        // Positive double: first byte is bits>>56, then 4 LE bytes (bits>>24 as i32),
-        // 2 LE bytes (bits>>8 as i16), 1 byte (bits & 0xFF)
+        // Positive double: first byte is bits>>56, then LE int (bits>>24),
+        // LE short (bits>>8), byte (bits & 0xFF)
         if data.len() < 7 {
             return Err("truncated zdouble positive".into());
         }
-        let b0 = first as i64;
-        let mid = i32::from_le_bytes([data[0], data[1], data[2], data[3]]) as i64;
-        let lo_short = i16::from_le_bytes([data[4], data[5]]) as i64;
-        let lo_byte = data[6] as i64;
+        let b0 = first as u64;
+        let mid = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
+        let lo_short = u16::from_le_bytes([data[4], data[5]]) as u64;
+        let lo_byte = data[6] as u64;
         *data = &data[7..];
-        let bits = (b0 << 56) | ((mid & 0xFFFF_FFFF) << 24) | ((lo_short & 0xFFFF) << 8) | lo_byte;
-        Ok(f64::from_bits(bits as u64))
+        let bits = (b0 << 56) | (mid << 24) | ((lo_short as u64) << 8) | lo_byte;
+        Ok(f64::from_bits(bits))
     }
 }
 
@@ -627,20 +627,27 @@ fn read_zfloat(data: &mut &[u8]) -> Result<f32, String> {
     let first = data[0];
     *data = &data[1..];
 
-    if first >= 0x80 {
+    if first == 0xFF {
+        // Negative float: 4 bytes LE f32 bits
+        if data.len() < 4 {
+            return Err("truncated zfloat negative".into());
+        }
+        let bits = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        *data = &data[4..];
+        Ok(f32::from_bits(bits))
+    } else if first >= 0x80 {
         // Small integer [-1..125]: single byte
         Ok((first & 0x7f) as i32 as f32 - 1.0)
     } else {
-        // 3 more bytes: LE short (bits>>8) + byte (bits & 0xFF)
-        // first byte = bits >> 24
+        // Positive float: first byte is bits>>24, then LE short (bits>>8), byte (bits & 0xFF)
         if data.len() < 3 {
             return Err("truncated zfloat".into());
         }
-        let mid = i16::from_le_bytes([data[0], data[1]]) as i32;
-        let lo = data[2] as i32;
+        let mid = u16::from_le_bytes([data[0], data[1]]) as u32;
+        let lo = data[2] as u32;
         *data = &data[3..];
-        let bits = ((first as i32) << 24) | ((mid & 0xFFFF) << 8) | lo;
-        Ok(f32::from_bits(bits as u32))
+        let bits = ((first as u32) << 24) | (mid << 8) | lo;
+        Ok(f32::from_bits(bits))
     }
 }
 
@@ -701,5 +708,90 @@ mod tests {
         let names = vec!["count".to_string()];
         let result = decode_stored_doc(&buf, &names).unwrap();
         assert_eq!(result.get("count").unwrap(), &serde_json::json!(7));
+    }
+
+    #[test]
+    fn decode_stored_doc_float_double_roundtrip() {
+        use super::*;
+
+        // --- Helper: encode zfloat the same way as write_zfloat ---
+        fn encode_zfloat(out: &mut Vec<u8>, f: f32) {
+            let int_val = f as i32;
+            let float_bits = f.to_bits() as i32;
+            let neg_zero = (-0.0f32).to_bits() as i32;
+            if f == int_val as f32 && (-1..=0x7d).contains(&int_val) && float_bits != neg_zero {
+                out.push(0x80 | (1 + int_val) as u8);
+            } else if float_bits >= 0 {
+                out.push((float_bits >> 24) as u8);
+                out.extend_from_slice(&((float_bits >> 8) as i16).to_le_bytes());
+                out.push(float_bits as u8);
+            } else {
+                out.push(0xFF);
+                out.extend_from_slice(&float_bits.to_le_bytes());
+            }
+        }
+
+        // --- Helper: encode zdouble the same way as write_zdouble ---
+        fn encode_zdouble(out: &mut Vec<u8>, d: f64) {
+            let int_val = d as i32;
+            let double_bits = d.to_bits() as i64;
+            let neg_zero = (-0.0f64).to_bits() as i64;
+            if d == int_val as f64 && (-1..=0x7c).contains(&int_val) && double_bits != neg_zero {
+                out.push(0x80 | (int_val + 1) as u8);
+            } else if d == d as f32 as f64 {
+                out.push(0xFE);
+                out.extend_from_slice(&((d as f32).to_bits() as i32).to_le_bytes());
+            } else if double_bits >= 0 {
+                out.push((double_bits >> 56) as u8);
+                out.extend_from_slice(&((double_bits >> 24) as i32).to_le_bytes());
+                out.extend_from_slice(&((double_bits >> 8) as i16).to_le_bytes());
+                out.push(double_bits as u8);
+            } else {
+                out.push(0xFF);
+                out.extend_from_slice(&double_bits.to_le_bytes());
+            }
+        }
+
+        let mut buf = Vec::new();
+
+        // field 0: negative float -3.14 (type FLOAT=3), info = (0<<3)|3 = 3
+        buf.push(3);
+        encode_zfloat(&mut buf, -3.14f32);
+
+        // field 1: float-accurate double 1.5 (type DOUBLE=5), info = (1<<3)|5 = 13
+        buf.push(13);
+        encode_zdouble(&mut buf, 1.5f64);
+
+        // field 2: negative double -1e100 (type DOUBLE=5), info = (2<<3)|5 = 21
+        buf.push(21);
+        encode_zdouble(&mut buf, -1e100f64);
+
+        // field 3: positive non-small double 1e100 (type DOUBLE=5), info = (3<<3)|5 = 29
+        buf.push(29);
+        encode_zdouble(&mut buf, 1e100f64);
+
+        let names = vec![
+            "neg_f".to_string(),
+            "flt_d".to_string(),
+            "neg_d".to_string(),
+            "pos_d".to_string(),
+        ];
+        let result = decode_stored_doc(&buf, &names).unwrap();
+
+        // Negative float: -3.14f32 as f64
+        let neg_f = result.get("neg_f").unwrap().as_f64().unwrap();
+        assert!((neg_f - (-3.14f32 as f64)).abs() < 1e-6, "neg_f={neg_f}");
+
+        // Float-accurate double: 1.5
+        let flt_d = result.get("flt_d").unwrap().as_f64().unwrap();
+        assert_eq!(flt_d, 1.5f64);
+
+        // Negative double: -1e100
+        let neg_d = result.get("neg_d").unwrap().as_f64().unwrap();
+        assert_eq!(neg_d, -1e100f64);
+
+        // Positive non-small double: 1e100
+        let pos_d = result.get("pos_d").unwrap().as_f64().unwrap();
+        assert_eq!(pos_d, 1e100f64);
     }
 }

@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::FileExt;
 
 /// Large output buffer; avoids per-byte syscalls (cf. BufferedIndexOutput).
 const BUFFER_CAPACITY: usize = 1 << 16;
@@ -630,7 +629,7 @@ pub mod io_stats {
 
 enum InputSource {
     /// Positional reads at `base + pos`; slices share the file handle via
-    /// `try_clone` and shift `base` (std::os::unix::fs::FileExt::read_at).
+    /// `try_clone` and shift `base` (read_at on unix, seek_read on windows).
     File {
         file: File,
         base: u64,
@@ -747,7 +746,16 @@ impl IndexInput {
                     io_stats::READ_BYTES.fetch_add(n as u64, Relaxed);
                     io_stats::READ_CALLS.fetch_add(1, Relaxed);
                 }
-                file.read_at(&mut self.buffer[..n], base + self.position)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    file.read_at(&mut self.buffer[..n], base + self.position)?;
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_read(&mut self.buffer[..n], base + self.position)?;
+                }
             }
             InputSource::Memory(bytes) => {
                 self.buffer[..n]

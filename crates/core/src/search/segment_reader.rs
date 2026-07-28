@@ -5,6 +5,7 @@
 use std::io;
 
 use codec_lucene9::directory::FSDirectory;
+use codec_lucene9::doc_values_read::DocValuesReader;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::points_read::PointsReader;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
@@ -18,6 +19,7 @@ pub struct SegmentReader {
     terms: TermsDict,
     postings: PostingsReader,
     points: Option<PointsReader>,
+    doc_values: Option<DocValuesReader>,
 }
 
 impl SegmentReader {
@@ -28,12 +30,15 @@ impl SegmentReader {
         let terms = TermsDict::open(dir, segment, segment_id, &field_infos)?;
         let postings = PostingsReader::open(dir, segment, segment_id)?;
         let points = PointsReader::open(dir, segment, segment_id, &field_infos)?;
+        let dv_suffix = "Lucene90_0";
+        let doc_values = DocValuesReader::open(dir, segment, segment_id, dv_suffix).ok();
         Ok(SegmentReader {
             max_doc: sci.info.doc_count,
             field_infos,
             terms,
             postings,
             points,
+            doc_values,
         })
     }
 
@@ -118,6 +123,20 @@ impl SegmentReader {
     /// points files (segment_builder.rs:240-245).
     pub(crate) fn points_reader(&self) -> Option<&PointsReader> {
         self.points.as_ref()
+    }
+
+    /// Read a numeric doc value by field name and local doc id.
+    /// Returns None if the field has no DV, the segment has no DV files,
+    /// or the doc has no value (sparse).
+    pub fn numeric_dv(&self, field: &str, doc: u32) -> Option<i64> {
+        let fi = self.field_infos.by_name(field)?;
+        let dv = self.doc_values.as_ref()?;
+        let pairs = dv.numeric_values(fi.number).ok()?;
+        // pairs is Vec<(u32, i64)> sorted by doc — binary search
+        pairs
+            .binary_search_by(|&(d, _)| d.cmp(&doc))
+            .ok()
+            .map(|idx| pairs[idx].1)
     }
 }
 

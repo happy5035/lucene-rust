@@ -812,4 +812,113 @@ mod tests {
         }
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// Task 8 equivalence battery: exercise EVERY query type through
+    /// `IndexWriter::search()` on unflushed (pure in-memory) data, proving the
+    /// unified LeafAccess path produces correct results for the full query set.
+    ///
+    /// Data distribution for docs 0..20:
+    ///   level = i%4 → 0:INFO 1:WARN 2:ERROR 3:DEBUG
+    ///   msg   = "quick brown fox" if i%8==0 else "w{i%5}"
+    ///   ts    = 1000 + i
+    /// Message buckets:
+    ///   "quick brown fox": {0,8,16}
+    ///   w0:{5,10,15} w1:{1,6,11} w2:{2,7,12,17} w3:{3,13,18} w4:{4,9,14,19}
+    #[test]
+    fn memory_search_equivalence_battery() {
+        use crate::search::query::Occur;
+
+        let root = temp_dir("equiv");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        schema.add(FieldSpec::keyword("tid"));
+        schema.add(FieldSpec::text_with_positions("message"));
+        schema.add(FieldSpec::long_point("ts").with_numeric_dv());
+
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        // Write 20 docs with varied data (no flush — all in memory)
+        for i in 0..20u32 {
+            let level = match i % 4 {
+                0 => "INFO",
+                1 => "WARN",
+                2 => "ERROR",
+                _ => "DEBUG",
+            };
+            let msg = if i % 8 == 0 {
+                "quick brown fox".to_string()
+            } else {
+                format!("w{}", i % 5)
+            };
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword(level.to_string()));
+            d.add("tid", FieldValue::Keyword(format!("tid-{i}")));
+            d.add("message", FieldValue::Text(msg));
+            d.add("ts", FieldValue::Long(1000 + i as i64));
+            w.add_document(d).unwrap();
+        }
+        // NO flush — everything in memory buffer
+
+        // Term: INFO = i%4==0 → {0,4,8,12,16}
+        let r = w.search(&Query::term("level", "INFO"), None, 100).unwrap();
+        assert_eq!(r.total, 5);
+
+        // MatchAll: all 20
+        let r = w.search(&Query::MatchAll, None, 100).unwrap();
+        assert_eq!(r.total, 20);
+
+        // And: message has both "quick" and "brown" → qbf docs {0,8,16}
+        let r = w
+            .search(&Query::and("message", &["quick", "brown"]), None, 100)
+            .unwrap();
+        assert_eq!(r.total, 3);
+
+        // Or: w0 ∪ w1 = {5,10,15} ∪ {1,6,11} = {1,5,6,10,11,15} (disjoint)
+        let r = w
+            .search(&Query::or("message", &["w0", "w1"]), None, 100)
+            .unwrap();
+        assert_eq!(r.total, 6);
+
+        // Phrase: "quick brown" adjacent → qbf docs {0,8,16}
+        let r = w
+            .search(&Query::phrase("message", &["quick", "brown"]), None, 100)
+            .unwrap();
+        assert_eq!(r.total, 3);
+
+        // Prefix "w": every w0-w4 doc, i.e. all but the 3 qbf docs → 17
+        let r = w.search(&Query::prefix("message", "w"), None, 100).unwrap();
+        assert_eq!(r.total, 17);
+
+        // Wildcard "w?": w0-w4 all match (w + one char) → same 17
+        let r = w.search(&Query::wildcard("message", "w?"), None, 100).unwrap();
+        assert_eq!(r.total, 17);
+
+        // PointRange ts ∈ [1005,1010] inclusive → i ∈ {5,6,7,8,9,10}
+        let r = w
+            .search(&Query::point_range("ts", 1005, 1010), None, 100)
+            .unwrap();
+        assert_eq!(r.total, 6);
+
+        // Bool: MUST level=INFO, MUST_NOT message=w0.
+        // INFO = {0,4,8,12,16}; w0 = {5,10,15}; intersection empty → all 5 INFO.
+        let r = w
+            .search(
+                &Query::bool(vec![
+                    (Occur::Must, Query::term("level", "INFO")),
+                    (Occur::MustNot, Query::term("message", "w0")),
+                ]),
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(r.total, 5);
+
+        // Sort desc by ts, top 3 of INFO: ts 1016,1012,1008 → docs 16,12,8
+        let r = w
+            .search(&Query::term("level", "INFO"), Some(("ts", true)), 3)
+            .unwrap();
+        assert_eq!(r.total, 5);
+        assert_eq!(r.docs, vec![16, 12, 8]);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

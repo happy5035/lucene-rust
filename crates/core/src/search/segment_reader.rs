@@ -13,6 +13,9 @@ use codec_lucene9::roaring::FrozenBitmap;
 use codec_lucene9::segment_infos::SegmentCommitInfo;
 use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 
+use super::doc_iter::{PhraseDocIter, SegmentDocIter};
+use super::leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
+
 pub struct SegmentReader {
     max_doc: i32,
     field_infos: FieldInfos,
@@ -139,6 +142,115 @@ impl SegmentReader {
             .binary_search_by(|&(d, _)| d.cmp(&doc))
             .ok()
             .map(|idx| pairs[idx].1)
+    }
+}
+
+// ── DiskTermsIter adapter (TermsIterAccess over disk FST streaming) ────
+
+struct DiskTermsIter<'a> {
+    inner: TermsIter<'a>,
+}
+
+impl TermsIterAccess for DiskTermsIter<'_> {
+    fn seek_ceil(&mut self, target: &[u8]) -> io::Result<bool> {
+        self.inner.seek_ceil(target)
+    }
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntryLike)>> {
+        match self.inner.next()? {
+            Some((term, entry)) => Ok(Some((
+                term,
+                TermEntryLike {
+                    doc_freq: entry.doc_freq,
+                    total_term_freq: entry.total_term_freq,
+                    handle: 0, // not used for disk path
+                },
+            ))),
+            None => Ok(None),
+        }
+    }
+}
+
+// ── PointsAccess for PointsReader ─────────────────────────────────────
+
+impl PointsAccess for PointsReader {
+    fn intersect(
+        &self,
+        field: &str,
+        low: i64,
+        high: i64,
+        visitor: &mut dyn FnMut(i64, i32),
+    ) -> io::Result<()> {
+        PointsReader::intersect(self, field, low, high, visitor)
+    }
+}
+
+// ── LeafAccess for SegmentReader ──────────────────────────────────────
+
+impl LeafAccess for SegmentReader {
+    type TermHandle = TermEntry;
+
+    fn max_doc(&self) -> i32 {
+        self.max_doc
+    }
+
+    fn seek_term(
+        &mut self,
+        field: &str,
+        term: &[u8],
+    ) -> io::Result<Option<(bool, TermEntry)>> {
+        SegmentReader::seek_term(self, field, term)
+    }
+
+    fn docs_enum(&self, entry: &TermEntry) -> io::Result<SegmentDocIter> {
+        Ok(SegmentDocIter::Docs(self.postings.docs(entry)?))
+    }
+
+    fn docs_freqs_enum(&self, entry: &TermEntry, needs_freq: bool) -> io::Result<SegmentDocIter> {
+        if needs_freq {
+            Ok(SegmentDocIter::Freqs(self.postings.docs_and_freqs(entry)?))
+        } else {
+            Ok(SegmentDocIter::Freqs(
+                self.postings.docs_and_freqs_no_freq(entry)?,
+            ))
+        }
+    }
+
+    fn positions_enum(&self, entry: &TermEntry) -> io::Result<SegmentDocIter> {
+        let en = self.postings.positions(entry)?;
+        Ok(SegmentDocIter::Phrase(PhraseDocIter::from_entries(
+            vec![(entry.doc_freq, 0, en)],
+            None,
+        )))
+    }
+
+    fn open_term_bitmap(&self, entry: &TermEntry) -> io::Result<Option<FrozenBitmap>> {
+        SegmentReader::open_term_bitmap(self, entry)
+    }
+
+    fn field_info(&self, name: &str) -> Option<&FieldInfo> {
+        self.field_infos.by_name(name)
+    }
+
+    fn field_has_freqs(&self, field: &str) -> Option<bool> {
+        SegmentReader::field_has_freqs(self, field)
+    }
+
+    fn terms_iter(&mut self, field: &str) -> Option<Box<dyn TermsIterAccess + '_>> {
+        let fi = self.field_infos.by_name(field)?;
+        let it = self.terms.terms_iter(fi);
+        Some(Box::new(DiskTermsIter { inner: it }))
+    }
+
+    fn points_reader(&self) -> Option<&dyn PointsAccess> {
+        self.points.as_ref().map(|p| p as &dyn PointsAccess)
+    }
+
+    fn numeric_dv(&self, field: &str, doc: u32) -> Option<i64> {
+        SegmentReader::numeric_dv(self, field, doc)
+    }
+
+    fn term_doc_freq(&self, entry: &TermEntry) -> u32 {
+        entry.doc_freq
     }
 }
 

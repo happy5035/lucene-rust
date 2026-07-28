@@ -194,9 +194,10 @@ impl DocIter for MemFreqsIter {
 
 // ── Internal postings wrapper ─────────────────────────────────────────
 
-enum PostingsIter {
+pub(crate) enum PostingsIter {
     Docs(DocsEnum),
     Freqs(DocsFreqsEnum),
+    Generic(Box<SegmentDocIter>),
 }
 impl PostingsIter {
     /// `needs_freq == false` over a DOCS_AND_FREQS field yields a no-freq
@@ -214,27 +215,35 @@ impl PostingsIter {
             Ok(PostingsIter::Docs(seg.docs_enum(entry)?))
         }
     }
+    /// Wrap a pre-built SegmentDocIter (from any LeafAccess source).
+    pub(crate) fn from_segment_iter(it: SegmentDocIter) -> Self {
+        PostingsIter::Generic(Box::new(it))
+    }
     fn doc_id(&self) -> i32 {
         match self {
             Self::Docs(d) => d.doc_id(),
             Self::Freqs(f) => f.doc_id(),
+            Self::Generic(g) => g.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
         match self {
             Self::Docs(d) => d.next_doc(),
             Self::Freqs(f) => f.next_doc(),
+            Self::Generic(g) => g.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
         match self {
             Self::Docs(d) => d.advance(t),
             Self::Freqs(f) => f.advance(t),
+            Self::Generic(g) => g.advance(t),
         }
     }
     fn freq(&self) -> u32 {
         match self {
             Self::Freqs(f) => f.freq(),
+            Self::Generic(g) => g.freq(),
             _ => 1,
         }
     }
@@ -263,6 +272,13 @@ impl ConjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
+        Self::from_iters(sub)
+    }
+
+    /// Construct from pre-built sub-iterators (generic over any LeafAccess
+    /// source). Primes every child; any exhausted child empties the whole
+    /// conjunction.
+    pub(crate) fn from_iters(mut sub: Vec<PostingsIter>) -> io::Result<Self> {
         for s in &mut sub {
             if s.next_doc()? == NO_MORE_DOCS {
                 return Ok(ConjunctionDocIter {
@@ -369,6 +385,12 @@ impl DisjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
+        Self::from_iters(sub)
+    }
+
+    /// Construct from pre-built sub-iterators (generic over any LeafAccess
+    /// source). Primes every child to its first doc.
+    pub(crate) fn from_iters(mut sub: Vec<PostingsIter>) -> io::Result<Self> {
         for s in &mut sub {
             s.next_doc()?;
         }
@@ -556,28 +578,43 @@ impl PhraseDocIter {
                 }
             }
         }
-        let approx = if all_bitmap {
-            let refs: Vec<&FrozenBitmap> = views.iter().collect();
-            PhraseApprox::Bitmap {
-                docs: codec_lucene9::roaring::intersect_docs(&refs),
-                cursor: 0,
-            }
-        } else {
-            PhraseApprox::Postings
-        };
-        let mut occ: Vec<Occurrence> = Vec::with_capacity(sought.len());
+        let approx_bitmaps = if all_bitmap { Some(views) } else { None };
+        let mut entries: Vec<(u32, u32, PositionsEnum)> = Vec::with_capacity(sought.len());
         for (_, offset, entry) in sought {
-            occ.push(Occurrence {
-                en: seg.positions_enum(&entry)?,
-                offset,
-            });
+            entries.push((entry.doc_freq, offset, seg.positions_enum(&entry)?));
         }
-        Ok(Some(PhraseDocIter {
+        Ok(Some(Self::from_entries(entries, approx_bitmaps)))
+    }
+
+    /// Construct from pre-built positions iterators (generic over any
+    /// LeafAccess source). `entries` is (doc_freq, offset, positions_enum)
+    /// sorted by doc_freq ascending (conjunction cost order).
+    /// `approx_bitmaps`: when all terms have inline bitmaps, the roaring AND
+    /// materialized candidate sequence; None → postings conjunction approx.
+    pub fn from_entries(
+        entries: Vec<(u32, u32, PositionsEnum)>,
+        approx_bitmaps: Option<Vec<FrozenBitmap>>,
+    ) -> PhraseDocIter {
+        let approx = match approx_bitmaps {
+            Some(views) => {
+                let refs: Vec<&FrozenBitmap> = views.iter().collect();
+                PhraseApprox::Bitmap {
+                    docs: codec_lucene9::roaring::intersect_docs(&refs),
+                    cursor: 0,
+                }
+            }
+            None => PhraseApprox::Postings,
+        };
+        let mut occ: Vec<Occurrence> = Vec::with_capacity(entries.len());
+        for (_, offset, en) in entries {
+            occ.push(Occurrence { en, offset });
+        }
+        PhraseDocIter {
             occ,
             approx,
             doc: -1,
             lead: 0,
-        }))
+        }
     }
 
     /// ExactPhraseMatcher (:138-167): collects each occurrence's positions

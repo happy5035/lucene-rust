@@ -77,6 +77,121 @@ impl DocIter for MatchAllIter {
     }
 }
 
+// ── Memory postings iterators ────────────────────────────────────────
+
+/// DocIter over a sorted Vec<u32> (postings from in-memory buffer).
+pub struct MemDocsIter {
+    docs: Vec<u32>,
+    pos: usize,
+    doc: i32,
+}
+
+impl MemDocsIter {
+    pub fn new(docs: Vec<u32>) -> Self {
+        Self { docs, pos: 0, doc: -1 }
+    }
+}
+
+impl DocIter for MemDocsIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.pos >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.pos] as i32;
+        self.pos += 1;
+        Ok(self.doc)
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.pos..].binary_search(&t) {
+            Ok(i) => {
+                self.pos += i;
+                self.doc = self.docs[self.pos] as i32;
+                self.pos += 1;
+            }
+            Err(i) => {
+                self.pos += i;
+                if self.pos >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.pos] as i32;
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+    fn freq(&self) -> u32 {
+        1
+    }
+}
+
+/// DocIter over (doc, freq) pairs from in-memory buffer.
+pub struct MemFreqsIter {
+    docs: Vec<u32>,
+    freqs: Vec<u32>,
+    pos: usize,
+    doc: i32,
+    cur_freq: u32,
+}
+
+impl MemFreqsIter {
+    pub fn new(docs: Vec<u32>, freqs: Vec<u32>) -> Self {
+        Self { docs, freqs, pos: 0, doc: -1, cur_freq: 1 }
+    }
+}
+
+impl DocIter for MemFreqsIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.pos >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.pos] as i32;
+        self.cur_freq = self.freqs[self.pos];
+        self.pos += 1;
+        Ok(self.doc)
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.pos..].binary_search(&t) {
+            Ok(i) => {
+                self.pos += i;
+                self.doc = self.docs[self.pos] as i32;
+                self.cur_freq = self.freqs[self.pos];
+                self.pos += 1;
+            }
+            Err(i) => {
+                self.pos += i;
+                if self.pos >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.pos] as i32;
+                    self.cur_freq = self.freqs[self.pos];
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+    fn freq(&self) -> u32 {
+        self.cur_freq
+    }
+}
+
 // ── Internal postings wrapper ─────────────────────────────────────────
 
 enum PostingsIter {
@@ -1507,6 +1622,8 @@ pub enum SegmentDocIter {
     ConjOver(ConjOverDocIter),
     DisjOver(DisjOverDocIter),
     Excluding(ExcludingDocIter),
+    MemDocs(MemDocsIter),
+    MemFreqs(MemFreqsIter),
 }
 
 impl DocIter for SegmentDocIter {
@@ -1526,6 +1643,8 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.doc_id(),
             Self::DisjOver(d) => d.doc_id(),
             Self::Excluding(e) => e.doc_id(),
+            Self::MemDocs(m) => m.doc_id(),
+            Self::MemFreqs(m) => m.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -1544,6 +1663,8 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.next_doc(),
             Self::DisjOver(d) => d.next_doc(),
             Self::Excluding(e) => e.next_doc(),
+            Self::MemDocs(m) => m.next_doc(),
+            Self::MemFreqs(m) => m.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -1562,11 +1683,14 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.advance(t),
             Self::DisjOver(d) => d.advance(t),
             Self::Excluding(e) => e.advance(t),
+            Self::MemDocs(m) => m.advance(t),
+            Self::MemFreqs(m) => m.advance(t),
         }
     }
     fn freq(&self) -> u32 {
         match self {
             Self::Freqs(f) => f.freq(),
+            Self::MemFreqs(m) => m.freq(),
             Self::And(a) => a.freq(),
             Self::Or(o) => o.freq(),
             _ => 1,

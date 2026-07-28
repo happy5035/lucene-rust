@@ -8,12 +8,9 @@
 
 use std::io;
 
-use codec_lucene9::postings_read::NO_MORE_DOCS;
-
 use crate::doc_writer::{DocWriter, FieldBuf};
 use crate::document::{Document, FieldValue};
 use crate::schema::Schema;
-use crate::search::doc_iter::DocIter;
 use crate::search::query::{Occur, Query};
 use crate::search::Collector;
 
@@ -206,109 +203,6 @@ impl<'a> LeafReader for MemoryLeafReader<'a> {
             .iter()
             .find(|(name, _)| name == field)
             .map(|(_, v)| v.clone())
-    }
-}
-
-// ── Memory DocIter implementations ───────────────────────────────────
-
-/// DocIter over a sorted Vec<u32> (postings from memory).
-pub struct MemDocsIter {
-    docs: Vec<u32>,
-    pos: usize,
-    doc: i32,
-}
-
-impl MemDocsIter {
-    pub fn new(docs: Vec<u32>) -> Self {
-        Self { docs, pos: 0, doc: -1 }
-    }
-}
-
-impl DocIter for MemDocsIter {
-    fn doc_id(&self) -> i32 {
-        self.doc
-    }
-    fn next_doc(&mut self) -> io::Result<i32> {
-        if self.pos >= self.docs.len() {
-            self.doc = NO_MORE_DOCS;
-            return Ok(NO_MORE_DOCS);
-        }
-        self.doc = self.docs[self.pos] as i32;
-        self.pos += 1;
-        Ok(self.doc)
-    }
-    fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if self.doc >= target {
-            return Ok(self.doc);
-        }
-        let t = target.max(0) as u32;
-        // Skip forward
-        while self.pos < self.docs.len() && self.docs[self.pos] < t {
-            self.pos += 1;
-        }
-        if self.pos >= self.docs.len() {
-            self.doc = NO_MORE_DOCS;
-        } else {
-            self.doc = self.docs[self.pos] as i32;
-            self.pos += 1;
-        }
-        Ok(self.doc)
-    }
-    fn freq(&self) -> u32 {
-        1
-    }
-}
-
-/// DocIter over (doc, freq) pairs from memory.
-pub struct MemFreqsIter {
-    docs: Vec<u32>,
-    freqs: Vec<u32>,
-    pos: usize,
-    doc: i32,
-    cur_freq: u32,
-}
-
-impl MemFreqsIter {
-    pub fn new(pairs: Vec<(u32, u32)>) -> Self {
-        let docs = pairs.iter().map(|&(d, _)| d).collect();
-        let freqs = pairs.iter().map(|&(_, f)| f).collect();
-        Self { docs, freqs, pos: 0, doc: -1, cur_freq: 1 }
-    }
-}
-
-impl DocIter for MemFreqsIter {
-    fn doc_id(&self) -> i32 {
-        self.doc
-    }
-    fn next_doc(&mut self) -> io::Result<i32> {
-        if self.pos >= self.docs.len() {
-            self.doc = NO_MORE_DOCS;
-            return Ok(NO_MORE_DOCS);
-        }
-        self.doc = self.docs[self.pos] as i32;
-        self.cur_freq = self.freqs[self.pos];
-        self.pos += 1;
-        Ok(self.doc)
-    }
-    fn advance(&mut self, target: i32) -> io::Result<i32> {
-        if self.doc >= target {
-            return Ok(self.doc);
-        }
-        let t = target.max(0) as u32;
-        while self.pos < self.docs.len() && self.docs[self.pos] < t {
-            self.pos += 1;
-        }
-        if self.pos >= self.docs.len() {
-            self.doc = NO_MORE_DOCS;
-        } else {
-            self.doc = self.docs[self.pos] as i32;
-            self.cur_freq = self.freqs[self.pos];
-            self.pos += 1;
-        }
-        Ok(self.doc)
-    }
-    fn freq(&self) -> u32 {
-        self.cur_freq
     }
 }
 

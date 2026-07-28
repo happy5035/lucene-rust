@@ -19,6 +19,7 @@ pub mod doc_values;
 pub mod doc_values_read;
 pub mod field_infos;
 pub mod fst;
+pub mod automaton;
 pub mod io;
 pub mod packed;
 pub mod points;

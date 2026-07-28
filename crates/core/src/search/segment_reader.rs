@@ -4,6 +4,7 @@
 
 use std::io;
 
+use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::directory::FSDirectory;
 use codec_lucene9::doc_values_read::DocValuesReader;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
@@ -17,7 +18,7 @@ use codec_lucene9::terms_read::{TermEntry, TermsDict, TermsIter};
 const DV_SUFFIX: &str = "Lucene90_0";
 
 use super::doc_iter::{PhraseDocIter, PositionsEnumLike, SegmentDocIter};
-use super::leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
+use super::leaf_access::{LeafAccess, PointsAccess, TermsIterAccess};
 
 pub struct SegmentReader {
     dir: FSDirectory,
@@ -232,21 +233,13 @@ struct DiskTermsIter<'a> {
 }
 
 impl TermsIterAccess for DiskTermsIter<'_> {
+    type TermHandle = TermEntry;
+
     fn seek_ceil(&mut self, target: &[u8]) -> io::Result<bool> {
         self.inner.seek_ceil(target)
     }
-    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntryLike)>> {
-        match self.inner.next()? {
-            Some((term, entry)) => Ok(Some((
-                term,
-                TermEntryLike {
-                    doc_freq: entry.doc_freq,
-                    total_term_freq: entry.total_term_freq,
-                    handle: 0, // not used for disk path
-                },
-            ))),
-            None => Ok(None),
-        }
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntry)>> {
+        self.inner.next()
     }
 }
 
@@ -329,10 +322,26 @@ impl LeafAccess for SegmentReader {
         SegmentReader::field_has_freqs(self, field)
     }
 
-    fn terms_iter(&mut self, field: &str) -> Option<Box<dyn TermsIterAccess + '_>> {
+    fn terms_iter(
+        &mut self,
+        field: &str,
+    ) -> Option<Box<dyn TermsIterAccess<TermHandle = TermEntry> + '_>> {
         Some(Box::new(DiskTermsIter {
             inner: SegmentReader::terms_iter(self, field)?,
         }))
+    }
+
+    fn intersect_terms(
+        &mut self,
+        field: &str,
+        dfa: &WildcardDfa,
+    ) -> io::Result<Option<Vec<(Vec<u8>, TermEntry)>>> {
+        let fi = match self.field_infos.by_name(field) {
+            Some(fi) => fi,
+            None => return Ok(None),
+        };
+        let results = self.terms.intersect(fi, dfa)?;
+        Ok(Some(results))
     }
 
     fn points_reader(&self) -> Option<&dyn PointsAccess> {

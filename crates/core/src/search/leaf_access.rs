@@ -4,28 +4,22 @@
 
 use std::io;
 
+use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::field_infos::FieldInfo;
 use codec_lucene9::roaring::FrozenBitmap;
 
 use super::doc_iter::SegmentDocIter;
 
-/// Lightweight term metadata returned by TermsIterAccess::next().
-/// Disk side wraps TermEntry; memory side wraps term_id.
-#[derive(Clone, Debug)]
-pub struct TermEntryLike {
-    pub doc_freq: u32,
-    pub total_term_freq: u64,
-    /// Opaque handle for the concrete LeafAccess impl to interpret.
-    /// Disk: index into TermsDict; Memory: term_id in TermDict.
-    pub handle: u64,
-}
-
 /// Unified term enumeration interface (disk FST streaming / memory sorted array).
+/// The associated TermHandle matches the concrete LeafAccess::TermHandle so
+/// enumeration yields directly usable postings handles without re-seeking.
 pub trait TermsIterAccess {
+    type TermHandle;
+
     /// Seek to the first term >= target. Returns true if a term was found.
     fn seek_ceil(&mut self, target: &[u8]) -> io::Result<bool>;
     /// Advance to the next term. Returns None when exhausted.
-    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntryLike)>>;
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, Self::TermHandle)>>;
 }
 
 /// Unified points interface (disk BKD tree / memory linear scan).
@@ -97,8 +91,20 @@ pub trait LeafAccess {
     /// Whether the field indexes freqs (IndexOptions >= DOCS_AND_FREQS).
     fn field_has_freqs(&self, field: &str) -> Option<bool>;
 
-    /// Term enumeration for prefix/wildcard queries.
-    fn terms_iter(&mut self, field: &str) -> Option<Box<dyn TermsIterAccess + '_>>;
+    /// Term enumeration for prefix/wildcard queries. Yields concrete handles.
+    fn terms_iter(
+        &mut self,
+        field: &str,
+    ) -> Option<Box<dyn TermsIterAccess<TermHandle = Self::TermHandle> + '_>>;
+
+    /// DFA-guided term enumeration. Disk side uses FST intersection;
+    /// memory side uses linear scan + DFA filter.
+    /// Returns None if field is unknown.
+    fn intersect_terms(
+        &mut self,
+        field: &str,
+        dfa: &WildcardDfa,
+    ) -> io::Result<Option<Vec<(Vec<u8>, Self::TermHandle)>>>;
 
     /// Points reader for range queries.
     fn points_reader(&self) -> Option<&dyn PointsAccess>;

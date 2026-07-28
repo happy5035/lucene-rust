@@ -3,6 +3,7 @@
 
 use std::io;
 
+use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::roaring::FrozenBitmap;
 
@@ -11,7 +12,7 @@ use crate::schema::Schema;
 use crate::search::doc_iter::{
     MemDocsIter, MemFreqsIter, MemPositionsEnum, PhraseDocIter, PositionsEnumLike, SegmentDocIter,
 };
-use crate::search::leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
+use crate::search::leaf_access::{LeafAccess, PointsAccess, TermsIterAccess};
 
 /// Term handle for in-memory postings.
 #[derive(Clone, Debug)]
@@ -139,10 +140,47 @@ impl<'a> LeafAccess for MemoryLeafAccess<'a> {
         })
     }
 
-    fn terms_iter(&mut self, field: &str) -> Option<Box<dyn TermsIterAccess + '_>> {
-        let buf = self.field_buf(field)?;
+    fn terms_iter(
+        &mut self,
+        field: &str,
+    ) -> Option<Box<dyn TermsIterAccess<TermHandle = MemTermHandle> + '_>> {
+        let field_number = self.dw.fields().iter().position(|f| f.name == field)? as u32;
+        let buf = self.dw.field_buffer(field_number)?;
         let dict = buf.dict.as_ref()?;
-        Some(Box::new(MemTermsIter::new(dict)))
+        Some(Box::new(MemTermsIter::new(dict, field_number)))
+    }
+
+    fn intersect_terms(
+        &mut self,
+        field: &str,
+        dfa: &WildcardDfa,
+    ) -> io::Result<Option<Vec<(Vec<u8>, MemTermHandle)>>> {
+        let field_number = match self.dw.fields().iter().position(|f| f.name == field) {
+            Some(n) => n as u32,
+            None => return Ok(None),
+        };
+        let buf = match self.dw.field_buffer(field_number) {
+            Some(b) => b,
+            None => return Ok(Some(Vec::new())),
+        };
+        let dict = match buf.dict.as_ref() {
+            Some(d) => d,
+            None => return Ok(Some(Vec::new())),
+        };
+        let mut results = Vec::new();
+        for id in dict.sorted_ids() {
+            let bytes = dict.bytes_of(id);
+            if dfa.accepts(bytes) {
+                let pb = dict.postings(id);
+                let doc_freq = pb.docs.len() as u32;
+                let total_term_freq: u64 = pb.freqs.iter().map(|&f| f as u64).sum();
+                results.push((
+                    bytes.to_vec(),
+                    MemTermHandle { field_number, term_id: id, doc_freq, total_term_freq },
+                ));
+            }
+        }
+        Ok(Some(results))
     }
 
     fn points_reader(&self) -> Option<&dyn PointsAccess> {
@@ -164,17 +202,20 @@ impl<'a> LeafAccess for MemoryLeafAccess<'a> {
 struct MemTermsIter<'a> {
     dict: &'a crate::doc_writer::TermDict,
     sorted_ids: Vec<u32>,
+    field_number: u32,
     pos: usize,
 }
 
 impl<'a> MemTermsIter<'a> {
-    fn new(dict: &'a crate::doc_writer::TermDict) -> Self {
+    fn new(dict: &'a crate::doc_writer::TermDict, field_number: u32) -> Self {
         let sorted_ids = dict.sorted_ids();
-        MemTermsIter { dict, sorted_ids, pos: 0 }
+        MemTermsIter { dict, sorted_ids, field_number, pos: 0 }
     }
 }
 
 impl TermsIterAccess for MemTermsIter<'_> {
+    type TermHandle = MemTermHandle;
+
     fn seek_ceil(&mut self, target: &[u8]) -> io::Result<bool> {
         let result = self.sorted_ids[self.pos..].binary_search_by(|&id| {
             self.dict.bytes_of(id).cmp(target)
@@ -191,7 +232,7 @@ impl TermsIterAccess for MemTermsIter<'_> {
         }
     }
 
-    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntryLike)>> {
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, MemTermHandle)>> {
         if self.pos >= self.sorted_ids.len() {
             return Ok(None);
         }
@@ -203,7 +244,12 @@ impl TermsIterAccess for MemTermsIter<'_> {
         let total_term_freq: u64 = pb.freqs.iter().map(|&f| f as u64).sum();
         Ok(Some((
             bytes,
-            TermEntryLike { doc_freq, total_term_freq, handle: id as u64 },
+            MemTermHandle {
+                field_number: self.field_number,
+                term_id: id,
+                doc_freq,
+                total_term_freq,
+            },
         )))
     }
 }

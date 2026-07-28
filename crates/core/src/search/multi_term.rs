@@ -11,9 +11,8 @@ use std::io;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::bitset::FixedBitSet;
-use super::doc_iter::{BitsetDocIter, DocIter, SegmentDocIter};
+use super::doc_iter::{BitsetDocIter, DisjunctionDocIter, DocIter, PostingsIter, SegmentDocIter};
 use super::leaf_access::LeafAccess;
-use super::query::Query;
 
 /// AbstractMultiTermQueryConstantScoreWrapper.java:44.
 pub(crate) const BOOLEAN_REWRITE_THRESHOLD: usize = 16;
@@ -74,10 +73,7 @@ pub(crate) fn collect_direct<L: LeafAccess>(
 /// Prefix collection (spec §3): seek_ceil(prefix) then next() until
 /// !starts_with(prefix). `None` = unknown field (empty-hit semantics).
 ///
-/// The trait `terms_iter` yields `TermEntryLike` (opaque metadata), so the
-/// matching term bytes are enumerated first and then re-sought via
-/// `seek_term` to materialize the concrete `L::TermHandle` needed for
-/// postings access.
+/// The iterator yields concrete `L::TermHandle` directly — no re-seek needed.
 pub(crate) fn collect_prefix<L: LeafAccess>(
     seg: &mut L,
     field: &str,
@@ -86,29 +82,27 @@ pub(crate) fn collect_prefix<L: LeafAccess>(
     let Some(has_freqs) = seg.field_has_freqs(field) else {
         return Ok(None);
     };
-    let mut matched: Vec<Vec<u8>> = Vec::new();
+    let mut pairs: Vec<(Vec<u8>, L::TermHandle)> = Vec::new();
     {
         let Some(mut it) = seg.terms_iter(field) else {
             return Ok(None);
         };
         it.seek_ceil(prefix)?;
-        while let Some((term, _)) = it.next()? {
+        while let Some((term, handle)) = it.next()? {
             if !term.starts_with(prefix) {
                 break;
             }
-            matched.push(term);
+            pairs.push((term, handle));
         }
     }
     let mut collected = CollectedTerms {
-        terms: Vec::new(),
-        entries: Vec::new(),
+        terms: Vec::with_capacity(pairs.len()),
+        entries: Vec::with_capacity(pairs.len()),
     };
-    for t in matched {
-        if let Some((_, entry)) = seg.seek_term(field, &t)? {
-            let df = seg.term_doc_freq(&entry);
-            collected.entries.push((df, entry));
-            collected.terms.push(t);
-        }
+    for (term, handle) in pairs {
+        let df = seg.term_doc_freq(&handle);
+        collected.terms.push(term);
+        collected.entries.push((df, handle));
     }
     collected.sort_by_df();
     Ok(Some((has_freqs, collected)))
@@ -132,6 +126,7 @@ pub(crate) struct WildcardPattern {
     pub pattern: Vec<u8>,
     pub prefix: Vec<u8>,
     pub class: WildcardClass,
+    pattern_chars: Vec<char>,
 }
 
 impl WildcardPattern {
@@ -151,10 +146,15 @@ impl WildcardPattern {
         } else {
             WildcardClass::PrefixFilter
         };
+        let pattern_chars = match std::str::from_utf8(pattern) {
+            Ok(s) => s.chars().collect(),
+            Err(_) => Vec::new(),
+        };
         WildcardPattern {
             pattern: pattern.to_vec(),
             prefix,
             class,
+            pattern_chars,
         }
     }
 
@@ -162,30 +162,27 @@ impl WildcardPattern {
         match self.class {
             WildcardClass::Exact => term == self.pattern.as_slice(),
             WildcardClass::PurePrefix => term.starts_with(&self.prefix),
-            _ => match std::str::from_utf8(&self.pattern) {
-                Ok(p) => glob_match(p, term),
-                Err(_) => false, // non-UTF-8 pattern: matches nothing
-            },
+            _ => glob_match(&self.pattern_chars, term),
         }
     }
 }
 
-/// Classic two-pointer glob with '*' backtracking, iterated over `char`s so
-/// '?' matches exactly one code point (WildcardQuery.toAutomaton :84-114:
-/// WILDCARD_CHAR → Automata.makeAnyChar, WILDCARD_STRING → makeAnyString).
-pub(crate) fn glob_match(pattern: &str, text: &[u8]) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = match std::str::from_utf8(text) {
-        Ok(s) => s.chars().collect(),
+/// Two-pointer glob with '*' backtracking over chars. '?' matches exactly
+/// one code point. Pattern chars are pre-collected by the caller (once per
+/// query); text is iterated lazily via from_utf8 + char_indices (no Vec).
+pub(crate) fn glob_match(pattern: &[char], text: &[u8]) -> bool {
+    let t: &str = match std::str::from_utf8(text) {
+        Ok(s) => s,
         Err(_) => return false,
     };
+    let tchars: Vec<char> = t.chars().collect();
     let (mut i, mut j) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text retry idx)
-    while j < t.len() {
-        if i < p.len() && (p[i] == '?' || p[i] == t[j]) {
+    let mut star: Option<(usize, usize)> = None;
+    while j < tchars.len() {
+        if i < pattern.len() && (pattern[i] == '?' || pattern[i] == tchars[j]) {
             i += 1;
             j += 1;
-        } else if i < p.len() && p[i] == '*' {
+        } else if i < pattern.len() && pattern[i] == '*' {
             star = Some((i + 1, j));
             i += 1;
         } else if let Some((si, sj)) = star {
@@ -196,10 +193,10 @@ pub(crate) fn glob_match(pattern: &str, text: &[u8]) -> bool {
             return false;
         }
     }
-    while i < p.len() && p[i] == '*' {
+    while i < pattern.len() && pattern[i] == '*' {
         i += 1;
     }
-    i == p.len()
+    i == pattern.len()
 }
 
 /// Wildcard collection (spec §5): Exact → direct seek; PurePrefix → prefix
@@ -217,33 +214,18 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
             let Some(has_freqs) = seg.field_has_freqs(field) else {
                 return Ok(None);
             };
-            let mut matched: Vec<Vec<u8>> = Vec::new();
-            {
-                let Some(mut it) = seg.terms_iter(field) else {
-                    return Ok(None);
-                };
-                if pat.class == WildcardClass::PrefixFilter {
-                    it.seek_ceil(&pat.prefix)?;
-                }
-                while let Some((term, _)) = it.next()? {
-                    if pat.class == WildcardClass::PrefixFilter && !term.starts_with(&pat.prefix) {
-                        break;
-                    }
-                    if pat.matches(&term) {
-                        matched.push(term);
-                    }
-                }
-            }
-            let mut collected = CollectedTerms {
-                terms: Vec::new(),
-                entries: Vec::new(),
+            let dfa = codec_lucene9::automaton::WildcardDfa::compile(&pat.pattern);
+            let Some(results) = seg.intersect_terms(field, &dfa)? else {
+                return Ok(None);
             };
-            for t in matched {
-                if let Some((_, entry)) = seg.seek_term(field, &t)? {
-                    let df = seg.term_doc_freq(&entry);
-                    collected.entries.push((df, entry));
-                    collected.terms.push(t);
-                }
+            let mut collected = CollectedTerms {
+                terms: Vec::with_capacity(results.len()),
+                entries: Vec::with_capacity(results.len()),
+            };
+            for (term, handle) in results {
+                let df = seg.term_doc_freq(&handle);
+                collected.terms.push(term);
+                collected.entries.push((df, handle));
             }
             collected.sort_by_df();
             Ok(Some((has_freqs, collected)))
@@ -251,11 +233,11 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
     }
 }
 
-/// Threshold dispatch (spec §4): <=16 terms rewrite to `Query::Or` (heap
-/// merge, zero new execution code); >16 materialize a FixedBitSet.
+/// Threshold dispatch (spec §4): <=16 terms build a DisjunctionDocIter
+/// directly from collected handles (no re-seek); >16 materialize a FixedBitSet.
 pub(crate) fn segment_iterator<L: LeafAccess>(
     seg: &mut L,
-    field: &str,
+    _field: &str,
     has_freqs: bool,
     collected: &CollectedTerms<L::TermHandle>,
     needs_freq: bool,
@@ -264,11 +246,16 @@ pub(crate) fn segment_iterator<L: LeafAccess>(
         return Ok(None);
     }
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
-        return Query::Or {
-            field: field.to_string(),
-            terms: collected.terms.clone(),
+        let mut sub = Vec::with_capacity(collected.len());
+        for (_, entry) in &collected.entries {
+            let it = if has_freqs {
+                seg.docs_freqs_enum(entry, needs_freq)?
+            } else {
+                seg.docs_enum(entry)?
+            };
+            sub.push(PostingsIter::from_segment_iter(it));
         }
-        .segment_iterator(seg, needs_freq);
+        return Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::from_iters(sub)?)));
     }
     let bits = materialize(seg, &collected.entries, has_freqs)?;
     Ok(Some(SegmentDocIter::Bitset(BitsetDocIter::new(bits))))
@@ -339,42 +326,47 @@ pub(crate) fn materialize<L: LeafAccess>(
 mod tests {
     use super::*;
 
+    fn gm(pattern: &str, text: &[u8]) -> bool {
+        let chars: Vec<char> = pattern.chars().collect();
+        glob_match(&chars, text)
+    }
+
     #[test]
     fn glob_match_basics() {
-        assert!(glob_match("foo*", b"foo"));
-        assert!(glob_match("foo*", b"foobar"));
-        assert!(!glob_match("foo*", b"fo"));
-        assert!(glob_match("fo?o", b"fooo"));
-        assert!(!glob_match("fo?o", b"foo")); // ? matches exactly one char
-        assert!(!glob_match("fo?o", b"fooxo"));
-        assert!(glob_match("*foo", b"foo"));
-        assert!(glob_match("*foo", b"barfoo"));
-        assert!(!glob_match("*foo", b"foob"));
-        assert!(glob_match("*", b"anything"));
-        assert!(glob_match("*", b""));
-        assert!(glob_match("a*b*c", b"aXbYc"));
-        assert!(glob_match("a*b*c", b"abc"));
-        assert!(!glob_match("a*b*c", b"acb"));
-        assert!(glob_match("que?y3*", b"query39"));
-        assert!(!glob_match("que?y3*", b"queue39"));
+        assert!(gm("foo*", b"foo"));
+        assert!(gm("foo*", b"foobar"));
+        assert!(!gm("foo*", b"fo"));
+        assert!(gm("fo?o", b"fooo"));
+        assert!(!gm("fo?o", b"foo")); // ? matches exactly one char
+        assert!(!gm("fo?o", b"fooxo"));
+        assert!(gm("*foo", b"foo"));
+        assert!(gm("*foo", b"barfoo"));
+        assert!(!gm("*foo", b"foob"));
+        assert!(gm("*", b"anything"));
+        assert!(gm("*", b""));
+        assert!(gm("a*b*c", b"aXbYc"));
+        assert!(gm("a*b*c", b"abc"));
+        assert!(!gm("a*b*c", b"acb"));
+        assert!(gm("que?y3*", b"query39"));
+        assert!(!gm("que?y3*", b"queue39"));
         // consecutive stars collapse semantically
-        assert!(glob_match("a**b", b"aXXb"));
+        assert!(gm("a**b", b"aXXb"));
         // literal star-less patterns are exact
-        assert!(glob_match("abc", b"abc"));
-        assert!(!glob_match("abc", b"abd"));
+        assert!(gm("abc", b"abc"));
+        assert!(!gm("abc", b"abd"));
     }
 
     #[test]
     fn glob_match_chars_semantics() {
         // '?' is one Unicode code point (WildcardQuery.toAutomaton :96-97),
         // not one byte
-        assert!(glob_match("h?llo", "héllo".as_bytes()));
-        assert!(!glob_match("h?llx", "héllo".as_bytes()));
-        assert!(glob_match("h*llo", "héllo".as_bytes()));
+        assert!(gm("h?llo", "héllo".as_bytes()));
+        assert!(!gm("h?llx", "héllo".as_bytes()));
+        assert!(gm("h*llo", "héllo".as_bytes()));
         // multi-byte star content
-        assert!(glob_match("*", "héllo".as_bytes()));
+        assert!(gm("*", "héllo".as_bytes()));
         // invalid UTF-8 term bytes never match a filter pattern
-        assert!(!glob_match("h?llo", b"h\xffllo"));
+        assert!(!gm("h?llo", b"h\xffllo"));
     }
 
     #[test]

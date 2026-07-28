@@ -11,6 +11,7 @@ pub mod reader;
 pub(crate) mod roaring_exec;
 pub mod searcher;
 pub mod segment_reader;
+pub mod sorted_collector;
 
 pub use bitset::FixedBitSet;
 pub use collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
@@ -19,6 +20,7 @@ pub use query::{Occur, Query};
 pub use reader::Reader;
 pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
+pub use sorted_collector::{SearchResults, SortedTopN};
 
 #[cfg(test)]
 mod tests {

@@ -12,6 +12,7 @@ use std::io;
 use crate::codec_util::{check_footer, check_footer_structure, check_index_header, corrupt};
 use crate::directory::FSDirectory;
 use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
+use crate::automaton::{DEAD, WildcardDfa};
 use crate::fst::{FstMetadata, FstReader};
 use crate::io::{DataInput, IndexInput};
 use crate::postings::{
@@ -416,6 +417,118 @@ impl TermsDict {
     /// never postings. Terms arrive in dictionary (byte) order.
     pub fn terms_iter(&mut self, field: &FieldInfo) -> TermsIter<'_> {
         TermsIter::new(self, field)
+    }
+
+    /// Enumerate all terms in `field` accepted by the DFA.
+    /// Uses FST intersection to prune non-matching subtrees, then verifies
+    /// full terms within candidate blocks. Reuses `load_frame_block` and
+    /// `next_frame_entry` for block decoding.
+    pub fn intersect(
+        &mut self,
+        field: &FieldInfo,
+        dfa: &WildcardDfa,
+    ) -> io::Result<Vec<(Vec<u8>, TermEntry)>> {
+        let field_index = match self.fields.iter().position(|f| f.field_number == field.number) {
+            Some(i) => i,
+            None => return Ok(Vec::new()),
+        };
+
+        let has_freqs = field.index_options != IndexOptions::Docs;
+        let has_positions = field_has_positions(field);
+        let mut results: Vec<(Vec<u8>, TermEntry)> = Vec::new();
+
+        // Always scan the root block (FST only covers sub-blocks).
+        let root_code = self.fields[field_index].root_code.clone();
+        let mut root_in = IndexInput::in_memory(root_code);
+        let root_fp = read_msb_vlong(&mut root_in)? >> 2;
+        self.intersect_scan_block(
+            root_fp,
+            0,
+            &[],
+            0, // DFA start state
+            dfa,
+            has_freqs,
+            has_positions,
+            &mut results,
+        )?;
+
+        // Scan FST candidate blocks (sub-blocks pruned by DFA).
+        let candidates = self.fst(field_index)?.intersect_candidates(dfa)?;
+        for candidate in &candidates {
+            let mut out_in = IndexInput::in_memory(candidate.output.clone());
+            let code = read_msb_vlong(&mut out_in)?;
+            let fp = code >> 2;
+            self.intersect_scan_block(
+                fp,
+                candidate.depth,
+                &candidate.prefix,
+                candidate.dfa_state,
+                dfa,
+                has_freqs,
+                has_positions,
+                &mut results,
+            )?;
+        }
+
+        Ok(results)
+    }
+
+    /// Helper: load a block at `fp` (and its floor siblings), scan term
+    /// entries, verify suffixes against the DFA from `dfa_state`, and push
+    /// accepted terms into `results`. Sub-block entries are skipped (they
+    /// appear as separate FST candidates).
+    #[allow(clippy::too_many_arguments)]
+    fn intersect_scan_block(
+        &mut self,
+        fp: u64,
+        prefix_len: usize,
+        prefix: &[u8],
+        dfa_state: u32,
+        dfa: &WildcardDfa,
+        has_freqs: bool,
+        has_positions: bool,
+        results: &mut Vec<(Vec<u8>, TermEntry)>,
+    ) -> io::Result<()> {
+        let mut frame = IterFrame::new(prefix_len, fp);
+        load_frame_block(&mut self.tim_in, &mut frame)?;
+
+        loop {
+            while let Some((off, len, entry)) =
+                next_frame_entry(&mut frame, has_freqs, has_positions)?
+            {
+                match entry {
+                    NextEntry::SubBlock(_) => {
+                        // Sub-blocks have their own FST entries and will
+                        // appear as separate candidates; skip here.
+                    }
+                    NextEntry::Term(te) => {
+                        let suffix = &frame.suffix_bytes[off..off + len];
+                        // DFA verification: run from dfa_state on the suffix.
+                        let mut state = dfa_state;
+                        let mut matched = true;
+                        for &b in suffix {
+                            state = dfa.transition(state, b);
+                            if state == DEAD {
+                                matched = false;
+                                break;
+                            }
+                        }
+                        if matched && dfa.is_accept(state) {
+                            let mut full_term = prefix.to_vec();
+                            full_term.extend_from_slice(suffix);
+                            results.push((full_term, te));
+                        }
+                    }
+                }
+            }
+            // Chain floor siblings (consecutive in .tim)
+            if frame.is_last_in_floor {
+                break;
+            }
+            frame.fp = frame.fp_end;
+            load_frame_block(&mut self.tim_in, &mut frame)?;
+        }
+        Ok(())
     }
 }
 
@@ -1181,6 +1294,89 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 201);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn intersect_matches_seek_exact() {
+        use crate::automaton::WildcardDfa;
+
+        let root = temp_dir("intersect");
+        let dir = FSDirectory::open(&root).unwrap();
+        let fis = write_segment(&dir);
+        let mut dict = TermsDict::open(&dir, "_0", &[3u8; 16], &fis).unwrap();
+        let kw = fis.by_name("kw").unwrap();
+
+        // Pattern "t0*" should match t000..t099 (100 terms)
+        let dfa = WildcardDfa::compile(b"t0*");
+        let results = dict.intersect(kw, &dfa).unwrap();
+        let mut matched: Vec<Vec<u8>> = results.iter().map(|(t, _)| t.clone()).collect();
+        matched.sort();
+        assert_eq!(matched.len(), 100);
+        for (i, t) in matched.iter().enumerate() {
+            assert_eq!(t, &format!("t{i:03}").into_bytes(), "position {i}");
+        }
+
+        // Verify TermEntry matches seek_exact for a sample
+        for (term, entry) in results.iter().take(10) {
+            let expected = dict.seek_exact(kw, term).unwrap().unwrap();
+            assert_eq!(entry.doc_freq, expected.doc_freq, "term {:?}", term);
+            assert_eq!(
+                entry.state.doc_start_fp, expected.state.doc_start_fp,
+                "term {:?}",
+                term
+            );
+        }
+
+        // Pattern "t2*" should match t200..t299 (100 terms)
+        let dfa2 = WildcardDfa::compile(b"t2*");
+        let results2 = dict.intersect(kw, &dfa2).unwrap();
+        assert_eq!(results2.len(), 100);
+        let mut matched2: Vec<Vec<u8>> = results2.iter().map(|(t, _)| t.clone()).collect();
+        matched2.sort();
+        for (i, t) in matched2.iter().enumerate() {
+            assert_eq!(t, &format!("t{:03}", 200 + i).into_bytes(), "position {i}");
+        }
+
+        // Pattern "t?9*" should match t090..t099, t190..t199, t290..t299 (30 terms)
+        let dfa3 = WildcardDfa::compile(b"t?9*");
+        let results3 = dict.intersect(kw, &dfa3).unwrap();
+        let mut matched3: Vec<Vec<u8>> = results3.iter().map(|(t, _)| t.clone()).collect();
+        matched3.sort();
+        assert_eq!(matched3.len(), 30);
+        // spot check
+        assert!(matched3.contains(&b"t090".to_vec()));
+        assert!(matched3.contains(&b"t099".to_vec()));
+        assert!(matched3.contains(&b"t190".to_vec()));
+        assert!(matched3.contains(&b"t299".to_vec()));
+        assert!(!matched3.contains(&b"t100".to_vec()));
+
+        // Pattern "z*" should match nothing
+        let dfa4 = WildcardDfa::compile(b"z*");
+        let results4 = dict.intersect(kw, &dfa4).unwrap();
+        assert!(results4.is_empty());
+
+        // Pattern "a" (exact, no wildcard) should match only "a"
+        let dfa5 = WildcardDfa::compile(b"a");
+        let results5 = dict.intersect(kw, &dfa5).unwrap();
+        assert_eq!(results5.len(), 1);
+        assert_eq!(results5[0].0, b"a".to_vec());
+        assert_eq!(results5[0].1.doc_freq, 1);
+
+        // tx field: "h*" matches "hello"
+        let tx = fis.by_name("tx").unwrap();
+        let dfa6 = WildcardDfa::compile(b"h*");
+        let results6 = dict.intersect(tx, &dfa6).unwrap();
+        assert_eq!(results6.len(), 1);
+        assert_eq!(results6[0].0, b"hello".to_vec());
+        assert_eq!(results6[0].1.doc_freq, 200);
+
+        // field without a .tmd record yields empty
+        let ghost = indexed("ghost", 99, IndexOptions::Docs);
+        let dfa7 = WildcardDfa::compile(b"*");
+        let results7 = dict.intersect(&ghost, &dfa7).unwrap();
+        assert!(results7.is_empty());
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

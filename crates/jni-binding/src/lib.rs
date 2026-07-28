@@ -16,6 +16,8 @@
 //! Example:
 //! `timestamp:longpoint+numericdv+stored,level:keyword+sorteddv,message:text+positions,latency_ms:numericdv`
 
+mod query_parser;
+
 use std::path::Path;
 use std::sync::Mutex;
 

@@ -9,3 +9,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 jni = "0.21"
 rustlucene-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

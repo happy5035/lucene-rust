@@ -11,6 +11,8 @@ pub mod reader;
 pub(crate) mod roaring_exec;
 pub mod searcher;
 pub mod segment_reader;
+pub mod sorted_collector;
+pub mod leaf_access;
 
 pub use bitset::FixedBitSet;
 pub use collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
@@ -19,6 +21,8 @@ pub use query::{Occur, Query};
 pub use reader::Reader;
 pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
+pub use sorted_collector::{SearchResults, SortedTopN};
+pub use leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
 
 #[cfg(test)]
 mod block_tests;
@@ -2347,6 +2351,34 @@ mod tests {
             query::MatOutcome::Hits(bm) => assert_eq!(bm.cardinality(), 714), // hot∧t3 = i%7==3
             query::MatOutcome::OverBudget => panic!("u64::MAX budget must not be over"),
         }
+        drop(reader);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn segment_reader_numeric_dv() {
+        let root = temp_dir("segdv");
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::keyword("level"));
+        schema.add(FieldSpec::long_point("ts").with_numeric_dv());
+        let mut w = IndexWriter::create(&root, schema, IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            let mut d = Document::new();
+            d.add("level", FieldValue::Keyword("INFO".to_string()));
+            d.add("ts", FieldValue::Long(1000 + i as i64));
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+        drop(w);
+
+        let dir = FSDirectory::open(&root).unwrap();
+        let mut reader = Reader::open(&dir).unwrap();
+        let (_base, seg) = reader.leaves().next().unwrap();
+        assert_eq!(seg.numeric_dv("ts", 0), Some(1000));
+        assert_eq!(seg.numeric_dv("ts", 9), Some(1009));
+        assert_eq!(seg.numeric_dv("ts", 10), None); // out of range
+        assert_eq!(seg.numeric_dv("level", 0), None); // no DV
+        assert_eq!(seg.numeric_dv("nope", 0), None); // unknown
         drop(reader);
         fs::remove_dir_all(&root).unwrap();
     }

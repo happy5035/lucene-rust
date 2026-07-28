@@ -5,16 +5,16 @@ use std::io;
 
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
-use codec_lucene9::terms_read::TermEntry;
 
 use super::doc_iter::{
     ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, DocIter,
-    ExcludingDocIter, MatchAllIter, MaterializedDocIter, PhraseDocIter, RoaringDocIter,
-    SegmentDocIter,
+    ExcludingDocIter, MatchAllIter, MaterializedDocIter, PhraseDocIter, PostingsIter,
+    RoaringDocIter, SegmentDocIter,
 };
+use super::leaf_access::LeafAccess;
 use super::multi_term;
 use super::roaring_exec;
-use super::segment_reader::{bitmap_enabled, SegmentReader};
+use super::segment_reader::bitmap_enabled;
 
 /// Boolean clause occur (spec M6 §2.1)：MUST / SHOULD / MUST_NOT；
 /// FILTER 不做（ConstantScore 下与 MUST 等价，spec §0 拍板）。
@@ -151,7 +151,7 @@ impl Query {
 
     /// Per-segment count shortcut: `Some(popcount)` when this query takes
     /// the bitset path in this segment, `None` otherwise (caller iterates).
-    pub(crate) fn bitset_count(&self, seg: &mut SegmentReader) -> io::Result<Option<u64>> {
+    pub(crate) fn bitset_count<L: LeafAccess>(&self, seg: &mut L) -> io::Result<Option<u64>> {
         match self {
             Query::Terms { field, terms } => {
                 if terms.len() < 2 {
@@ -182,9 +182,9 @@ impl Query {
         }
     }
 
-    pub(crate) fn segment_iterator(
+    pub(crate) fn segment_iterator<L: LeafAccess>(
         &self,
-        seg: &mut SegmentReader,
+        seg: &mut L,
         needs_freq: bool,
     ) -> io::Result<Option<SegmentDocIter>> {
         match self {
@@ -202,11 +202,9 @@ impl Query {
                     }
                 }
                 if has_freqs {
-                    Ok(Some(SegmentDocIter::Freqs(
-                        seg.docs_freqs_enum(&entry, needs_freq)?,
-                    )))
+                    Ok(Some(seg.docs_freqs_enum(&entry, needs_freq)?))
                 } else {
-                    Ok(Some(SegmentDocIter::Docs(seg.docs_enum(&entry)?)))
+                    Ok(Some(seg.docs_enum(&entry)?))
                 }
             }
             Query::And { field, terms } => and_segment_iterator(seg, field, terms, needs_freq),
@@ -325,8 +323,8 @@ pub(crate) fn flatten_bool<'q>(
 /// :100-110——此处是钉死的 Rust 显式错误面）。段内命中经 visitor 收集、
 /// sort + dedup 后建 `MaterializedBitmap`；`None` = 未知字段 / 非 point
 /// 字段 / 段无 points / 空命中。
-pub(crate) fn point_range_bitmap(
-    seg: &mut SegmentReader,
+pub(crate) fn point_range_bitmap<L: LeafAccess>(
+    seg: &mut L,
     field: &str,
     low: i64,
     high: i64,
@@ -362,8 +360,8 @@ pub(crate) fn point_range_bitmap(
 /// test-thread stack. The bodies are the spec §5 three-tier rule, per arm.
 /// M6 T-A：泛型化 `T: AsRef<[u8]>`——Bool 拍平（spec §2.4）借引用 terms
 /// 与 And/Or 的 `Vec<u8>` 共用同一函数体。
-fn and_segment_iterator<T: AsRef<[u8]>>(
-    seg: &mut SegmentReader,
+fn and_segment_iterator<L: LeafAccess, T: AsRef<[u8]>>(
+    seg: &mut L,
     field: &str,
     terms: &[T],
     needs_freq: bool,
@@ -389,14 +387,22 @@ fn and_segment_iterator<T: AsRef<[u8]>>(
             return Ok(Some(it));
         }
     }
-    Ok(Some(SegmentDocIter::And(ConjunctionDocIter::new(
-        seg, field, &entries, needs_freq,
-    )?)))
+    // 档 3：经 trait 逐 clause 建 postings 迭代器，from_iters 装配合取。
+    let mut sub = Vec::with_capacity(entries.len());
+    for (_, entry) in &entries {
+        let it = if has_freqs {
+            seg.docs_freqs_enum(entry, needs_freq)?
+        } else {
+            seg.docs_enum(entry)?
+        };
+        sub.push(PostingsIter::from_segment_iter(it));
+    }
+    Ok(Some(SegmentDocIter::And(ConjunctionDocIter::from_iters(sub)?)))
 }
 
 /// See `and_segment_iterator` — the Or half of the same rule.
-fn or_segment_iterator<T: AsRef<[u8]>>(
-    seg: &mut SegmentReader,
+fn or_segment_iterator<L: LeafAccess, T: AsRef<[u8]>>(
+    seg: &mut L,
     field: &str,
     terms: &[T],
     needs_freq: bool,
@@ -422,9 +428,17 @@ fn or_segment_iterator<T: AsRef<[u8]>>(
             return Ok(Some(it));
         }
     }
-    Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::new(
-        seg, field, &entries, needs_freq,
-    )?)))
+    // 档 3：经 trait 逐 clause 建 postings 迭代器，from_iters 装配析取。
+    let mut sub = Vec::with_capacity(entries.len());
+    for (_, entry) in &entries {
+        let it = if has_freqs {
+            seg.docs_freqs_enum(entry, needs_freq)?
+        } else {
+            seg.docs_enum(entry)?
+        };
+        sub.push(PostingsIter::from_segment_iter(it));
+    }
+    Ok(Some(SegmentDocIter::Or(DisjunctionDocIter::from_iters(sub)?)))
 }
 
 /// Bool 分派体（outline 自由函数，与 and/or_segment_iterator 同因：
@@ -432,8 +446,8 @@ fn or_segment_iterator<T: AsRef<[u8]>>(
 /// 2MiB 测试线程栈——见 and_segment_iterator 上方注释）。needs_freq 按
 /// spec §2.3 恒 false 处理：freq_sum 已拒绝 Bool，组合语义下 freq 无
 /// 定义，子句一律按 no-freq 打开（bitmap/roaring 路径不受限）。
-fn bool_segment_iterator(
-    seg: &mut SegmentReader,
+fn bool_segment_iterator<L: LeafAccess>(
+    seg: &mut L,
     clauses: &[(Occur, Query)],
     _needs_freq: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
@@ -567,21 +581,22 @@ pub(crate) enum MatOutcome {
 
 /// 单 term 叶子物化：有内联 bitmap → 容器级拷贝；无 → postings 全量
 /// 扫描（O(df)）。cost 累加 df，超 budget → OverBudget。
-fn term_entry_bitmap(
-    seg: &SegmentReader,
-    entry: &TermEntry,
+fn term_entry_bitmap<L: LeafAccess>(
+    seg: &L,
+    entry: &L::TermHandle,
     has_freqs: bool,
     budget: u64,
     cost: &mut u64,
 ) -> io::Result<MatOutcome> {
-    *cost += entry.doc_freq as u64;
+    let df = seg.term_doc_freq(entry) as u64;
+    *cost += df;
     if *cost > budget {
         return Ok(MatOutcome::OverBudget);
     }
     if let Some(f) = seg.open_term_bitmap(entry)? {
         return Ok(MatOutcome::Hits(f.to_materialized()));
     }
-    let mut docs = Vec::with_capacity(entry.doc_freq as usize);
+    let mut docs = Vec::with_capacity(df as usize);
     multi_term::for_each_doc(seg, entry, has_freqs, &mut |d| docs.push(d))?;
     Ok(MatOutcome::Hits(MaterializedBitmap::of(&docs)))
 }
@@ -589,8 +604,8 @@ fn term_entry_bitmap(
 /// 递归把任意查询物化为段内 doc bitmap（M7 §3.1，**仅服务 count**：无
 /// 提前终止，物化不亏——这是与迭代路径的本质区别）。成本经共享的
 /// `cost` 累加器记账，任一叶子超 budget 全树 OverBudget。
-fn materialize_query_bitmap(
-    seg: &mut SegmentReader,
+fn materialize_query_bitmap<L: LeafAccess>(
+    seg: &mut L,
     query: &Query,
     budget: u64,
     cost: &mut u64,
@@ -665,7 +680,7 @@ fn materialize_query_bitmap(
                 match seg.seek_term(field, t)? {
                     None => return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[]))),
                     Some((_, entry)) => {
-                        *cost += entry.doc_freq as u64;
+                        *cost += seg.term_doc_freq(&entry) as u64;
                         if *cost > budget {
                             return Ok(MatOutcome::OverBudget);
                         }
@@ -679,7 +694,7 @@ fn materialize_query_bitmap(
 
 /// 驱动查询的 segment_iterator 全量收集 docs 物化（Phrase 叶子用；
 /// 必须调 matches()——T-A 协议）。
-fn drive_materialize(seg: &mut SegmentReader, query: &Query) -> io::Result<MatOutcome> {
+fn drive_materialize<L: LeafAccess>(seg: &mut L, query: &Query) -> io::Result<MatOutcome> {
     let mut docs = Vec::new();
     if let Some(mut it) = query.segment_iterator(seg, false)? {
         loop {
@@ -697,9 +712,9 @@ fn drive_materialize(seg: &mut SegmentReader, query: &Query) -> io::Result<MatOu
 }
 
 /// term 集 fold：is_and → 交（零 cardinality 短路），否则 → 并。
-fn fold_term_entries(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+fn fold_term_entries<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
     is_and: bool,
     budget: u64,
@@ -728,8 +743,8 @@ fn fold_term_entries(
 /// Bool 子句 fold（M7 §3.1）：正集三态与迭代语义逐条对应——MUST 交 /
 /// 纯 SHOULD 并 / 纯 MUST_NOT 的 MatchAll；排除集先并后 andnot。
 /// 任一子树 OverBudget → 全树 OverBudget。
-pub(crate) fn materialize_bool_bitmap(
-    seg: &mut SegmentReader,
+pub(crate) fn materialize_bool_bitmap<L: LeafAccess>(
+    seg: &mut L,
     clauses: &[(Occur, Query)],
     budget: u64,
     cost: &mut u64,
@@ -744,8 +759,8 @@ pub(crate) fn materialize_bool_bitmap(
             Occur::MustNot => nots.push(q),
         }
     }
-    fn fold_group(
-        seg: &mut SegmentReader,
+    fn fold_group<L: LeafAccess>(
+        seg: &mut L,
         group: &[&Query],
         is_and: bool,
         budget: u64,
@@ -797,8 +812,8 @@ pub(crate) fn materialize_bool_bitmap(
 
 /// M7 §5.1 Bool 段级 count 快路径：Some = 快路径结果（拍平 roaring /
 /// 纯 MUST_NOT / T-B fold）；None = 无快路径（调用方迭代）。
-pub(crate) fn bool_segment_fast_count(
-    seg: &mut SegmentReader,
+pub(crate) fn bool_segment_fast_count<L: LeafAccess>(
+    seg: &mut L,
     clauses: &[(Occur, Query)],
 ) -> io::Result<Option<u64>> {
     // 拍平快路径（§2.4 同形状）：roaring count
@@ -836,14 +851,11 @@ pub(crate) fn bool_segment_fast_count(
 /// 快路径（调用方迭代计数）。归并既有全部捷径（Term doc_freq 直读 /
 /// PointRange bitmap cardinality / multi-term bitset popcount / And-Or
 /// roaring count / Bool 快路径族）。Searcher::count 与 top_docs 共用。
-pub(crate) fn fast_segment_count(
-    seg: &mut SegmentReader,
-    query: &Query,
-) -> io::Result<Option<u64>> {
+pub(crate) fn fast_segment_count<L: LeafAccess>(seg: &mut L, query: &Query) -> io::Result<Option<u64>> {
     match query {
         Query::MatchAll => Ok(Some(seg.max_doc() as u64)),
         Query::Term { field, term } => Ok(Some(match seg.seek_term(field, term)? {
-            Some((_, entry)) => entry.doc_freq as u64,
+            Some((_, entry)) => seg.term_doc_freq(&entry) as u64,
             None => 0,
         })),
         Query::PointRange { field, low, high } => {
@@ -878,7 +890,7 @@ pub(crate) fn fast_segment_count(
 
 /// 纯 MUST_NOT 的 prohibited 侧 count：子句换 SHOULD 视角取并集——拍平
 /// OR 形命中 roaring count 快路径，否则驱动 DisjOver（单子句直接驱动）。
-fn prohibited_count(seg: &mut SegmentReader, clauses: &[(Occur, Query)]) -> io::Result<u64> {
+fn prohibited_count<L: LeafAccess>(seg: &mut L, clauses: &[(Occur, Query)]) -> io::Result<u64> {
     let as_should: Vec<(Occur, &Query)> = clauses.iter().map(|(_, q)| (Occur::Should, q)).collect();
     if let Some((_, field, terms)) = flatten_bool(&as_should) {
         if terms.len() >= 2 {

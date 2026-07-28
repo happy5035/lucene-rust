@@ -655,6 +655,40 @@ impl StoredFieldsWriter {
         Ok(())
     }
 
+    /// Number of docs already flushed to disk (in completed chunks).
+    pub fn flushed_doc_count(&self) -> i32 {
+        self.doc_base
+    }
+
+    /// File pointer for the chunk containing `doc_id` (for disk read).
+    /// Returns None if `doc_id` is in the unflushed buffer or out of range.
+    pub fn chunk_file_pointer(&self, doc_id: u32) -> Option<u64> {
+        let mut base: u32 = 0;
+        for (i, &nd) in self.chunk_num_docs.iter().enumerate() {
+            base += nd as u32;
+            if doc_id < base {
+                return Some(self.chunk_start_pointers[i] as u64);
+            }
+        }
+        None
+    }
+
+    /// Raw bytes of the n-th buffered (unflushed) document.
+    /// Returns None if n >= number of buffered docs.
+    pub fn buffered_doc_bytes(&self, n: u32) -> Option<&[u8]> {
+        let idx = n as usize;
+        if idx >= self.num_buffered_docs as usize {
+            return None;
+        }
+        let start = if idx == 0 {
+            0
+        } else {
+            self.end_offsets[idx - 1] as usize
+        };
+        let end = self.end_offsets[idx] as usize;
+        Some(&self.buffered_docs[start..end])
+    }
+
     /// finish (:472-490) + FieldsIndexWriter.finish (:106-182). Writes .fdx,
     /// completes .fdm, and footers .fdt/.fdx/.fdm. Java collects the index
     /// deltas in temp files; we collect them in memory — the byte layout of
@@ -1491,5 +1525,57 @@ mod tests {
         assert_eq!(index_header_length(FDT_CODEC_NAME, ""), 54);
         assert_eq!(index_header_length("Lucene90FieldsIndexIdx", ""), 48);
         assert_eq!(index_header_length("Lucene90FieldsIndexMeta", ""), 49);
+    }
+
+    #[test]
+    fn sfw_read_accessors() {
+        let root = temp_dir("sfw-acc");
+        let dir = FSDirectory::open(&root).unwrap();
+        let seg_id = [0u8; 16];
+        let mut sfw = StoredFieldsWriter::new(&dir, "_0", seg_id, "").unwrap();
+
+        // Write 3 docs — below chunk threshold, so all stay buffered
+        for i in 0..3 {
+            sfw.start_document();
+            sfw.write_field(0, &StoredField::String(format!("val-{i}")));
+            sfw.finish_document().unwrap();
+        }
+        assert_eq!(sfw.flushed_doc_count(), 0); // not flushed yet (chunk not full)
+        assert!(sfw.chunk_file_pointer(0).is_none()); // nothing flushed
+        assert!(sfw.buffered_doc_bytes(0).is_some());
+        assert!(sfw.buffered_doc_bytes(2).is_some());
+        assert!(sfw.buffered_doc_bytes(3).is_none()); // out of range
+
+        // Verify buffered bytes are non-empty and distinct
+        let b0 = sfw.buffered_doc_bytes(0).unwrap().to_vec();
+        let b2 = sfw.buffered_doc_bytes(2).unwrap().to_vec();
+        assert!(!b0.is_empty());
+        assert_ne!(b0, b2);
+
+        // Force flush 2 docs, then write 1 more
+        sfw.force_flush_for_test();
+        assert_eq!(sfw.flushed_doc_count(), 3);
+        assert!(sfw.chunk_file_pointer(0).is_some());
+        assert!(sfw.chunk_file_pointer(2).is_some());
+        assert!(sfw.chunk_file_pointer(3).is_none()); // out of range
+        assert!(sfw.buffered_doc_bytes(0).is_none()); // buffer cleared
+
+        // Write 2 more docs (buffered)
+        for i in 3..5 {
+            sfw.start_document();
+            sfw.write_field(0, &StoredField::String(format!("val-{i}")));
+            sfw.finish_document().unwrap();
+        }
+        assert_eq!(sfw.flushed_doc_count(), 3);
+        assert!(sfw.buffered_doc_bytes(0).is_some());
+        assert!(sfw.buffered_doc_bytes(1).is_some());
+        assert!(sfw.buffered_doc_bytes(2).is_none()); // only 2 buffered
+
+        // chunk_file_pointer still works for flushed docs
+        let fp = sfw.chunk_file_pointer(1).unwrap();
+        assert!(fp > 0); // after the header
+
+        sfw.finish(5, &dir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
     }
 }

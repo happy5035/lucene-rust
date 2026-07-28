@@ -76,6 +76,11 @@ impl SegmentBuilder {
         self.dw.max_doc
     }
 
+    /// Read-only access to the internal DocWriter (for real-time search).
+    pub fn doc_writer(&self) -> &DocWriter {
+        &self.dw
+    }
+
     /// M3 §4: `Some(t)` → write inline roaring bitmaps for terms with
     /// df >= t at finalize; None (default) keeps .doc byte-identical to M2.
     pub fn set_bitmap_threshold(&mut self, threshold: Option<u32>) {
@@ -86,6 +91,17 @@ impl SegmentBuilder {
     /// `field` (which must carry Numeric or Sorted DocValues) at finalize.
     pub fn set_index_sort(&mut self, sort: Option<IndexSortField>) {
         self.index_sort = sort;
+    }
+
+    /// Number of docs already flushed to disk in the SFW (completed chunks).
+    pub fn sfw_flushed_doc_count(&self) -> i32 {
+        self.sfw.as_ref().map_or(0, |s| s.flushed_doc_count())
+    }
+
+    /// Raw stored-field bytes of the n-th unflushed buffered document.
+    /// Returns None if no SFW exists or n is out of range.
+    pub fn sfw_buffered_doc_bytes(&self, n: u32) -> Option<&[u8]> {
+        self.sfw.as_ref().and_then(|s| s.buffered_doc_bytes(n))
     }
 
     /// Approximate RAM held by the indexing buffers (postings/docvalues/

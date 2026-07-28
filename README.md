@@ -1,6 +1,6 @@
 # RustLucene
 
-用 Rust 重写的 **Lucene 9.12.3 格式兼容索引**：追加写（append-only）链路，产出 Java Lucene 9.12.3 可读的段文件与 `segments_N` 提交点；并提供 **Rust 搜索读路径**（Term / Phrase / Boolean / multi-term / 范围 / 排序，ConstantScore 无打分），高 df term 可选内联 Roaring bitmap 加速。段合并不在范围内——Java Lucene 担任交叉校验（`CheckIndex` + 查询结果逐条 diff）。
+用 Rust 重写的 **Lucene 9.12.3 格式兼容索引**：追加写（append-only）链路，产出 Java Lucene 9.12.3 可读的段文件与 `segments_N` 提交点；并提供 **Rust 搜索读路径**（Term / Phrase / Boolean / multi-term / 范围 / 排序，ConstantScore 无打分），高 df term 可选内联 Roaring bitmap 加速。**实时内存搜索**：未 flush 写入缓冲通过 `LeafAccess` 统一 trait 直接可搜，RwLock 单写多读并发，磁盘与内存共用同一查询执行引擎。段合并不在范围内——Java Lucene 担任交叉校验（`CheckIndex` + 查询结果逐条 diff）。
 
 全部格式细节以 `reference/lucene-9.12.3/` 源码为唯一事实来源，逐文件对照并注释出处（见 `docs/format-notes-*.md`）。
 
@@ -42,6 +42,35 @@
 - **架构**：方案 C——执行语义逐行对照 Lucene 9.12.3 源码（advance 协议、position 合取、BKD 边界、MISSING 排序），对象结构 Rust 化：`enum Query` + `trait DocIter`，不做 Java 式 Query/Weight/Scorer 继承体系
 - **快照语义**：open 即快照，重开即刷新（无 NRT 原地 refresh）；单线程逐段执行
 - 只保证读**本系统写出的**索引（无 delete / `.liv` / norms）；Java 写的索引可读但不做删除语义
+
+### 实时内存搜索（RwLock 并发 + LeafAccess 统一执行）
+
+写入缓冲（未 flush 文档）**可直接搜索**，无需先落盘。设计目标：单写线程（JNI 调用方）+ 多读线程（查询方），<100 QPS 场景下查询延迟 1ms 级。
+
+**并发模型**：`Arc<RwLock<IndexWriter>>`——写端持 `write()` 锁追加文档，读端持 `read()` 锁搜索。RwLock 保证写时互斥、读时共享；写入缓冲为 append-only 结构（`Vec` 追加、哈希表插入），读锁内无可变借用，安全共享。搜索全程持读锁（~1ms 级），不阻塞其他读者。
+
+**统一执行引擎（LeafAccess trait）**：磁盘段与内存缓冲共用同一套查询执行代码，消除 ~200 行重复逻辑：
+
+```
+trait LeafAccess {
+    type TermHandle;                        // 磁盘: TermEntry, 内存: MemTermHandle
+    fn seek_term(...)  -> Option<(bool, Self::TermHandle)>;
+    fn docs_enum(...)  -> SegmentDocIter;   // 磁盘: PFOR 解码, 内存: Vec<u32> 迭代
+    fn positions_enum(...) -> SegmentDocIter;
+    fn open_term_bitmap(...) -> Option<FrozenBitmap>;  // 内存永远 None (tier 3)
+    fn terms_iter(...) -> Box<dyn TermsIterAccess>;     // 磁盘: FST 流, 内存: 排序数组
+    fn points_reader(...) -> Option<&dyn PointsAccess>; // 磁盘: BKD 树, 内存: 线性扫描
+    fn numeric_dv(...) -> Option<i64>;      // 排序键
+    ...
+}
+```
+
+- `Query::segment_iterator<L: LeafAccess>` 泛型执行——Term / Phrase / Bool / Prefix / Wildcard / PointRange / MatchAll 全部查询类型对磁盘和内存透明
+- `IndexWriter::search()` 内 `drive_segment<L: LeafAccess>` 统一驱动：先遍历已提交磁盘段（`SegmentReader`），再遍历内存缓冲（`MemoryLeafAccess`），doc_base 累加保证全局 docID 唯一
+- 内存 postings 通过 `SegmentDocIter::MemDocs` / `MemFreqs` 变体接入同一枚举分发；phrase positions 通过 `MemPositionsEnum` 适配器复用 `PhraseDocIter`
+- 排序搜索：`SortedTopN` 堆收集器 + `numeric_dv` 排序键，支持按时间字段降序 top-N
+
+**JNI 搜索接口**：`nativeSearch(byte[] queryJson, int topN, String sortField, boolean sortDesc)` —— JSON 查询解析（serde）+ 统一搜索 + 结果序列化（docID 数组 + total），一次 JNI 穿越。`nativeDocument(int docId)` 两阶段取文档：读锁内定位段/偏移，解锁后读 `.fdt` 磁盘数据。
 
 ### 高 df term 内联 Roaring bitmap（M3–M5）
 
@@ -337,13 +366,53 @@ roaring（`--bitmap` 索引）vs 同索引纯 PFOR（`RL_BITMAP=0`）vs Java Luc
 
 详细口径与逐组数字见 `docs/m3-bench-report.md`（M3 基线）与 `.superpowers/sdd/m5-bench-report.md`（M5 终值，gitignored）。
 
+### 实时内存搜索性能（LeafAccess 统一路径，4 核云主机，release profile）
+
+写入吞吐（`add_document`，LeafAccess 重构前后无变化）：
+
+| 规模 | 吞吐 |
+|---|---|
+| 10K–1M docs | **~130 万 docs/sec**（~260 MB/s @ 200B/doc） |
+
+内存搜索延迟（未 flush 数据，`IndexWriter::search()`，avg/20 轮）：
+
+| 查询类型 | 10K | 100K | 500K | 1M |
+|---|---|---|---|---|
+| Term | 17 µs | 150 µs | 718 µs | 1.5 ms |
+| MatchAll | 73 µs | 717 µs | 3.5 ms | 7.7 ms |
+| And(2 词) | 80 µs | 749 µs | 3.6 ms | 7.4 ms |
+| Or(2 词) | 82 µs | 679 µs | 3.2 ms | 6.7 ms |
+| Phrase | 364 µs | 4.9 ms | 30 ms | 60 ms |
+| Prefix | 73 µs | 535 µs | 2.5 ms | 5.0 ms |
+| Wildcard | 72 µs | 464 µs | 2.2 ms | 4.3 ms |
+| PointRange | 27 µs | 252 µs | 1.1 ms | 2.6 ms |
+| Bool(MUST+MUST_NOT) | 72 µs | 743 µs | 4.0 ms | 8.3 ms |
+| Term+SortDesc(top10) | 109 µs | 1.3 ms | 6.8 ms | 14.5 ms |
+
+内存 vs 磁盘（1M docs，同查询同口径）：
+
+| 查询 | 内存 | 磁盘 | 比值 |
+|---|---|---|---|
+| Term | 1.5 ms | 2.1 ms | **0.7x（内存更快）** |
+| PointRange | 2.6 ms | 3.3 ms | **0.8x（内存更快）** |
+| Prefix | 5.0 ms | 6.1 ms | **0.8x（内存更快）** |
+| MatchAll | 7.7 ms | 4.4 ms | 1.7x |
+| Bool | 8.3 ms | 4.4 ms | 1.9x |
+| Phrase | 60 ms | 25 ms | 2.4x |
+
+- Term / PointRange / Prefix：内存无 I/O 开销，直接内存访问优于磁盘
+- Phrase / Bool / MatchAll：内存始终走 tier 3（线性扫描），磁盘有 roaring bitmap 折叠 + 优化编码；Phrase 瓶颈在内存 positions 的 `Vec<Vec<u32>>` 逐 doc 遍历
+- 写入+搜索交替：1M 缓冲时 Term 查询 ~1.5 ms，写入吞吐不受搜索影响
+
+基准复现：`cargo run --release --example bench_leaf_access [num_docs]`
+
 ## 格式兼容验证
 
 - 双侧 `CheckIndex` 零错误（单段、8 段并发、稀疏、大字典、positions、bitmap 等场景全覆盖，`make log-test` 五变体 11 次 "No problems"）
 - 查询结果与同语料 Java 索引**逐条 diff 一致**：term count、boolean and/or、prefix / wildcard / terms、point range、sort by DV、phrase、DV 基数 / 字典 hash
 - bitmap A/B 对拍：roaring 路径 vs 纯 PFOR 路径（`RL_BITMAP=0`）hit-counts 逐位一致；v1/v2 旧格式索引自动落档
 - 低层编码字节级 golden vectors 对齐 `ForUtil` / `ForDeltaUtil` / `PForUtil`；FST `.tip` 由 Java `FST.read` 读回逐条比对
-- `cargo test`：codec-lucene9 192 项 + rustlucene-core 121 项 + rustlucene-metric 48 项全绿
+- `cargo test`：codec-lucene9 192 项 + rustlucene-core 128 项 + rustlucene-metric 48 项全绿
 
 ## 快速开始
 
@@ -358,6 +427,8 @@ cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- logwrite /tmp/
 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- searchbench /tmp/idx message --warmup 10 --iter 30
 # forceMerge(1)：把多段压成一个段（bitmap 按配置重建）
 cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- forcemerge /tmp/idx --bitmap
+# 实时内存搜索性能基准（写入吞吐 + 内存搜索延迟 + 磁盘对比）
+cargo run --release --example bench_leaf_access 100000
 ```
 
 ## 范围与限制
@@ -365,8 +436,9 @@ cargo run -q --release -p rustlucene-core --bin rustlucene-cli -- forcemerge /tm
 - **段合并**：已实现 `forceMerge(1)`，会把当前全部段归并成一个新段、重建 `segments_N`、删除旧段文件；delete / 更新不在范围内。写侧仅 CREATE（空目录建索引），暂不支持追加打开已有索引
 - 无打分：写侧一律 omitNorms、不写 `.nvm/.nvd/.nrm`；读侧全部 ConstantScore
 - 读侧只保证读本系统写出的索引（无 `.liv` / norms / vector）；NRT 为 open 即快照、重开即刷新
+- **实时搜索**：写入缓冲（未 flush）可通过 `IndexWriter::search()` 直接搜索，RwLock 单写多读；内存搜索始终走 tier 3（无 roaring bitmap），Phrase / 高 df Bool 延迟高于磁盘路径。缓冲上限由 `max_buffered_docs`（默认 100 万）/ `max_ram_bytes`（默认 512MB）控制
 - 暂不支持：SortedSet / SortedNumeric DV、多维 points、compound file、BEST_COMPRESSION（ZSTD）、模糊查询（Levenshtein 自动机）、聚合 / facet、可配目标段数的 merge 策略
 - bitmap 为实验性写侧开关（`--bitmap` 默认 off）：只加速 docs 维度，phrase / freq 永远落档 postings；multi-term 的 roaring 集成未做
 - **指标存储**：HLL wire format 为简化版（非 DataSketches 字节兼容，估计算法兼容）；metric 查询路径（按 metric_name+labels 拉取 series）暂未实现
 
-里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲、M6 嵌套 Bool + Point + forceMerge）；指标存储设计 `docs/superpowers/specs/rust-metric-storage-design.md`、实现计划 `docs/superpowers/plans/rust-metric-storage.md`；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。
+里程碑与设计文档：写入链路 `docs/m1-report.md`、`docs/m2-report.md`；搜索读路径 / bitmap 各阶段 spec 在 `docs/superpowers/specs/`（2026-07-22 搜索设计、M2 multi-term、M3/M4/M5 bitmap 三部曲、M6 嵌套 Bool + Point + forceMerge、2026-07-27 RwLock 实时搜索设计、2026-07-27 LeafAccess 统一设计）；指标存储设计 `docs/superpowers/specs/rust-metric-storage-design.md`、实现计划 `docs/superpowers/plans/rust-metric-storage.md`；bitmap bench 基线 `docs/m3-bench-report.md`。格式笔记见 `docs/format-notes-*.md`。

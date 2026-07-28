@@ -12,6 +12,7 @@ pub mod doc_writer;
 pub mod document;
 pub mod index_writer;
 pub mod json;
+pub mod memory_access;
 pub mod merge;
 pub mod schema;
 pub mod search;
@@ -20,7 +21,7 @@ pub mod sort;
 pub mod tokenizer;
 
 pub use document::{Document, FieldValue};
-pub use index_writer::{commit_segments, IndexWriter, IndexWriterConfig};
+pub use index_writer::{commit_segments, DocLocation, IndexWriter, IndexWriterConfig};
 pub use json::{BindOutcome, FieldPolicy, JsonBinder};
 pub use schema::{FieldSpec, PointSpec, Schema};
 pub use segment_builder::SegmentBuilder;

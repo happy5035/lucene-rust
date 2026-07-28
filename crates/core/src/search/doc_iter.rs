@@ -12,6 +12,7 @@ use codec_lucene9::roaring::{FrozenBitmap, MaterializedBitmap};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
+use super::leaf_access::LeafAccess;
 use super::segment_reader::SegmentReader;
 
 /// 块级迭代尺寸（spec 2026-07-26 §3）= PFOR PackedBlock 尺寸。
@@ -141,11 +142,127 @@ impl DocIter for MatchAllIter {
     }
 }
 
+// ── Memory postings iterators ────────────────────────────────────────
+
+/// DocIter over a sorted Vec<u32> (postings from in-memory buffer).
+pub struct MemDocsIter {
+    docs: Vec<u32>,
+    pos: usize,
+    doc: i32,
+}
+
+impl MemDocsIter {
+    pub fn new(docs: Vec<u32>) -> Self {
+        Self { docs, pos: 0, doc: -1 }
+    }
+}
+
+impl DocIter for MemDocsIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.pos >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.pos] as i32;
+        self.pos += 1;
+        Ok(self.doc)
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.pos..].binary_search(&t) {
+            Ok(i) => {
+                self.pos += i;
+                self.doc = self.docs[self.pos] as i32;
+                self.pos += 1;
+            }
+            Err(i) => {
+                self.pos += i;
+                if self.pos >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.pos] as i32;
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+    fn freq(&self) -> u32 {
+        1
+    }
+}
+
+/// DocIter over (doc, freq) pairs from in-memory buffer.
+pub struct MemFreqsIter {
+    docs: Vec<u32>,
+    freqs: Vec<u32>,
+    pos: usize,
+    doc: i32,
+    cur_freq: u32,
+}
+
+impl MemFreqsIter {
+    pub fn new(docs: Vec<u32>, freqs: Vec<u32>) -> Self {
+        Self { docs, freqs, pos: 0, doc: -1, cur_freq: 1 }
+    }
+}
+
+impl DocIter for MemFreqsIter {
+    fn doc_id(&self) -> i32 {
+        self.doc
+    }
+    fn next_doc(&mut self) -> io::Result<i32> {
+        if self.pos >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.pos] as i32;
+        self.cur_freq = self.freqs[self.pos];
+        self.pos += 1;
+        Ok(self.doc)
+    }
+    fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.pos..].binary_search(&t) {
+            Ok(i) => {
+                self.pos += i;
+                self.doc = self.docs[self.pos] as i32;
+                self.cur_freq = self.freqs[self.pos];
+                self.pos += 1;
+            }
+            Err(i) => {
+                self.pos += i;
+                if self.pos >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.pos] as i32;
+                    self.cur_freq = self.freqs[self.pos];
+                    self.pos += 1;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+    fn freq(&self) -> u32 {
+        self.cur_freq
+    }
+}
+
 // ── Internal postings wrapper ─────────────────────────────────────────
 
-enum PostingsIter {
+pub(crate) enum PostingsIter {
     Docs(DocsEnum),
     Freqs(DocsFreqsEnum),
+    Generic(Box<SegmentDocIter>),
 }
 impl PostingsIter {
     /// `needs_freq == false` over a DOCS_AND_FREQS field yields a no-freq
@@ -163,27 +280,35 @@ impl PostingsIter {
             Ok(PostingsIter::Docs(seg.docs_enum(entry)?))
         }
     }
+    /// Wrap a pre-built SegmentDocIter (from any LeafAccess source).
+    pub(crate) fn from_segment_iter(it: SegmentDocIter) -> Self {
+        PostingsIter::Generic(Box::new(it))
+    }
     fn doc_id(&self) -> i32 {
         match self {
             Self::Docs(d) => d.doc_id(),
             Self::Freqs(f) => f.doc_id(),
+            Self::Generic(g) => g.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
         match self {
             Self::Docs(d) => d.next_doc(),
             Self::Freqs(f) => f.next_doc(),
+            Self::Generic(g) => g.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
         match self {
             Self::Docs(d) => d.advance(t),
             Self::Freqs(f) => f.advance(t),
+            Self::Generic(g) => g.advance(t),
         }
     }
     fn freq(&self) -> u32 {
         match self {
             Self::Freqs(f) => f.freq(),
+            Self::Generic(g) => g.freq(),
             _ => 1,
         }
     }
@@ -198,6 +323,7 @@ impl PostingsIter {
                     f.next_docs(&mut out.docs)?
                 }
             }
+            Self::Generic(g) => return g.next_block(out),
         };
         out.len = n;
         Ok(n)
@@ -229,6 +355,12 @@ impl ConjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
+        Self::from_iters(sub)
+    }
+
+    /// Construct from pre-built sub-iterators (generic over any LeafAccess
+    /// source).
+    pub(crate) fn from_iters(sub: Vec<PostingsIter>) -> io::Result<Self> {
         let curs = sub.iter().map(|_| BlockCursor::new()).collect();
         Ok(ConjunctionDocIter {
             sub,
@@ -405,6 +537,12 @@ impl DisjunctionDocIter {
         for (_, entry) in sorted_entries {
             sub.push(PostingsIter::new(seg, entry, has_freqs, needs_freq)?);
         }
+        Self::from_iters(sub)
+    }
+
+    /// Construct from pre-built sub-iterators (generic over any LeafAccess
+    /// source).
+    pub(crate) fn from_iters(sub: Vec<PostingsIter>) -> io::Result<Self> {
         let curs = sub.iter().map(|_| BlockCursor::new()).collect();
         Ok(DisjunctionDocIter {
             sub,
@@ -575,6 +713,125 @@ impl DocIter for BitsetDocIter {
     }
 }
 
+// ── In-memory positions iterator ─────────────────────────────────────
+
+/// In-memory positions iterator: adapts pre-built doc/freq/positions data
+/// to the same interface as codec's `PositionsEnum`, allowing PhraseDocIter
+/// to work unchanged over RAM buffers.
+pub struct MemPositionsEnum {
+    docs: Vec<u32>,
+    positions: Vec<Vec<u32>>, // positions[doc_idx] = sorted position list
+    doc_idx: usize,
+    pos_idx: usize,
+    doc: i32,
+}
+
+impl MemPositionsEnum {
+    pub fn new(docs: Vec<u32>, positions: Vec<Vec<u32>>) -> Self {
+        Self { docs, positions, doc_idx: 0, pos_idx: 0, doc: -1 }
+    }
+
+    pub fn doc_id(&self) -> i32 {
+        self.doc
+    }
+
+    pub fn next_doc(&mut self) -> io::Result<i32> {
+        if self.doc_idx >= self.docs.len() {
+            self.doc = NO_MORE_DOCS;
+            return Ok(NO_MORE_DOCS);
+        }
+        self.doc = self.docs[self.doc_idx] as i32;
+        self.doc_idx += 1;
+        self.pos_idx = 0;
+        Ok(self.doc)
+    }
+
+    pub fn advance(&mut self, target: i32) -> io::Result<i32> {
+        if self.doc >= target {
+            return Ok(self.doc);
+        }
+        let t = target.max(0) as u32;
+        match self.docs[self.doc_idx..].binary_search(&t) {
+            Ok(i) => {
+                self.doc_idx += i;
+                self.doc = self.docs[self.doc_idx] as i32;
+                self.doc_idx += 1;
+                self.pos_idx = 0;
+            }
+            Err(i) => {
+                self.doc_idx += i;
+                if self.doc_idx >= self.docs.len() {
+                    self.doc = NO_MORE_DOCS;
+                } else {
+                    self.doc = self.docs[self.doc_idx] as i32;
+                    self.doc_idx += 1;
+                    self.pos_idx = 0;
+                }
+            }
+        }
+        Ok(self.doc)
+    }
+
+    pub fn freq(&self) -> u32 {
+        if self.doc < 0 || self.doc == NO_MORE_DOCS {
+            return 0;
+        }
+        // doc_idx points past the current doc
+        self.positions[self.doc_idx - 1].len() as u32
+    }
+
+    pub fn next_position(&mut self) -> io::Result<u32> {
+        let positions = &self.positions[self.doc_idx - 1];
+        let p = positions[self.pos_idx];
+        self.pos_idx += 1;
+        Ok(p)
+    }
+}
+
+/// Unified positions enum: wraps either a disk `PositionsEnum` (codec) or
+/// an in-memory `MemPositionsEnum`. PhraseDocIter is generic over this.
+pub enum PositionsEnumLike {
+    Disk(PositionsEnum),
+    Mem(MemPositionsEnum),
+}
+
+impl PositionsEnumLike {
+    pub fn doc_id(&self) -> i32 {
+        match self {
+            Self::Disk(e) => e.doc_id(),
+            Self::Mem(e) => e.doc_id(),
+        }
+    }
+
+    pub fn next_doc(&mut self) -> io::Result<i32> {
+        match self {
+            Self::Disk(e) => e.next_doc(),
+            Self::Mem(e) => e.next_doc(),
+        }
+    }
+
+    pub fn advance(&mut self, target: i32) -> io::Result<i32> {
+        match self {
+            Self::Disk(e) => e.advance(target),
+            Self::Mem(e) => e.advance(target),
+        }
+    }
+
+    pub fn freq(&self) -> u32 {
+        match self {
+            Self::Disk(e) => e.freq(),
+            Self::Mem(e) => e.freq(),
+        }
+    }
+
+    pub fn next_position(&mut self) -> io::Result<u32> {
+        match self {
+            Self::Disk(e) => e.next_position(),
+            Self::Mem(e) => e.next_position(),
+        }
+    }
+}
+
 // ── Phrase (slop=0) ─────────────────────────────────────────────────────
 
 /// phrase approximation 源（M7 §2.2）：全 term 有内联 bitmap 时 roaring
@@ -584,11 +841,11 @@ enum PhraseApprox {
     Bitmap { docs: Vec<u32>, cursor: usize },
 }
 
-/// One phrase term occurrence: an independent EverythingEnum + its offset
+/// One phrase term occurrence: an independent positions enum + its offset
 /// in the phrase. Repeated terms get independent enums, which makes them
 /// naturally correct (spec M2 §6; PhrasePositions :24-58).
 struct Occurrence {
-    en: PositionsEnum,
+    en: PositionsEnumLike,
     offset: u32,
 }
 
@@ -609,8 +866,8 @@ impl PhraseDocIter {
     /// no positions — fail-fast, mirroring Java's execution-time error of
     /// PhraseQuery on such fields (Lucene912PostingsReader.postings :280-309
     /// downgrades to a docs-only enum whose nextPosition throws).
-    pub fn new(
-        seg: &mut SegmentReader,
+    pub fn new<L: LeafAccess>(
+        seg: &mut L,
         field: &str,
         terms: &[Vec<u8>],
     ) -> io::Result<Option<PhraseDocIter>> {
@@ -633,12 +890,13 @@ impl PhraseDocIter {
                 ),
             ));
         }
-        let mut sought: Vec<(u32, u32, TermEntry)> = Vec::with_capacity(terms.len());
+        let mut sought: Vec<(u32, u32, L::TermHandle)> = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
             let Some((_, entry)) = seg.seek_term(field, t)? else {
                 return Ok(None); // absent term: no hits (PhraseWeight null scorer)
             };
-            sought.push((entry.doc_freq, i as u32, entry));
+            let df = seg.term_doc_freq(&entry);
+            sought.push((df, i as u32, entry));
         }
         sought.sort_by_key(|(df, _, _)| *df);
         // M7 §2.2 bitmap 候选快路径：全部 term 有内联 bitmap → roaring
@@ -654,28 +912,68 @@ impl PhraseDocIter {
                 }
             }
         }
-        let approx = if all_bitmap {
-            let refs: Vec<&FrozenBitmap> = views.iter().collect();
-            PhraseApprox::Bitmap {
-                docs: codec_lucene9::roaring::intersect_docs(&refs),
-                cursor: 0,
-            }
-        } else {
-            PhraseApprox::Postings
-        };
-        let mut occ: Vec<Occurrence> = Vec::with_capacity(sought.len());
-        for (_, offset, entry) in sought {
-            occ.push(Occurrence {
-                en: seg.positions_enum(&entry)?,
-                offset,
-            });
+        let approx_bitmaps = if all_bitmap { Some(views) } else { None };
+        // LeafAccess::positions_enum 返回 SegmentDocIter（磁盘侧把单个
+        // PositionsEnum 包进单词 PhraseDocIter）；from_entries 需要裸
+        // PositionsEnumLike 做跨 term 位置验证，故解包还原（L=SegmentReader
+        // 时与旧 inherent 路径逐字节一致）。
+        let mut entries: Vec<(u32, u32, PositionsEnumLike)> = Vec::with_capacity(sought.len());
+        for (df, offset, entry) in sought {
+            let it = seg.positions_enum(&entry)?;
+            let pen = it.into_positions_enum().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "LeafAccess::positions_enum did not yield a positions iterator",
+                )
+            })?;
+            entries.push((df, offset, pen));
         }
-        Ok(Some(PhraseDocIter {
+        Ok(Some(Self::from_entries(entries, approx_bitmaps)))
+    }
+
+    /// Construct from pre-built positions iterators (generic over any
+    /// LeafAccess source). `entries` is (doc_freq, offset, positions_enum)
+    /// sorted by doc_freq ascending (conjunction cost order).
+    /// `approx_bitmaps`: when all terms have inline bitmaps, the roaring AND
+    /// materialized candidate sequence; None → postings conjunction approx.
+    pub fn from_entries(
+        entries: Vec<(u32, u32, PositionsEnumLike)>,
+        approx_bitmaps: Option<Vec<FrozenBitmap>>,
+    ) -> PhraseDocIter {
+        let approx = match approx_bitmaps {
+            Some(views) => {
+                let refs: Vec<&FrozenBitmap> = views.iter().collect();
+                PhraseApprox::Bitmap {
+                    docs: codec_lucene9::roaring::intersect_docs(&refs),
+                    cursor: 0,
+                }
+            }
+            None => PhraseApprox::Postings,
+        };
+        let mut occ: Vec<Occurrence> = Vec::with_capacity(entries.len());
+        for (_, offset, en) in entries {
+            occ.push(Occurrence { en, offset });
+        }
+        PhraseDocIter {
             occ,
             approx,
             doc: -1,
             lead: 0,
-        }))
+        }
+    }
+
+    /// Inverse of the `LeafAccess::positions_enum` wrapping: extract the
+    /// single wrapped `PositionsEnumLike` when this is a one-term phrase (the
+    /// shape every `positions_enum` impl produces). Returns `None` for a
+    /// genuine multi-term phrase. Used by the generic `PhraseDocIter::new`
+    /// to rebuild a multi-term phrase from per-term positions iterators.
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnumLike> {
+        if self.occ.len() == 1 {
+            let mut occ = self.occ;
+            Some(occ.pop().unwrap().en)
+        } else {
+            None
+        }
     }
 
     /// ExactPhraseMatcher (:138-167): collects each occurrence's positions
@@ -2355,6 +2653,20 @@ pub enum SegmentDocIter {
     ConjOver(ConjOverDocIter),
     DisjOver(DisjOverDocIter),
     Excluding(ExcludingDocIter),
+    MemDocs(MemDocsIter),
+    MemFreqs(MemFreqsIter),
+}
+
+impl SegmentDocIter {
+    /// Extract a wrapped `PositionsEnumLike` from a single-term `Phrase`
+    /// iterator (the shape `LeafAccess::positions_enum` produces); `None`
+    /// for any other variant. See `PhraseDocIter::into_positions_enum`.
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnumLike> {
+        match self {
+            SegmentDocIter::Phrase(p) => p.into_positions_enum(),
+            _ => None,
+        }
+    }
 }
 
 impl SegmentDocIter {
@@ -2385,6 +2697,8 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.doc_id(),
             Self::DisjOver(d) => d.doc_id(),
             Self::Excluding(e) => e.doc_id(),
+            Self::MemDocs(m) => m.doc_id(),
+            Self::MemFreqs(m) => m.doc_id(),
         }
     }
     fn next_doc(&mut self) -> io::Result<i32> {
@@ -2403,6 +2717,8 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.next_doc(),
             Self::DisjOver(d) => d.next_doc(),
             Self::Excluding(e) => e.next_doc(),
+            Self::MemDocs(m) => m.next_doc(),
+            Self::MemFreqs(m) => m.next_doc(),
         }
     }
     fn advance(&mut self, t: i32) -> io::Result<i32> {
@@ -2421,11 +2737,14 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.advance(t),
             Self::DisjOver(d) => d.advance(t),
             Self::Excluding(e) => e.advance(t),
+            Self::MemDocs(m) => m.advance(t),
+            Self::MemFreqs(m) => m.advance(t),
         }
     }
     fn freq(&self) -> u32 {
         match self {
             Self::Freqs(f) => f.freq(),
+            Self::MemFreqs(m) => m.freq(),
             Self::And(a) => a.freq(),
             Self::Or(o) => o.freq(),
             _ => 1,
@@ -2467,6 +2786,8 @@ impl DocIter for SegmentDocIter {
             Self::ConjOver(c) => c.next_block(out),
             Self::DisjOver(d) => d.next_block(out),
             Self::Excluding(e) => e.next_block(out),
+            Self::MemDocs(m) => m.next_block(out),
+            Self::MemFreqs(m) => m.next_block(out),
         }
     }
 }

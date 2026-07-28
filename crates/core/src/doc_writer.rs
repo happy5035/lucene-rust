@@ -353,6 +353,16 @@ impl DocWriter {
         self.ram_bytes
     }
 
+    /// Read a numeric doc value for a specific doc. Returns None if the field
+    /// has no numeric DV buffer, or the doc has no value (sparse).
+    pub fn numeric_dv(&self, field: &str, doc: u32) -> Option<i64> {
+        let number = self.fields.iter().position(|f| f.name == field)?;
+        let buf = self.buffers.get(number)?.as_ref()?;
+        let dv = buf.numeric_dv.as_ref()?;
+        let idx = dv.docs.binary_search(&doc).ok()?;
+        Some(dv.values[idx])
+    }
+
     /// Consumes the document so owned values move into the stored-fields
     /// stream without an extra copy. Stored fields are serialized into `sfw`
     /// as they are consumed (streaming, Lucene's StoredFieldsConsumer model);
@@ -815,5 +825,63 @@ mod tests {
         let dv = level.sorted_dv.as_ref().unwrap();
         assert_eq!(dv.docs, vec![0, 1, 2]);
         assert_eq!(dv.dict.len(), 2);
+    }
+
+    #[test]
+    fn numeric_dv_read() {
+        use crate::schema::{FieldSpec, Schema};
+        use crate::document::{Document, FieldValue};
+
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::long_point("ts").with_numeric_dv());
+        schema.add(FieldSpec::keyword("level"));
+
+        let mut dw = DocWriter::new();
+        for i in 0..5u32 {
+            let mut doc = Document::new();
+            doc.add("ts", FieldValue::Long(1000 + i as i64));
+            doc.add("level", FieldValue::Keyword("INFO".into()));
+            dw.add_document(&schema, doc, None).unwrap();
+        }
+
+        // Existing docs return their value
+        assert_eq!(dw.numeric_dv("ts", 0), Some(1000));
+        assert_eq!(dw.numeric_dv("ts", 4), Some(1004));
+        // Out-of-range doc
+        assert_eq!(dw.numeric_dv("ts", 5), None);
+        // Field without DV
+        assert_eq!(dw.numeric_dv("level", 0), None);
+        // Unknown field
+        assert_eq!(dw.numeric_dv("nope", 0), None);
+    }
+
+    #[test]
+    fn numeric_dv_sparse() {
+        use crate::schema::{FieldSpec, Schema};
+        use crate::document::{Document, FieldValue};
+
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::long_point("ts").with_numeric_dv());
+        schema.add(FieldSpec::keyword("level"));
+
+        let mut dw = DocWriter::new();
+        // doc 0: has ts
+        let mut doc = Document::new();
+        doc.add("ts", FieldValue::Long(42));
+        doc.add("level", FieldValue::Keyword("A".into()));
+        dw.add_document(&schema, doc, None).unwrap();
+        // doc 1: no ts
+        let mut doc = Document::new();
+        doc.add("level", FieldValue::Keyword("B".into()));
+        dw.add_document(&schema, doc, None).unwrap();
+        // doc 2: has ts
+        let mut doc = Document::new();
+        doc.add("ts", FieldValue::Long(99));
+        doc.add("level", FieldValue::Keyword("C".into()));
+        dw.add_document(&schema, doc, None).unwrap();
+
+        assert_eq!(dw.numeric_dv("ts", 0), Some(42));
+        assert_eq!(dw.numeric_dv("ts", 1), None); // sparse
+        assert_eq!(dw.numeric_dv("ts", 2), Some(99));
     }
 }

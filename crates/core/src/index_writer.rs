@@ -1,11 +1,17 @@
 use std::io;
 use std::path::Path;
 
+use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::segment_infos::SegmentInfos;
 use codec_lucene9::FSDirectory;
 
 use crate::document::Document;
+use crate::memory_reader::MemorySearcher;
 use crate::schema::Schema;
+use crate::search::doc_iter::DocIter;
+use crate::search::query::Query;
+use crate::search::segment_reader::SegmentReader;
+use crate::search::sorted_collector::{SearchResults, SortedTopN};
 use crate::segment_builder::SegmentBuilder;
 
 pub struct IndexWriterConfig {
@@ -127,6 +133,99 @@ impl IndexWriter {
         self.generation += 1;
         Ok(())
     }
+
+    /// Schema accessor (needed by search to construct MemoryLeafReader).
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Unified search across in-memory buffer + flushed segments.
+    /// `sort_field`: Some((field_name, desc)) for sorted results, None for INDEXORDER.
+    pub fn search(
+        &self,
+        query: &Query,
+        sort_field: Option<(&str, bool)>,
+        top_n: usize,
+    ) -> io::Result<SearchResults> {
+        let (desc, n) = match sort_field {
+            Some((_, desc)) => (desc, top_n),
+            None => (false, top_n),
+        };
+        let mut collector = SortedTopN::new(desc, n);
+        let mut index_order_docs: Vec<i32> = Vec::new();
+        let mut total: u64 = 0;
+        let use_sort = sort_field.is_some();
+
+        // 1. Flushed segments (on disk)
+        let mut doc_base: i32 = 0;
+        for sci in &self.infos.segments {
+            let mut reader = SegmentReader::open(&self.dir, sci)?;
+            let local_docs = Self::exec_query_on_segment(&mut reader, query)?;
+            for local_id in &local_docs {
+                let global_id = doc_base + *local_id;
+                if use_sort {
+                    let (field, _) = sort_field.unwrap();
+                    let sv = reader.numeric_dv(field, *local_id as u32).unwrap_or(i64::MIN);
+                    collector.collect(global_id, sv);
+                } else {
+                    total += 1;
+                    if index_order_docs.len() < n {
+                        index_order_docs.push(global_id);
+                    }
+                }
+            }
+            doc_base += sci.info.doc_count;
+        }
+
+        // 2. In-memory buffer (unflushed)
+        if let Some(builder) = &self.builder {
+            let mem = MemorySearcher::new(builder.doc_writer(), &self.schema, &[]);
+            let local_docs = mem.exec_query(query)?;
+            for local_id in &local_docs {
+                let global_id = doc_base + *local_id as i32;
+                if use_sort {
+                    let (field, _) = sort_field.unwrap();
+                    let sv = builder.doc_writer().numeric_dv(field, *local_id).unwrap_or(i64::MIN);
+                    collector.collect(global_id, sv);
+                } else {
+                    total += 1;
+                    if index_order_docs.len() < n {
+                        index_order_docs.push(global_id);
+                    }
+                }
+            }
+        }
+
+        if use_sort {
+            Ok(collector.results())
+        } else {
+            Ok(SearchResults {
+                total,
+                docs: index_order_docs,
+            })
+        }
+    }
+
+    /// Execute a query on a single segment, returning local doc IDs.
+    fn exec_query_on_segment(
+        reader: &mut SegmentReader,
+        query: &Query,
+    ) -> io::Result<Vec<i32>> {
+        let mut docs = Vec::new();
+        if let Some(mut iter) = query.segment_iterator(reader, false)? {
+            loop {
+                let doc = iter.next_doc()?;
+                if doc == NO_MORE_DOCS {
+                    break;
+                }
+                if !iter.matches()? {
+                    continue;
+                }
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
 }
 
 /// Commits an externally-assembled `SegmentInfos` (e.g. the union of segments
@@ -156,4 +255,112 @@ pub(crate) fn commit_infos(
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
     dir.sync(&file_refs)?;
     infos.commit(dir, generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{Document, FieldValue};
+    use crate::schema::FieldSpec;
+    use crate::search::query::Query;
+    use std::fs;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustlucene-rt-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn rt_schema() -> Schema {
+        let mut s = Schema::new();
+        s.add(FieldSpec::keyword("level"));
+        s.add(FieldSpec::text("message"));
+        s.add(FieldSpec::long_point("ts").with_numeric_dv());
+        s
+    }
+
+    fn rt_doc(level: &str, message: &str, ts: i64) -> Document {
+        let mut d = Document::new();
+        d.add("level", FieldValue::Keyword(level.to_string()));
+        d.add("message", FieldValue::Text(message.to_string()));
+        d.add("ts", FieldValue::Long(ts));
+        d
+    }
+
+    #[test]
+    fn search_memory_only() {
+        let root = temp_dir("memonly");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            w.add_document(rt_doc("INFO", "hello world", 1000 + i as i64))
+                .unwrap();
+        }
+        // No flush — all in memory
+        let r = w.search(&Query::term("level", "INFO"), Some(("ts", true)), 5).unwrap();
+        assert_eq!(r.total, 10);
+        // desc by ts: docs 9,8,7,6,5 (ts 1009..1005)
+        assert_eq!(r.docs, vec![9, 8, 7, 6, 5]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_across_flush_boundary() {
+        let root = temp_dir("flushbound");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            w.add_document(rt_doc("INFO", "hello", 1000 + i as i64))
+                .unwrap();
+        }
+        w.flush().unwrap();
+        for i in 10..15u32 {
+            w.add_document(rt_doc("INFO", "hello", 1000 + i as i64))
+                .unwrap();
+        }
+        // 10 on disk + 5 in memory = 15 total
+        let r = w.search(&Query::term("level", "INFO"), Some(("ts", true)), 5).unwrap();
+        assert_eq!(r.total, 15);
+        assert_eq!(r.docs, vec![14, 13, 12, 11, 10]); // top 5 by ts desc
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_no_sort_index_order() {
+        let root = temp_dir("nosort");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..5u32 {
+            w.add_document(rt_doc("INFO", "hello", i as i64)).unwrap();
+        }
+        let r = w.search(&Query::term("level", "INFO"), None, 3).unwrap();
+        assert_eq!(r.total, 5);
+        assert_eq!(r.docs, vec![0, 1, 2]); // INDEXORDER
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_asc_sort() {
+        let root = temp_dir("ascsort");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        for i in 0..10u32 {
+            w.add_document(rt_doc("INFO", "hello", 1000 + i as i64))
+                .unwrap();
+        }
+        let r = w.search(&Query::term("level", "INFO"), Some(("ts", false)), 3).unwrap();
+        assert_eq!(r.total, 10);
+        assert_eq!(r.docs, vec![0, 1, 2]); // asc: ts 1000, 1001, 1002
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn search_empty_index() {
+        let root = temp_dir("emptyrt");
+        let w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+        let r = w.search(&Query::MatchAll, Some(("ts", true)), 10).unwrap();
+        assert_eq!(r.total, 0);
+        assert!(r.docs.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

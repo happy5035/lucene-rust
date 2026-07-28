@@ -65,6 +65,11 @@ impl SegmentBuilder {
         self.dw.max_doc
     }
 
+    /// Read-only access to the internal DocWriter (for real-time search).
+    pub fn doc_writer(&self) -> &DocWriter {
+        &self.dw
+    }
+
     /// M3 §4: `Some(t)` → write inline roaring bitmaps for terms with
     /// df >= t at finalize; None (default) keeps .doc byte-identical to M2.
     pub fn set_bitmap_threshold(&mut self, threshold: Option<u32>) {

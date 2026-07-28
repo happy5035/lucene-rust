@@ -391,7 +391,7 @@ impl<'a> MemorySearcher<'a> {
     // ── Query execution engine ───────────────────────────────────────
 
     /// Execute a query and return sorted matching doc IDs.
-    fn exec_query(&self, query: &Query) -> io::Result<Vec<u32>> {
+    pub(crate) fn exec_query(&self, query: &Query) -> io::Result<Vec<u32>> {
         match query {
             Query::MatchAll => Ok((0..self.reader.max_doc() as u32).collect()),
 

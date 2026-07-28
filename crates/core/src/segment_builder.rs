@@ -76,6 +76,11 @@ impl SegmentBuilder {
         self.bitmap_threshold = threshold;
     }
 
+    /// Number of docs already flushed to disk in the SFW (completed chunks).
+    pub fn sfw_flushed_doc_count(&self) -> i32 {
+        self.sfw.as_ref().map_or(0, |s| s.flushed_doc_count())
+    }
+
     /// Approximate RAM held by the indexing buffers (postings/docvalues/
     /// points arenas) plus one stored-fields compression chunk cushion.
     pub fn ram_bytes(&self) -> usize {

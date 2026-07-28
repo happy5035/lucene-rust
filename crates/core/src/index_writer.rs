@@ -14,6 +14,21 @@ use crate::search::segment_reader::SegmentReader;
 use crate::search::sorted_collector::{SearchResults, SortedTopN};
 use crate::segment_builder::SegmentBuilder;
 
+/// Where a global doc_id's stored fields live.
+#[derive(Debug)]
+pub enum DocLocation {
+    /// In a committed segment's .fdt file.
+    CommittedSegment {
+        seg_name: String,
+        seg_id: [u8; 16],
+        local_id: u32,
+    },
+    /// In the current buffer's SFW (either flushed chunk or memory).
+    Buffer { local_id: u32, flushed: bool },
+    /// No document at this id.
+    NotFound,
+}
+
 pub struct IndexWriterConfig {
     /// Flush when this many docs are buffered (Lucene default: disabled / RAM-based).
     pub max_buffered_docs: u32,
@@ -137,6 +152,31 @@ impl IndexWriter {
     /// Schema accessor (needed by search to construct MemoryLeafReader).
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Maps a global doc_id to where its stored fields live.
+    pub fn document_location(&self, global_id: u32) -> DocLocation {
+        let mut base: u32 = 0;
+        for sci in &self.infos.segments {
+            let seg_docs = sci.info.doc_count as u32;
+            if global_id < base + seg_docs {
+                return DocLocation::CommittedSegment {
+                    seg_name: sci.info.name.clone(),
+                    seg_id: sci.info.id,
+                    local_id: global_id - base,
+                };
+            }
+            base += seg_docs;
+        }
+        // In-memory buffer
+        if let Some(builder) = &self.builder {
+            let local_id = global_id - base;
+            if local_id < builder.buffered_docs() {
+                let flushed = builder.sfw_flushed_doc_count() > local_id as i32;
+                return DocLocation::Buffer { local_id, flushed };
+            }
+        }
+        DocLocation::NotFound
     }
 
     /// Unified search across in-memory buffer + flushed segments.
@@ -361,6 +401,72 @@ mod tests {
         let r = w.search(&Query::MatchAll, Some(("ts", true)), 10).unwrap();
         assert_eq!(r.total, 0);
         assert!(r.docs.is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn document_location_variants() {
+        let root = temp_dir("docloc");
+        let mut w = IndexWriter::create(&root, rt_schema(), IndexWriterConfig::default()).unwrap();
+
+        // Empty index: everything is NotFound
+        assert!(matches!(w.document_location(0), DocLocation::NotFound));
+
+        // Add 5 docs (buffered, not flushed)
+        for i in 0..5u32 {
+            w.add_document(rt_doc("INFO", "hello", 1000 + i as i64))
+                .unwrap();
+        }
+        // Buffered docs: local_id 0..5
+        match w.document_location(0) {
+            DocLocation::Buffer { local_id, flushed } => {
+                assert_eq!(local_id, 0);
+                assert!(!flushed); // small docs, not flushed to chunk
+            }
+            other => panic!("expected Buffer, got {other:?}"),
+        }
+        match w.document_location(4) {
+            DocLocation::Buffer { local_id, .. } => assert_eq!(local_id, 4),
+            other => panic!("expected Buffer, got {other:?}"),
+        }
+        assert!(matches!(w.document_location(5), DocLocation::NotFound));
+
+        // Flush: docs move to committed segment
+        w.flush().unwrap();
+        match w.document_location(0) {
+            DocLocation::CommittedSegment {
+                seg_name,
+                local_id,
+                ..
+            } => {
+                assert_eq!(seg_name, "_0");
+                assert_eq!(local_id, 0);
+            }
+            other => panic!("expected CommittedSegment, got {other:?}"),
+        }
+        match w.document_location(4) {
+            DocLocation::CommittedSegment { local_id, .. } => assert_eq!(local_id, 4),
+            other => panic!("expected CommittedSegment, got {other:?}"),
+        }
+        assert!(matches!(w.document_location(5), DocLocation::NotFound));
+
+        // Add 3 more docs (buffered after committed segment)
+        for i in 5..8u32 {
+            w.add_document(rt_doc("INFO", "world", 1000 + i as i64))
+                .unwrap();
+        }
+        // global_id 5 => Buffer local_id 0
+        match w.document_location(5) {
+            DocLocation::Buffer { local_id, .. } => assert_eq!(local_id, 0),
+            other => panic!("expected Buffer, got {other:?}"),
+        }
+        // global_id 7 => Buffer local_id 2
+        match w.document_location(7) {
+            DocLocation::Buffer { local_id, .. } => assert_eq!(local_id, 2),
+            other => panic!("expected Buffer, got {other:?}"),
+        }
+        assert!(matches!(w.document_location(8), DocLocation::NotFound));
+
         fs::remove_dir_all(&root).unwrap();
     }
 }

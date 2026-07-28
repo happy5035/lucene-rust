@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "croaring"
-version = "2.7.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1923cfaba49fda0b2e27f16f3772e677b499621bdf016b9e40ffcb1ca0981d7e"
+checksum = "d0e813b58ac55ac5ccea5ec63beb8c80f37dedd78da3f594c848313415a08c8c"
 dependencies = [
  "allocator-api2",
  "croaring-sys",

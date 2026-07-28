@@ -9,24 +9,24 @@
 use std::io;
 
 use codec_lucene9::postings_read::NO_MORE_DOCS;
-use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
-use super::doc_iter::{BitsetDocIter, SegmentDocIter};
+use super::doc_iter::{BitsetDocIter, DocIter, SegmentDocIter};
+use super::leaf_access::LeafAccess;
 use super::query::Query;
-use super::segment_reader::SegmentReader;
 
 /// AbstractMultiTermQueryConstantScoreWrapper.java:44.
 pub(crate) const BOOLEAN_REWRITE_THRESHOLD: usize = 16;
 
 /// Terms of one query present in one segment's dictionary, df-sorted
-/// (spec §4: 集合收集后按 df 排序交给双路).
-pub(crate) struct CollectedTerms {
+/// (spec §4: 集合收集后按 df 排序交给双路). Generic over the leaf's term
+/// handle type (`L::TermHandle`).
+pub(crate) struct CollectedTerms<H> {
     pub terms: Vec<Vec<u8>>,
-    pub entries: Vec<(u32, TermEntry)>,
+    pub entries: Vec<(u32, H)>,
 }
 
-impl CollectedTerms {
+impl<H> CollectedTerms<H> {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -36,7 +36,7 @@ impl CollectedTerms {
     }
 
     pub(crate) fn sort_by_df(&mut self) {
-        let mut pairs: Vec<(Vec<u8>, (u32, TermEntry))> =
+        let mut pairs: Vec<(Vec<u8>, (u32, H))> =
             self.terms.drain(..).zip(self.entries.drain(..)).collect();
         pairs.sort_by_key(|(_, (df, _))| *df);
         for (t, e) in pairs {
@@ -48,11 +48,11 @@ impl CollectedTerms {
 
 /// Direct term-set collection (Terms/IN): seek each term, keep the present
 /// ones. `None` = unknown field (empty-hit semantics, same as TermQuery).
-pub(crate) fn collect_direct(
-    seg: &mut SegmentReader,
+pub(crate) fn collect_direct<L: LeafAccess>(
+    seg: &mut L,
     field: &str,
     terms: &[Vec<u8>],
-) -> io::Result<Option<(bool, CollectedTerms)>> {
+) -> io::Result<Option<(bool, CollectedTerms<L::TermHandle>)>> {
     let Some(has_freqs) = seg.field_has_freqs(field) else {
         return Ok(None);
     };
@@ -62,8 +62,9 @@ pub(crate) fn collect_direct(
     };
     for t in terms {
         if let Some((_, entry)) = seg.seek_term(field, t)? {
+            let df = seg.term_doc_freq(&entry);
             collected.terms.push(t.clone());
-            collected.entries.push((entry.doc_freq, entry));
+            collected.entries.push((df, entry));
         }
     }
     collected.sort_by_df();
@@ -72,29 +73,41 @@ pub(crate) fn collect_direct(
 
 /// Prefix collection (spec §3): seek_ceil(prefix) then next() until
 /// !starts_with(prefix). `None` = unknown field (empty-hit semantics).
-pub(crate) fn collect_prefix(
-    seg: &mut SegmentReader,
+///
+/// The trait `terms_iter` yields `TermEntryLike` (opaque metadata), so the
+/// matching term bytes are enumerated first and then re-sought via
+/// `seek_term` to materialize the concrete `L::TermHandle` needed for
+/// postings access.
+pub(crate) fn collect_prefix<L: LeafAccess>(
+    seg: &mut L,
     field: &str,
     prefix: &[u8],
-) -> io::Result<Option<(bool, CollectedTerms)>> {
+) -> io::Result<Option<(bool, CollectedTerms<L::TermHandle>)>> {
     let Some(has_freqs) = seg.field_has_freqs(field) else {
         return Ok(None);
     };
-    let mut collected = CollectedTerms {
-        terms: Vec::new(),
-        entries: Vec::new(),
-    };
+    let mut matched: Vec<Vec<u8>> = Vec::new();
     {
         let Some(mut it) = seg.terms_iter(field) else {
             return Ok(None);
         };
         it.seek_ceil(prefix)?;
-        while let Some((term, entry)) = it.next()? {
+        while let Some((term, _)) = it.next()? {
             if !term.starts_with(prefix) {
                 break;
             }
-            collected.entries.push((entry.doc_freq, entry));
-            collected.terms.push(term);
+            matched.push(term);
+        }
+    }
+    let mut collected = CollectedTerms {
+        terms: Vec::new(),
+        entries: Vec::new(),
+    };
+    for t in matched {
+        if let Some((_, entry)) = seg.seek_term(field, &t)? {
+            let df = seg.term_doc_freq(&entry);
+            collected.entries.push((df, entry));
+            collected.terms.push(t);
         }
     }
     collected.sort_by_df();
@@ -192,11 +205,11 @@ pub(crate) fn glob_match(pattern: &str, text: &[u8]) -> bool {
 /// Wildcard collection (spec §5): Exact → direct seek; PurePrefix → prefix
 /// enumeration with zero filtering; PrefixFilter → prefix enumeration +
 /// glob tail filter; FullScan → whole-dictionary scan + glob filter.
-pub(crate) fn collect_wildcard(
-    seg: &mut SegmentReader,
+pub(crate) fn collect_wildcard<L: LeafAccess>(
+    seg: &mut L,
     field: &str,
     pat: &WildcardPattern,
-) -> io::Result<Option<(bool, CollectedTerms)>> {
+) -> io::Result<Option<(bool, CollectedTerms<L::TermHandle>)>> {
     match pat.class {
         WildcardClass::Exact => collect_direct(seg, field, std::slice::from_ref(&pat.pattern)),
         WildcardClass::PurePrefix => collect_prefix(seg, field, &pat.prefix),
@@ -204,10 +217,7 @@ pub(crate) fn collect_wildcard(
             let Some(has_freqs) = seg.field_has_freqs(field) else {
                 return Ok(None);
             };
-            let mut collected = CollectedTerms {
-                terms: Vec::new(),
-                entries: Vec::new(),
-            };
+            let mut matched: Vec<Vec<u8>> = Vec::new();
             {
                 let Some(mut it) = seg.terms_iter(field) else {
                     return Ok(None);
@@ -215,14 +225,24 @@ pub(crate) fn collect_wildcard(
                 if pat.class == WildcardClass::PrefixFilter {
                     it.seek_ceil(&pat.prefix)?;
                 }
-                while let Some((term, entry)) = it.next()? {
+                while let Some((term, _)) = it.next()? {
                     if pat.class == WildcardClass::PrefixFilter && !term.starts_with(&pat.prefix) {
                         break;
                     }
                     if pat.matches(&term) {
-                        collected.entries.push((entry.doc_freq, entry));
-                        collected.terms.push(term);
+                        matched.push(term);
                     }
+                }
+            }
+            let mut collected = CollectedTerms {
+                terms: Vec::new(),
+                entries: Vec::new(),
+            };
+            for t in matched {
+                if let Some((_, entry)) = seg.seek_term(field, &t)? {
+                    let df = seg.term_doc_freq(&entry);
+                    collected.entries.push((df, entry));
+                    collected.terms.push(t);
                 }
             }
             collected.sort_by_df();
@@ -233,11 +253,11 @@ pub(crate) fn collect_wildcard(
 
 /// Threshold dispatch (spec §4): <=16 terms rewrite to `Query::Or` (heap
 /// merge, zero new execution code); >16 materialize a FixedBitSet.
-pub(crate) fn segment_iterator(
-    seg: &mut SegmentReader,
+pub(crate) fn segment_iterator<L: LeafAccess>(
+    seg: &mut L,
     field: &str,
     has_freqs: bool,
-    collected: &CollectedTerms,
+    collected: &CollectedTerms<L::TermHandle>,
     needs_freq: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
     if collected.is_empty() {
@@ -256,10 +276,10 @@ pub(crate) fn segment_iterator(
 
 /// Count fast path (spec §4: count 路径直接 popcount): `Some(popcount)` on
 /// the bitset path, `None` when the OR path applies (caller iterates).
-pub(crate) fn bitset_count(
-    seg: &SegmentReader,
+pub(crate) fn bitset_count<L: LeafAccess>(
+    seg: &L,
     has_freqs: bool,
-    collected: &CollectedTerms,
+    collected: &CollectedTerms<L::TermHandle>,
 ) -> io::Result<Option<u64>> {
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
         return Ok(None);
@@ -273,9 +293,9 @@ pub(crate) fn bitset_count(
 /// the M3 tier-2 roaring materialization: feeds every doc of `entry`'s
 /// postings to `f` in ascending order. Uses no-freq enums on freqs fields —
 /// the materialized sets carry no per-doc freq (ConstantScore).
-pub(crate) fn for_each_doc(
-    seg: &SegmentReader,
-    entry: &TermEntry,
+pub(crate) fn for_each_doc<L: LeafAccess>(
+    seg: &L,
+    entry: &L::TermHandle,
     has_freqs: bool,
     f: &mut impl FnMut(u32),
 ) -> io::Result<()> {
@@ -303,9 +323,9 @@ pub(crate) fn for_each_doc(
 
 /// Bitset materialization (spec §4): per-term full postings scan, one bit
 /// per hit doc.
-pub(crate) fn materialize(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+pub(crate) fn materialize<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
 ) -> io::Result<FixedBitSet> {
     let mut bits = FixedBitSet::new(seg.max_doc() as usize);

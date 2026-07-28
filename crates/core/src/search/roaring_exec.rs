@@ -15,11 +15,10 @@ use std::io;
 
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::FrozenBitmap;
-use codec_lucene9::terms_read::TermEntry;
 
 use super::doc_iter::{DocIter, DocSource, RoaringAndDocIter, RoaringOrDocIter, SegmentDocIter};
+use super::leaf_access::LeafAccess;
 use super::multi_term::for_each_doc;
-use super::segment_reader::SegmentReader;
 
 /// Tier-1 skew gate: when max/min df reaches this ratio the AND runs
 /// smallest-side iteration + contains() probes; below it, the croaring
@@ -40,19 +39,22 @@ pub(crate) const SKEW_RATIO: u64 = 256; // bench-calibrated (T5): fold wins all 
 /// field, an absent AND clause, or no OR clause present. M6 T-A：泛型化
 /// 到 `AsRef<[u8]>`——`Vec<u8>`（And/Or 平铺变体）与 `&[u8]`（Bool 拍平
 /// 的借引用 terms）同入口，单态化零成本。
-pub(crate) fn collect_bool_entries<T: AsRef<[u8]>>(
-    seg: &mut SegmentReader,
+pub(crate) fn collect_bool_entries<L: LeafAccess, T: AsRef<[u8]>>(
+    seg: &mut L,
     field: &str,
     terms: &[T],
     is_and: bool,
-) -> io::Result<Option<(bool, Vec<(u32, TermEntry)>)>> {
+) -> io::Result<Option<(bool, Vec<(u32, L::TermHandle)>)>> {
     let Some(has_freqs) = seg.field_has_freqs(field) else {
         return Ok(None);
     };
     let mut entries = Vec::with_capacity(terms.len());
     for t in terms {
         match seg.seek_term(field, t.as_ref())? {
-            Some((_, entry)) => entries.push((entry.doc_freq, entry)),
+            Some((_, entry)) => {
+                let df = seg.term_doc_freq(&entry);
+                entries.push((df, entry));
+            }
             None => {
                 if is_and {
                     return Ok(None); // missing MUST clause: no hits in this segment
@@ -70,12 +72,12 @@ pub(crate) fn collect_bool_entries<T: AsRef<[u8]>>(
 /// Tier-2 query-time materialization of one low-df clause: full postings
 /// scan into an ascending doc vec (spec §5: df<4096 → ≤4095 docs,
 /// bounded). Docs arrive ascending from the enum.
-fn materialize_docs(
-    seg: &SegmentReader,
-    entry: &TermEntry,
+fn materialize_docs<L: LeafAccess>(
+    seg: &L,
+    entry: &L::TermHandle,
     has_freqs: bool,
 ) -> io::Result<Vec<u32>> {
-    let mut docs = Vec::with_capacity(entry.doc_freq as usize);
+    let mut docs = Vec::with_capacity(seg.term_doc_freq(entry) as usize);
     for_each_doc(seg, entry, has_freqs, &mut |d| docs.push(d))?;
     Ok(docs)
 }
@@ -83,9 +85,9 @@ fn materialize_docs(
 /// Opens every clause's frozen view (one sequential region read each —
 /// open/probe 合一, 关键设计事实 6). None = no clause has a bitmap
 /// (tier 3).
-fn open_clauses(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+fn open_clauses<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
 ) -> io::Result<Option<Vec<Option<FrozenBitmap>>>> {
     let mut opened = Vec::with_capacity(entries.len());
     for (_, entry) in entries {
@@ -100,9 +102,9 @@ fn open_clauses(
 /// Tier-1/2 AND over frozen views (M5 §2). entries are df-ascending (==
 /// cardinality-ascending, validation ③), so construction order is
 /// cheapest-first.
-fn and_iterator(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+fn and_iterator<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
     let Some(opened) = open_clauses(seg, entries)? else {
@@ -143,9 +145,9 @@ fn and_iterator(
 /// Tier-1/2 OR (M5 §2): all-bitmap → croaring materialized `or` fold +
 /// result iteration; mixed → k-way merge-union over batch cursors +
 /// materialized low-df slices. All-None = tier 3.
-fn or_iterator(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+fn or_iterator<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
     let Some(opened) = open_clauses(seg, entries)? else {
@@ -172,9 +174,9 @@ fn or_iterator(
 
 /// Three-tier segment iterator (spec §5): Some = roaring path taken
 /// (tier 1/2); None = tier 3, the caller builds the PFOR iterator.
-pub(crate) fn segment_iterator(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+pub(crate) fn segment_iterator<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
     is_and: bool,
 ) -> io::Result<Option<SegmentDocIter>> {
@@ -189,9 +191,9 @@ pub(crate) fn segment_iterator(
 /// no per-doc driving); tier-2 mixed → drive the same iterator to
 /// exhaustion (bounded candidates; count == iteration by construction).
 /// None = tier 3, caller iterates.
-pub(crate) fn count(
-    seg: &SegmentReader,
-    entries: &[(u32, TermEntry)],
+pub(crate) fn count<L: LeafAccess>(
+    seg: &L,
+    entries: &[(u32, L::TermHandle)],
     has_freqs: bool,
     is_and: bool,
 ) -> io::Result<Option<u64>> {

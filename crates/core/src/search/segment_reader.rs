@@ -216,7 +216,7 @@ impl LeafAccess for SegmentReader {
     }
 
     fn positions_enum(&self, entry: &TermEntry) -> io::Result<SegmentDocIter> {
-        let en = self.postings.positions(entry)?;
+        let en = SegmentReader::positions_enum(self, entry)?;
         Ok(SegmentDocIter::Phrase(PhraseDocIter::from_entries(
             vec![(entry.doc_freq, 0, en)],
             None,
@@ -236,13 +236,13 @@ impl LeafAccess for SegmentReader {
     }
 
     fn terms_iter(&mut self, field: &str) -> Option<Box<dyn TermsIterAccess + '_>> {
-        let fi = self.field_infos.by_name(field)?;
-        let it = self.terms.terms_iter(fi);
-        Some(Box::new(DiskTermsIter { inner: it }))
+        Some(Box::new(DiskTermsIter {
+            inner: SegmentReader::terms_iter(self, field)?,
+        }))
     }
 
     fn points_reader(&self) -> Option<&dyn PointsAccess> {
-        self.points.as_ref().map(|p| p as &dyn PointsAccess)
+        SegmentReader::points_reader(self).map(|p| p as &dyn PointsAccess)
     }
 
     fn numeric_dv(&self, field: &str, doc: u32) -> Option<i64> {

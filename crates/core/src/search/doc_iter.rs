@@ -12,6 +12,7 @@ use codec_lucene9::roaring::{FrozenBitmap, MaterializedBitmap};
 use codec_lucene9::terms_read::TermEntry;
 
 use super::bitset::FixedBitSet;
+use super::leaf_access::LeafAccess;
 use super::segment_reader::SegmentReader;
 
 pub trait DocIter {
@@ -533,8 +534,8 @@ impl PhraseDocIter {
     /// no positions — fail-fast, mirroring Java's execution-time error of
     /// PhraseQuery on such fields (Lucene912PostingsReader.postings :280-309
     /// downgrades to a docs-only enum whose nextPosition throws).
-    pub fn new(
-        seg: &mut SegmentReader,
+    pub fn new<L: LeafAccess>(
+        seg: &mut L,
         field: &str,
         terms: &[Vec<u8>],
     ) -> io::Result<Option<PhraseDocIter>> {
@@ -557,12 +558,13 @@ impl PhraseDocIter {
                 ),
             ));
         }
-        let mut sought: Vec<(u32, u32, TermEntry)> = Vec::with_capacity(terms.len());
+        let mut sought: Vec<(u32, u32, L::TermHandle)> = Vec::with_capacity(terms.len());
         for (i, t) in terms.iter().enumerate() {
             let Some((_, entry)) = seg.seek_term(field, t)? else {
                 return Ok(None); // absent term: no hits (PhraseWeight null scorer)
             };
-            sought.push((entry.doc_freq, i as u32, entry));
+            let df = seg.term_doc_freq(&entry);
+            sought.push((df, i as u32, entry));
         }
         sought.sort_by_key(|(df, _, _)| *df);
         // M7 §2.2 bitmap 候选快路径：全部 term 有内联 bitmap → roaring
@@ -579,9 +581,20 @@ impl PhraseDocIter {
             }
         }
         let approx_bitmaps = if all_bitmap { Some(views) } else { None };
+        // LeafAccess::positions_enum 返回 SegmentDocIter（磁盘侧把单个
+        // PositionsEnum 包进单词 PhraseDocIter）；from_entries 需要裸
+        // PositionsEnum 做跨 term 位置验证，故解包还原（L=SegmentReader
+        // 时与旧 inherent 路径逐字节一致）。
         let mut entries: Vec<(u32, u32, PositionsEnum)> = Vec::with_capacity(sought.len());
-        for (_, offset, entry) in sought {
-            entries.push((entry.doc_freq, offset, seg.positions_enum(&entry)?));
+        for (df, offset, entry) in sought {
+            let it = seg.positions_enum(&entry)?;
+            let pen = it.into_positions_enum().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "LeafAccess::positions_enum did not yield a positions iterator",
+                )
+            })?;
+            entries.push((df, offset, pen));
         }
         Ok(Some(Self::from_entries(entries, approx_bitmaps)))
     }
@@ -614,6 +627,20 @@ impl PhraseDocIter {
             approx,
             doc: -1,
             lead: 0,
+        }
+    }
+
+    /// Inverse of the `LeafAccess::positions_enum` wrapping: extract the
+    /// single wrapped `PositionsEnum` when this is a one-term phrase (the
+    /// shape every `positions_enum` impl produces). Returns `None` for a
+    /// genuine multi-term phrase. Used by the generic `PhraseDocIter::new`
+    /// to rebuild a multi-term phrase from per-term positions iterators.
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnum> {
+        if self.occ.len() == 1 {
+            let mut occ = self.occ;
+            Some(occ.pop().unwrap().en)
+        } else {
+            None
         }
     }
 
@@ -1661,6 +1688,18 @@ pub enum SegmentDocIter {
     Excluding(ExcludingDocIter),
     MemDocs(MemDocsIter),
     MemFreqs(MemFreqsIter),
+}
+
+impl SegmentDocIter {
+    /// Extract a wrapped `PositionsEnum` from a single-term `Phrase`
+    /// iterator (the shape `LeafAccess::positions_enum` produces); `None`
+    /// for any other variant. See `PhraseDocIter::into_positions_enum`.
+    pub(crate) fn into_positions_enum(self) -> Option<PositionsEnum> {
+        match self {
+            SegmentDocIter::Phrase(p) => p.into_positions_enum(),
+            _ => None,
+        }
+    }
 }
 
 impl DocIter for SegmentDocIter {

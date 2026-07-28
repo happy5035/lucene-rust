@@ -12,6 +12,7 @@ pub(crate) mod roaring_exec;
 pub mod searcher;
 pub mod segment_reader;
 pub mod sorted_collector;
+pub mod leaf_access;
 
 pub use bitset::FixedBitSet;
 pub use collector::{Collector, CountCollector, FreqSumCollector, TopDocCollector};
@@ -21,6 +22,7 @@ pub use reader::Reader;
 pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
 pub use sorted_collector::{SearchResults, SortedTopN};
+pub use leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
 
 #[cfg(test)]
 mod tests {

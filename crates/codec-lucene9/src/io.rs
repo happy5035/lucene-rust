@@ -653,8 +653,10 @@ enum InputSource {
 pub struct IndexInput {
     source: InputSource,
     length: u64,
-    // Only used for File source; Memory reads bypass this entirely.
-    buffer: [u8; INPUT_BUFFER_CAPACITY],
+    // Only used for File source; Memory/Mmap reads bypass this entirely,
+    // so it is allocated lazily (an 8 KiB zeroed inline array made every
+    // enum/slice construction pay a memset it never used).
+    buffer: Option<Box<[u8; INPUT_BUFFER_CAPACITY]>>,
     buffer_start: u64, // absolute position of buffer[0]
     buffer_len: usize, // valid bytes in buffer
     position: u64,     // absolute position of the next byte to read
@@ -666,7 +668,7 @@ impl IndexInput {
         IndexInput {
             source: InputSource::File { file: Arc::new(file), base: 0 },
             length,
-            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer: Some(Box::new([0; INPUT_BUFFER_CAPACITY])),
             buffer_start: 0,
             buffer_len: 0,
             position: 0,
@@ -679,7 +681,7 @@ impl IndexInput {
         IndexInput {
             source: InputSource::Memory { data: Arc::new(bytes), offset: 0 },
             length,
-            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer: None,
             buffer_start: 0,
             buffer_len: 0,
             position: 0,
@@ -692,7 +694,7 @@ impl IndexInput {
         IndexInput {
             source: InputSource::Mmap { data: mmap, offset: 0 },
             length,
-            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer: None,
             buffer_start: 0,
             buffer_len: 0,
             position: 0,
@@ -750,10 +752,14 @@ impl IndexInput {
                 offset: parent_off + offset,
             },
         };
+        let buffer = match &source {
+            InputSource::File { .. } => Some(Box::new([0; INPUT_BUFFER_CAPACITY])),
+            _ => None,
+        };
         Ok(IndexInput {
             source,
             length,
-            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer,
             buffer_start: 0,
             buffer_len: 0,
             position: 0,
@@ -776,24 +782,27 @@ impl IndexInput {
                     io_stats::READ_BYTES.fetch_add(n as u64, Relaxed);
                     io_stats::READ_CALLS.fetch_add(1, Relaxed);
                 }
+                let buf = self.buffer.as_mut().expect("File source buffer");
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::FileExt;
-                    file.read_at(&mut self.buffer[..n], base + self.position)?;
+                    file.read_at(&mut buf[..n], base + self.position)?;
                 }
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::FileExt;
-                    file.seek_read(&mut self.buffer[..n], base + self.position)?;
+                    file.seek_read(&mut buf[..n], base + self.position)?;
                 }
             }
             InputSource::Memory { data, offset } => {
                 let start = (offset + self.position) as usize;
-                self.buffer[..n].copy_from_slice(&data[start..start + n]);
+                let buf = self.buffer.as_mut().expect("buffered read buffer");
+                buf[..n].copy_from_slice(&data[start..start + n]);
             }
             InputSource::Mmap { data, offset } => {
                 let start = (offset + self.position) as usize;
-                self.buffer[..n].copy_from_slice(&data[start..start + n]);
+                let buf = self.buffer.as_mut().expect("buffered read buffer");
+                buf[..n].copy_from_slice(&data[start..start + n]);
             }
         }
         self.buffer_start = self.position;
@@ -932,6 +941,46 @@ pub trait DataInput {
     }
 }
 
+/// Zero-copy `DataInput` over a borrowed byte slice. Unlike
+/// `IndexInput::in_memory` (which takes ownership of a `Vec`, forcing a
+/// heap copy at call sites that only have a slice), this borrows in place
+/// and never allocates.
+pub struct SliceInput<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SliceInput<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        SliceInput { buf, pos: 0 }
+    }
+
+    /// Bytes consumed so far.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+}
+
+impl DataInput for SliceInput<'_> {
+    fn read_byte(&mut self) -> io::Result<u8> {
+        let b = *self.buf.get(self.pos).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "SliceInput overrun")
+        })?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let end = self.pos + buf.len();
+        let src = self.buf.get(self.pos..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "SliceInput overrun")
+        })?;
+        buf.copy_from_slice(src);
+        self.pos = end;
+        Ok(())
+    }
+}
+
 impl DataInput for IndexInput {
     /// BufferedIndexInput.readByte (:52-58).
     fn read_byte(&mut self) -> io::Result<u8> {
@@ -954,7 +1003,8 @@ impl DataInput for IndexInput {
         if self.buffered() == 0 {
             self.refill()?;
         }
-        let b = self.buffer[(self.position - self.buffer_start) as usize];
+        let b = self.buffer.as_ref().expect("buffered read buffer")
+            [(self.position - self.buffer_start) as usize];
         self.position += 1;
         Ok(b)
     }
@@ -985,7 +1035,8 @@ impl DataInput for IndexInput {
             }
             let n = self.buffered().min(buf.len());
             let start = (self.position - self.buffer_start) as usize;
-            buf[..n].copy_from_slice(&self.buffer[start..start + n]);
+            buf[..n]
+                .copy_from_slice(&self.buffer.as_ref().expect("buffered read buffer")[start..start + n]);
             self.position += n as u64;
             let rest = std::mem::take(&mut buf);
             buf = &mut rest[n..];

@@ -13,10 +13,10 @@ use crate::codec_util::{check_footer, check_footer_structure, check_index_header
 use crate::directory::FSDirectory;
 use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use crate::automaton::{DEAD, WildcardDfa};
-use crate::fst::{FstMetadata, FstReader};
-use crate::io::{DataInput, IndexInput};
+use crate::fst::{FstArc, FstMetadata, FstReader};
+use crate::io::{DataInput, IndexInput, SliceInput};
 use crate::postings::{
-    BLOCKTREE_VERSION, OUTPUT_FLAG_HAS_TERMS, OUTPUT_FLAG_IS_FLOOR, POSTINGS_VERSION,
+    BLOCKTREE_VERSION, OUTPUT_FLAG_IS_FLOOR, POSTINGS_VERSION,
     SEGMENT_SUFFIX, TERMS_CODEC, TIM_CODEC, TIP_CODEC, TMD_CODEC, file_name,
 };
 use crate::postings_ll::{BLOCK_SIZE, read_msb_vlong};
@@ -61,6 +61,28 @@ pub struct TermsDict {
     tip_in: IndexInput,
     fields: Vec<FieldTermsMeta>,
     fsts: Vec<Option<FstReader>>,
+    scan_scratch: ScanScratch,
+    seek_scratch: SeekScratch,
+}
+
+/// Reusable buffers for the FST descent in `seek_exact` (`trace_deepest`).
+/// Kept on the reader so a term lookup allocates nothing.
+#[derive(Default)]
+struct SeekScratch {
+    arcs: Vec<FstArc>,
+    out: Vec<u8>,
+    final_out: Vec<u8>,
+    output: Vec<u8>,
+}
+
+/// Reusable block-decode buffers for `scan_block` (one block load = four
+/// blob reads). Kept on the reader so a term lookup allocates nothing.
+#[derive(Default)]
+struct ScanScratch {
+    suffix: Vec<u8>,
+    suffix_lens: Vec<u8>,
+    stats: Vec<u8>,
+    meta: Vec<u8>,
 }
 
 /// Lucene90BlockTreeTermsReader.readBytesRef (:271-282).
@@ -191,6 +213,8 @@ impl TermsDict {
             tip_in,
             fields,
             fsts,
+            scan_scratch: ScanScratch::default(),
+            seek_scratch: SeekScratch::default(),
         })
     }
 
@@ -233,43 +257,25 @@ impl TermsDict {
                 return Ok(None);
             }
         }
-        // FST descent: (depth, output) candidates, deepest last.
-        let mut frames: Vec<(usize, Vec<u8>)> =
-            vec![(0, self.fields[field_index].root_code.clone())];
-        {
-            let traced = self.fst(field_index)?.trace_path(term)?;
-            frames.extend(traced);
-        }
-        let (depth, output) = frames.last().unwrap();
-        let depth = *depth;
+        // FST descent, keeping only the deepest candidate frame (seek_ceil
+        // is the one that needs ancestors, for frame pops). The root frame
+        // stands in when the FST matched no prefix of the term.
+        let _ = self.fst(field_index)?; // ensure loaded
+        let fst = self.fsts[field_index].as_ref().unwrap();
+        let SeekScratch {
+            arcs,
+            out,
+            final_out,
+            output,
+        } = &mut self.seek_scratch;
+        let depth = fst.trace_deepest(term, arcs, out, final_out, output)?;
+        let (depth, output) = match depth {
+            Some(d) => (d, output.as_slice()),
+            None => (0, self.fields[field_index].root_code.as_slice()),
+        };
         // pushFrame (:245-259): fp + flags from the output's leading
-        // MSB-VLong; OUTPUT_FLAGS_NUM_BITS = 2 (Reader :72).
-        let mut out_in = IndexInput::in_memory(output.clone());
-        let code = read_msb_vlong(&mut out_in)?;
-        let mut fp = code >> 2;
-        let is_floor = code & OUTPUT_FLAG_IS_FLOOR != 0;
-        let _has_terms = code & OUTPUT_FLAG_HAS_TERMS != 0;
-        // scanToFloorFrame (Frame :361-431): pick the last floor sub-block
-        // whose lead label <= the target byte at the frame's prefix length.
-        if is_floor && depth < term.len() {
-            let target_label = term[depth];
-            let num_follow = out_in.read_vint()? as u32;
-            let mut next_label = out_in.read_byte()?;
-            if target_label >= next_label {
-                let fp_orig = fp;
-                for i in 0..num_follow {
-                    let sub_code = out_in.read_vlong()? as u64;
-                    fp = fp_orig + (sub_code >> 1);
-                    if i + 1 == num_follow {
-                        break;
-                    }
-                    next_label = out_in.read_byte()?;
-                    if target_label < next_label {
-                        break;
-                    }
-                }
-            }
-        }
+        // MSB-VLong, then scanToFloorFrame (Frame :361-431).
+        let (_fp_anchor, fp) = fst_output_block_fp(output, term, depth)?;
         self.scan_block(fp, depth, term, field)
     }
 
@@ -302,29 +308,39 @@ impl TermsDict {
                 "unsupported suffix compression {compression} (writer emits NO_COMPRESSION)"
             )));
         }
-        let mut suffix_bytes = vec![0u8; num_suffix_bytes];
-        self.tim_in.read_bytes(&mut suffix_bytes)?;
+        let ScanScratch {
+            suffix: suffix_bytes,
+            suffix_lens: sl_bytes,
+            stats: stat_bytes,
+            meta: meta_bytes,
+        } = &mut self.scan_scratch;
+        suffix_bytes.clear();
+        suffix_bytes.resize(num_suffix_bytes, 0);
+        self.tim_in.read_bytes(suffix_bytes)?;
         // suffix lengths blob, with the all-equal-bytes trick (writer :1026-1037)
         let mut num_sl_bytes = self.tim_in.read_vint()? as usize;
         let all_equal = num_sl_bytes & 1 != 0;
         num_sl_bytes >>= 1;
-        let mut sl_bytes = vec![0u8; num_sl_bytes];
+        sl_bytes.clear();
+        sl_bytes.resize(num_sl_bytes, 0);
         if all_equal {
             let b = self.tim_in.read_byte()?;
             sl_bytes.fill(b);
         } else {
-            self.tim_in.read_bytes(&mut sl_bytes)?;
+            self.tim_in.read_bytes(sl_bytes)?;
         }
         let num_stat_bytes = self.tim_in.read_vint()? as usize;
-        let mut stat_bytes = vec![0u8; num_stat_bytes];
-        self.tim_in.read_bytes(&mut stat_bytes)?;
+        stat_bytes.clear();
+        stat_bytes.resize(num_stat_bytes, 0);
+        self.tim_in.read_bytes(stat_bytes)?;
         let num_meta_bytes = self.tim_in.read_vint()? as usize;
-        let mut meta_bytes = vec![0u8; num_meta_bytes];
-        self.tim_in.read_bytes(&mut meta_bytes)?;
+        meta_bytes.clear();
+        meta_bytes.resize(num_meta_bytes, 0);
+        self.tim_in.read_bytes(meta_bytes)?;
 
-        let mut suffix_lengths = IndexInput::in_memory(sl_bytes);
-        let mut stats = IndexInput::in_memory(stat_bytes);
-        let mut meta = IndexInput::in_memory(meta_bytes);
+        let mut suffix_lengths = SliceInput::new(sl_bytes);
+        let mut stats = SliceInput::new(stat_bytes);
+        let mut meta = SliceInput::new(meta_bytes);
         let mut suffix_pos = 0usize;
         let mut singleton_run: u32 = 0;
         // EMPTY_STATE (Lucene912PostingsWriter.java:425-457): fps 0, singleton -1
@@ -445,8 +461,7 @@ impl TermsDict {
         // FST-guided initial descent: skip root block for prefixed patterns.
         let (det_prefix, _det_state) = dfa.deterministic_prefix();
         let (start_fp, start_prefix_len, start_dfa_state) = if det_prefix.is_empty() {
-            let root_code = self.fields[field_index].root_code.clone();
-            let mut root_in = IndexInput::in_memory(root_code);
+            let mut root_in = SliceInput::new(&self.fields[field_index].root_code);
             let root_fp = read_msb_vlong(&mut root_in)? >> 2;
             (root_fp, 0, 0u32)
         } else {
@@ -454,8 +469,7 @@ impl TermsDict {
             let traces = self.fst(field_index)?.trace_path(&det_prefix)?;
             if traces.is_empty() {
                 // FST has no entry — all terms may be in root block. Fall back.
-                let root_code = self.fields[field_index].root_code.clone();
-                let mut root_in = IndexInput::in_memory(root_code);
+                let mut root_in = SliceInput::new(&self.fields[field_index].root_code);
                 let root_fp = read_msb_vlong(&mut root_in)? >> 2;
                 (root_fp, 0, 0u32)
             } else {
@@ -526,12 +540,35 @@ impl IntersectFrame {
         self.trans_dest = r.dest;
         true
     }
+
+    /// Re-target a pooled frame at a new sub-block, keeping its block
+    /// buffers (a full-dictionary scan pushes/pops a frame per sub-block).
+    fn reuse(&mut self, prefix_len: usize, fp: u64, dfa_state: u32, dfa: &WildcardDfa) {
+        self.base.prefix_len = prefix_len;
+        self.base.fp = fp;
+        self.base.fp_orig = fp;
+        self.dfa_state = dfa_state;
+        self.trans_index = 0;
+        let ranges = dfa.ranges(dfa_state);
+        if let Some(r) = ranges.first() {
+            self.trans_min = r.min;
+            self.trans_max = r.max;
+            self.trans_dest = r.dest;
+        } else {
+            self.trans_min = 0;
+            self.trans_max = 0;
+            self.trans_dest = DEAD;
+        }
+    }
 }
 
 struct IntersectTermsEnum<'a> {
     tim_in: &'a mut IndexInput,
     dfa: &'a WildcardDfa,
     frames: Vec<IntersectFrame>,
+    /// Popped frames kept for buffer reuse: a full-dictionary scan pushes
+    /// and pops a frame per sub-block, and each frame owns ~4 block buffers.
+    pool: Vec<IntersectFrame>,
     term: Vec<u8>,
     has_freqs: bool,
     has_positions: bool,
@@ -554,19 +591,31 @@ impl<'a> IntersectTermsEnum<'a> {
             tim_in,
             dfa,
             frames: vec![root],
+            pool: Vec::new(),
             term: initial_prefix.to_vec(),
             has_freqs,
             has_positions,
         })
     }
 
+    /// Moves the top frame to the pool and fixes up the term prefix.
+    fn pop_frame(&mut self) {
+        let popped = self.frames.pop().unwrap();
+        self.pool.push(popped);
+        if let Some(parent) = self.frames.last() {
+            self.term.truncate(parent.base.prefix_len);
+        }
+    }
+
     fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntry)>> {
         'outer: loop {
+            let has_freqs = self.has_freqs;
+            let has_positions = self.has_positions;
             let Some(frame) = self.frames.last_mut() else {
                 return Ok(None);
             };
 
-            let entry = next_frame_entry(&mut frame.base, self.has_freqs, self.has_positions)?;
+            let entry = next_frame_suffix(&mut frame.base)?;
 
             let Some((off, len, entry)) = entry else {
                 // Frame exhausted: floor sibling or pop
@@ -577,16 +626,14 @@ impl<'a> IntersectTermsEnum<'a> {
                     load_frame_block(self.tim_in, &mut frame.base)?;
                     continue 'outer;
                 }
-                self.frames.pop();
-                if let Some(parent) = self.frames.last() {
-                    self.term.truncate(parent.base.prefix_len);
-                }
+                self.pop_frame();
                 continue 'outer;
             };
 
             if len == 0 {
-                if let NextEntry::Term(te) = entry {
+                if let NextEntry::TermPending = entry {
                     if self.dfa.is_accept(frame.dfa_state) {
+                        let te = decode_frame_term(&mut frame.base, has_freqs, has_positions)?;
                         self.term.truncate(frame.base.prefix_len);
                         return Ok(Some((self.term.clone(), te)));
                     }
@@ -602,10 +649,7 @@ impl<'a> IntersectTermsEnum<'a> {
 
             while label > frame.trans_max {
                 if !frame.advance_range(self.dfa) {
-                    self.frames.pop();
-                    if let Some(parent) = self.frames.last() {
-                        self.term.truncate(parent.base.prefix_len);
-                    }
+                    self.pop_frame();
                     continue 'outer;
                 }
             }
@@ -619,7 +663,7 @@ impl<'a> IntersectTermsEnum<'a> {
             let suffix = &frame.base.suffix_bytes[off..off + len];
 
             match entry {
-                NextEntry::Term(te) => {
+                NextEntry::TermPending => {
                     let mut state = dest;
                     let mut matched = true;
                     for &b in &suffix[1..] {
@@ -632,8 +676,12 @@ impl<'a> IntersectTermsEnum<'a> {
                     if matched && self.dfa.is_accept(state) {
                         self.term.truncate(prefix_len);
                         self.term.extend_from_slice(suffix);
+                        let frame = self.frames.last_mut().unwrap();
+                        let te = decode_frame_term(&mut frame.base, has_freqs, has_positions)?;
                         return Ok(Some((self.term.clone(), te)));
                     }
+                    // Rejected: stats/meta stay undecoded (decode_frame_term
+                    // catches up only as far as the next accepted term).
                 }
                 NextEntry::SubBlock(sub_fp) => {
                     let mut state = dest;
@@ -651,10 +699,17 @@ impl<'a> IntersectTermsEnum<'a> {
                     self.term.truncate(prefix_len);
                     self.term.extend_from_slice(suffix);
                     let new_prefix_len = self.term.len();
-                    let mut child = IntersectFrame::new(new_prefix_len, sub_fp, state, self.dfa);
+                    let mut child = match self.pool.pop() {
+                        Some(mut f) => {
+                            f.reuse(new_prefix_len, sub_fp, state, self.dfa);
+                            f
+                        }
+                        None => IntersectFrame::new(new_prefix_len, sub_fp, state, self.dfa),
+                    };
                     load_frame_block(self.tim_in, &mut child.base)?;
                     self.frames.push(child);
                 }
+                NextEntry::Term(_) => unreachable!("suffix phase yields TermPending only"),
             }
         }
     }
@@ -678,13 +733,61 @@ struct IterFrame {
     is_last_in_floor: bool,
     is_leaf: bool,
     suffix_bytes: Vec<u8>,
-    suffix_lengths: IndexInput,
-    stats: IndexInput,
-    meta: IndexInput,
+    suffix_lengths: ByteCursor,
+    stats: ByteCursor,
+    meta: ByteCursor,
     suffix_pos: usize,
     next_ent: usize,
+    /// Term entries scanned so far in this block (sub-block entries have no
+    /// stats/meta blobs and don't count — Java `state.termBlockOrd`).
+    term_ord: usize,
+    /// Term entries whose stats/meta have been decoded (lazy decode, Java's
+    /// decodeMetaData catch-up: rejected terms never decode theirs).
+    meta_upto: usize,
     singleton_run: u32,
     last_state: TermState,
+}
+
+/// Per-stream block blob reader (suffix lengths / stats / meta): a plain
+/// buffer + position, reused across block loads. Replaces the per-load
+/// `IndexInput::in_memory` wrappers (an Arc allocation each, plus enum
+/// dispatch per byte read).
+#[derive(Default)]
+struct ByteCursor {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl ByteCursor {
+    fn reset(&mut self, len: usize) {
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        self.pos = 0;
+    }
+}
+
+impl DataInput for ByteCursor {
+    #[inline]
+    fn read_byte(&mut self) -> io::Result<u8> {
+        let b = *self
+            .buf
+            .get(self.pos)
+            .ok_or_else(|| corrupt("block stream overrun"))?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    #[inline]
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let end = self.pos + buf.len();
+        let src = self
+            .buf
+            .get(self.pos..end)
+            .ok_or_else(|| corrupt("block stream overrun"))?;
+        buf.copy_from_slice(src);
+        self.pos = end;
+        Ok(())
+    }
 }
 
 impl IterFrame {
@@ -699,11 +802,13 @@ impl IterFrame {
             is_last_in_floor: true,
             is_leaf: true,
             suffix_bytes: Vec::new(),
-            suffix_lengths: IndexInput::in_memory(Vec::new()),
-            stats: IndexInput::in_memory(Vec::new()),
-            meta: IndexInput::in_memory(Vec::new()),
+            suffix_lengths: ByteCursor::default(),
+            stats: ByteCursor::default(),
+            meta: ByteCursor::default(),
             suffix_pos: 0,
             next_ent: 0,
+            term_ord: 0,
+            meta_upto: 0,
             singleton_run: 0,
             // EMPTY_STATE (Lucene912PostingsWriter.java:425-457)
             last_state: TermState {
@@ -717,8 +822,11 @@ impl IterFrame {
 }
 
 /// One decoded block entry (SegmentTermsEnumFrame.next :291-298).
+/// `TermPending` is returned by [`next_frame_suffix`] before stats/meta are
+/// decoded; [`decode_frame_term`] turns it into a `TermEntry`.
 enum NextEntry {
     Term(TermEntry),
+    TermPending,
     SubBlock(u64),
 }
 
@@ -739,29 +847,29 @@ fn load_frame_block(tim_in: &mut IndexInput, frame: &mut IterFrame) -> io::Resul
             "unsupported suffix compression {compression} (writer emits NO_COMPRESSION)"
         )));
     }
-    frame.suffix_bytes = vec![0u8; num_suffix_bytes];
+    frame.suffix_bytes.clear();
+    frame.suffix_bytes.resize(num_suffix_bytes, 0);
     tim_in.read_bytes(&mut frame.suffix_bytes)?;
     let mut num_sl_bytes = tim_in.read_vint()? as usize;
     let all_equal = num_sl_bytes & 1 != 0;
     num_sl_bytes >>= 1;
-    let mut sl_bytes = vec![0u8; num_sl_bytes];
+    frame.suffix_lengths.reset(num_sl_bytes);
     if all_equal {
         let b = tim_in.read_byte()?;
-        sl_bytes.fill(b);
+        frame.suffix_lengths.buf.fill(b);
     } else {
-        tim_in.read_bytes(&mut sl_bytes)?;
+        tim_in.read_bytes(&mut frame.suffix_lengths.buf)?;
     }
     let num_stat_bytes = tim_in.read_vint()? as usize;
-    let mut stat_bytes = vec![0u8; num_stat_bytes];
-    tim_in.read_bytes(&mut stat_bytes)?;
+    frame.stats.reset(num_stat_bytes);
+    tim_in.read_bytes(&mut frame.stats.buf)?;
     let num_meta_bytes = tim_in.read_vint()? as usize;
-    let mut meta_bytes = vec![0u8; num_meta_bytes];
-    tim_in.read_bytes(&mut meta_bytes)?;
-    frame.suffix_lengths = IndexInput::in_memory(sl_bytes);
-    frame.stats = IndexInput::in_memory(stat_bytes);
-    frame.meta = IndexInput::in_memory(meta_bytes);
+    frame.meta.reset(num_meta_bytes);
+    tim_in.read_bytes(&mut frame.meta.buf)?;
     frame.suffix_pos = 0;
     frame.next_ent = 0;
+    frame.term_ord = 0;
+    frame.meta_upto = 0;
     frame.singleton_run = 0;
     frame.last_state = TermState {
         doc_start_fp: 0,
@@ -774,14 +882,12 @@ fn load_frame_block(tim_in: &mut IndexInput, frame: &mut IterFrame) -> io::Resul
     Ok(())
 }
 
-/// Reads the next entry of a loaded block: suffix (offset, len) + decoded
-/// payload. nextLeaf :300-312 / nextNonLeaf :314-356 for the entry shape,
-/// decodeMetaData :433-481 for stats, decodeTerm :235-277 for metadata.
-fn next_frame_entry(
-    frame: &mut IterFrame,
-    has_freqs: bool,
-    has_positions: bool,
-) -> io::Result<Option<(usize, usize, NextEntry)>> {
+/// Reads the next entry's suffix (offset, len) + payload kind, advancing
+/// only the suffix/suffix-length streams. Stats/meta are NOT decoded here —
+/// callers that accept the term must call [`decode_frame_term`], which
+/// catches up on every skipped entry first (Java: `Frame.next` vs
+/// `decodeMetaData`'s lazy metaDataUpto catch-up, :433-481).
+fn next_frame_suffix(frame: &mut IterFrame) -> io::Result<Option<(usize, usize, NextEntry)>> {
     if frame.next_ent == frame.ent_count {
         return Ok(None);
     }
@@ -799,55 +905,91 @@ fn next_frame_entry(
         let sub_fp = frame.fp - frame.suffix_lengths.read_vlong()? as u64;
         return Ok(Some((off, suffix_len, NextEntry::SubBlock(sub_fp))));
     }
-    // stats (decodeMetaData :433-481)
-    let (doc_freq, total_term_freq) = if frame.singleton_run > 0 {
-        frame.singleton_run -= 1;
-        (1u32, 1u64)
-    } else {
-        let token = frame.stats.read_vint()?;
-        if token & 1 != 0 {
-            frame.singleton_run = (token >> 1) as u32;
+    frame.term_ord += 1;
+    Ok(Some((off, suffix_len, NextEntry::TermPending)))
+}
+
+/// Decodes stats/meta up to the entry most recently returned by
+/// [`next_frame_suffix`], catching up on skipped entries (decodeMetaData
+/// :433-481 + decodeTerm :235-277). Returns the current entry's TermEntry.
+fn decode_frame_term(
+    frame: &mut IterFrame,
+    has_freqs: bool,
+    has_positions: bool,
+) -> io::Result<TermEntry> {
+    debug_assert!(frame.meta_upto < frame.term_ord);
+    let mut doc_freq = 0;
+    let mut total_term_freq = 0;
+    while frame.meta_upto < frame.term_ord {
+        frame.meta_upto += 1;
+        // stats (decodeMetaData :433-481)
+        (doc_freq, total_term_freq) = if frame.singleton_run > 0 {
+            frame.singleton_run -= 1;
             (1u32, 1u64)
         } else {
-            let df = (token >> 1) as u32;
-            let ttf = if has_freqs {
-                df as u64 + frame.stats.read_vlong()? as u64
+            let token = frame.stats.read_vint()?;
+            if token & 1 != 0 {
+                frame.singleton_run = (token >> 1) as u32;
+                (1u32, 1u64)
             } else {
-                df as u64
+                let df = (token >> 1) as u32;
+                let ttf = if has_freqs {
+                    df as u64 + frame.stats.read_vlong()? as u64
+                } else {
+                    df as u64
+                };
+                (df, ttf)
+            }
+        };
+        // metadata (Lucene912PostingsReader.decodeTerm :235-277)
+        let l = frame.meta.read_vlong()? as u64;
+        if l & 1 == 0 {
+            frame.last_state.doc_start_fp += l >> 1;
+            frame.last_state.singleton_doc_id = if doc_freq == 1 {
+                frame.meta.read_vint()? as i64
+            } else {
+                -1
             };
-            (df, ttf)
+        } else {
+            let delta = zigzag_decode(l >> 1);
+            frame.last_state.singleton_doc_id += delta;
         }
+        if has_positions {
+            frame.last_state.pos_start_fp += frame.meta.read_vlong()? as u64;
+            frame.last_state.last_pos_block_offset = if total_term_freq > BLOCK_SIZE as u64 {
+                frame.meta.read_vlong()?
+            } else {
+                -1
+            };
+        }
+    }
+    Ok(TermEntry {
+        doc_freq,
+        total_term_freq,
+        state: frame.last_state,
+    })
+}
+
+/// Reads the next entry of a loaded block: suffix (offset, len) + decoded
+/// payload (nextLeaf :300-312 / nextNonLeaf :314-356). Eager composition of
+/// [`next_frame_suffix`] + [`decode_frame_term`] for callers that accept
+/// every entry (seek scans, TermsIter).
+fn next_frame_entry(
+    frame: &mut IterFrame,
+    has_freqs: bool,
+    has_positions: bool,
+) -> io::Result<Option<(usize, usize, NextEntry)>> {
+    let Some((off, len, entry)) = next_frame_suffix(frame)? else {
+        return Ok(None);
     };
-    // metadata (Lucene912PostingsReader.decodeTerm :235-277)
-    let l = frame.meta.read_vlong()? as u64;
-    if l & 1 == 0 {
-        frame.last_state.doc_start_fp += l >> 1;
-        frame.last_state.singleton_doc_id = if doc_freq == 1 {
-            frame.meta.read_vint()? as i64
-        } else {
-            -1
-        };
-    } else {
-        let delta = zigzag_decode(l >> 1);
-        frame.last_state.singleton_doc_id += delta;
+    match entry {
+        NextEntry::SubBlock(_) => Ok(Some((off, len, entry))),
+        NextEntry::TermPending => {
+            let te = decode_frame_term(frame, has_freqs, has_positions)?;
+            Ok(Some((off, len, NextEntry::Term(te))))
+        }
+        NextEntry::Term(_) => unreachable!("TermPending is the only decoded-pending kind"),
     }
-    if has_positions {
-        frame.last_state.pos_start_fp += frame.meta.read_vlong()? as u64;
-        frame.last_state.last_pos_block_offset = if total_term_freq > BLOCK_SIZE as u64 {
-            frame.meta.read_vlong()?
-        } else {
-            -1
-        };
-    }
-    Ok(Some((
-        off,
-        suffix_len,
-        NextEntry::Term(TermEntry {
-            doc_freq,
-            total_term_freq,
-            state: frame.last_state,
-        }),
-    )))
 }
 
 /// pushFrame (:245-259) + scanToFloorFrame (:361-431) on one FST output:
@@ -857,7 +999,7 @@ fn next_frame_entry(
 /// (Frame.fp vs Frame.fpOrig in Lucene). Same logic as the inline descent
 /// in [`TermsDict::seek_exact`], factored for `seek_ceil`.
 fn fst_output_block_fp(output: &[u8], term: &[u8], depth: usize) -> io::Result<(u64, u64)> {
-    let mut out_in = IndexInput::in_memory(output.to_vec());
+    let mut out_in = SliceInput::new(output);
     let code = read_msb_vlong(&mut out_in)?;
     let fp_anchor = code >> 2;
     let mut fp = fp_anchor;
@@ -992,7 +1134,7 @@ impl<'a> TermsIter<'a> {
         // fp_orig stays the group anchor (Frame.fpOrig) so that popping
         // back finds the parent's sub-block entry.
         for (d, o) in &outs[..outs.len() - 1] {
-            let mut oi = IndexInput::in_memory(o.clone());
+            let mut oi = SliceInput::new(o);
             let code = read_msb_vlong(&mut oi)?;
             self.frames.push(IterFrame::new(*d, code >> 2));
         }
@@ -1069,6 +1211,7 @@ impl<'a> TermsIter<'a> {
                         NextEntry::SubBlock(_) => {
                             return Err(corrupt("ceil scan hit an exact sub-block match"));
                         }
+                        NextEntry::TermPending => unreachable!("eager path decodes"),
                     },
                     Ordering::Greater => match entry {
                         NextEntry::Term(te) => {
@@ -1086,6 +1229,7 @@ impl<'a> TermsIter<'a> {
                             descended = true;
                             break;
                         }
+                        NextEntry::TermPending => unreachable!("eager path decodes"),
                     },
                 }
             }
@@ -1171,6 +1315,7 @@ impl<'a> TermsIter<'a> {
                     self.pending = Some((self.term.clone(), te));
                     return Ok(());
                 }
+                Some((_, _, NextEntry::TermPending)) => unreachable!("eager path decodes"),
             }
         }
     }

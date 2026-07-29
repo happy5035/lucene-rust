@@ -507,12 +507,62 @@ impl FstMetadata {
     }
 }
 
+/// Inline buffer for arc outputs. FST outputs are vlong sequences (block
+/// fps, floor data) that are almost always short; spill to the heap only
+/// beyond INLINE bytes. Reading a node therefore allocates nothing in the
+/// common case (previously every arc output was its own `Vec`).
+#[derive(Clone, Debug)]
+pub struct OutBuf {
+    inline: [u8; Self::INLINE],
+    len: u8,
+    spill: Vec<u8>,
+}
+
+impl OutBuf {
+    const INLINE: usize = 24;
+
+    /// Wrap bytes stored in reverse order (as they appear in the FST image),
+    /// producing the forward-order output without an intermediate copy.
+    fn from_reversed(rev: &[u8]) -> OutBuf {
+        let len = rev.len();
+        if len <= Self::INLINE {
+            let mut inline = [0u8; Self::INLINE];
+            for i in 0..len {
+                inline[i] = rev[len - 1 - i];
+            }
+            OutBuf {
+                inline,
+                len: len as u8,
+                spill: Vec::new(),
+            }
+        } else {
+            OutBuf {
+                inline: [0u8; Self::INLINE],
+                len: Self::INLINE as u8 + 1, // marker: use spill
+                spill: rev.iter().rev().copied().collect(),
+            }
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        if self.len as usize <= Self::INLINE {
+            &self.inline[..self.len as usize]
+        } else {
+            &self.spill
+        }
+    }
+}
+
 /// One arc of an unpacked node (FST.Arc).
 #[derive(Clone, Debug)]
 pub struct FstArc {
     pub label: u8,
-    pub output: Option<Vec<u8>>,
-    pub final_output: Option<Vec<u8>>,
+    pub output: Option<OutBuf>,
+    /// Byte span (inclusive `[start, end]`, stored reversed) of the final
+    /// output in the FST image. Decoded on demand — floor data can run to
+    /// hundreds of bytes and only the matched arc's is ever read, so
+    /// eager decoding wastes a heap copy per arc per visited node.
+    pub final_output: Option<(u32, u32)>,
     pub is_final: bool,
     pub target: i64,
 }
@@ -578,17 +628,48 @@ impl FstReader {
     }
 
     /// ByteSequenceOutputs.read (:122-132) over reversed bytes.
-    fn read_output_rev(&self, pos: &mut i64) -> io::Result<Vec<u8>> {
+    fn read_output_rev(&self, pos: &mut i64) -> io::Result<OutBuf> {
+        let (start, end) = self.skip_output_rev(pos)?;
+        Ok(OutBuf::from_reversed(
+            &self.bytes[start as usize..=end as usize],
+        ))
+    }
+
+    /// Advance past an output without copying it, returning its inclusive
+    /// byte span (the bytes are stored reversed in the image).
+    fn skip_output_rev(&self, pos: &mut i64) -> io::Result<(u32, u32)> {
         let len = self.read_vlong_rev(pos)? as usize;
         let end = *pos as usize;
         if len > end + 1 {
             return Err(corrupt("FST output overruns the image"));
         }
         let start = end + 1 - len;
-        let mut v = self.bytes[start..=end].to_vec();
-        v.reverse();
         *pos = start as i64 - 1;
-        Ok(v)
+        Ok((start as u32, end as u32))
+    }
+
+    /// Decode an arc's final output (stored reversed) into `buf`.
+    pub fn final_output_into(&self, arc: &FstArc, buf: &mut Vec<u8>) {
+        buf.clear();
+        if let Some((start, end)) = arc.final_output {
+            buf.extend(
+                self.bytes[start as usize..=end as usize]
+                    .iter()
+                    .rev()
+                    .copied(),
+            );
+        }
+    }
+
+    /// Decode an arc's final output into a fresh Vec (cold paths, tests).
+    pub fn final_output(&self, arc: &FstArc) -> Option<Vec<u8>> {
+        arc.final_output.map(|(start, end)| {
+            self.bytes[start as usize..=end as usize]
+                .iter()
+                .rev()
+                .copied()
+                .collect()
+        })
     }
 
     /// Parse node at `addr` into the provided scratch Vec (cleared first).
@@ -613,7 +694,7 @@ impl FstReader {
                 None
             };
             let final_output = if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
-                Some(self.read_output_rev(&mut pos)?)
+                Some(self.skip_output_rev(&mut pos)?)
             } else {
                 None
             };
@@ -673,14 +754,14 @@ impl FstReader {
                 return Ok(None);
             };
             if let Some(o) = &arc.output {
-                out.extend_from_slice(o);
+                out.extend_from_slice(o.as_slice());
             }
             if i == input.len() - 1 {
                 if !arc.is_final {
                     return Ok(None);
                 }
-                if let Some(fo) = &arc.final_output {
-                    out.extend_from_slice(fo);
+                if let Some(fo) = self.final_output(arc) {
+                    out.extend_from_slice(&fo);
                 }
                 return Ok(Some(out));
             }
@@ -714,18 +795,66 @@ impl FstReader {
                 break;
             };
             if let Some(o) = &arc.output {
-                out.extend_from_slice(o);
+                out.extend_from_slice(o.as_slice());
             }
             if arc.is_final {
                 let mut full = out.clone();
-                if let Some(fo) = &arc.final_output {
-                    full.extend_from_slice(fo);
+                if let Some(fo) = self.final_output(arc) {
+                    full.extend_from_slice(&fo);
                 }
                 frames.push((i + 1, full));
             }
             node = arc.target;
         }
         Ok(frames)
+    }
+
+    /// Deepest final frame on the matched path of `input`. Unlike
+    /// `trace_path` (which copies the accumulated output at every final arc
+    /// for `seek_ceil`'s ancestor frames), this keeps only the deepest
+    /// frame and works in caller-owned scratch, so a lookup allocates
+    /// nothing once the buffers have reached steady-state capacity.
+    /// On a match, returns the depth and writes the composed output
+    /// (accumulated outputs + the last final arc's final output) to `output`.
+    pub fn trace_deepest(
+        &self,
+        input: &[u8],
+        arcs: &mut Vec<FstArc>,
+        out: &mut Vec<u8>,
+        final_out: &mut Vec<u8>,
+        output: &mut Vec<u8>,
+    ) -> io::Result<Option<usize>> {
+        if self.start_node == 0 || input.is_empty() {
+            return Ok(None);
+        }
+        out.clear();
+        final_out.clear();
+        let mut node = self.start_node as i64;
+        let mut best: Option<(usize, usize)> = None; // (depth, out.len() at that final arc)
+        for (i, &b) in input.iter().enumerate() {
+            if node <= 0 {
+                break;
+            }
+            self.read_node_into(node as u64, arcs)?;
+            let Some(arc) = Self::find_arc(arcs, b) else {
+                break;
+            };
+            if let Some(o) = &arc.output {
+                out.extend_from_slice(o.as_slice());
+            }
+            if arc.is_final {
+                self.final_output_into(arc, final_out);
+                best = Some((i + 1, out.len()));
+            }
+            node = arc.target;
+        }
+        let Some((depth, out_len)) = best else {
+            return Ok(None);
+        };
+        output.clear();
+        output.extend_from_slice(&out[..out_len]);
+        output.extend_from_slice(final_out);
+        Ok(Some(depth))
     }
 
     /// Walk the FST guided by a DFA, pruning arcs with no valid transition.
@@ -754,12 +883,12 @@ impl FstReader {
                 new_prefix.push(arc.label);
                 let mut new_out = out.clone();
                 if let Some(o) = &arc.output {
-                    new_out.extend_from_slice(o);
+                    new_out.extend_from_slice(o.as_slice());
                 }
                 if arc.is_final {
                     let mut full_out = new_out.clone();
-                    if let Some(fo) = &arc.final_output {
-                        full_out.extend_from_slice(fo);
+                    if let Some(fo) = self.final_output(arc) {
+                        full_out.extend_from_slice(&fo);
                     }
                     candidates.push(IntersectCandidate {
                         prefix: new_prefix.clone(),

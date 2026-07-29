@@ -41,11 +41,19 @@ impl FSDirectory {
         Ok(ChecksumIndexOutput::new(IndexOutput::from_file(file)))
     }
 
-    /// Directory.openInput: opens an existing file for reading.
+    /// Directory.openInput: opens an existing file for reading via mmap
+    /// (zero-syscall reads after initial page-in, matching Java MMapDirectory).
+    #[allow(unsafe_code)]
     pub fn open_input(&self, name: &str) -> io::Result<IndexInput> {
         let file = File::open(self.resolve(name))?;
         let length = file.metadata()?.len();
-        Ok(IndexInput::from_file(file, length))
+        if length == 0 {
+            return Ok(IndexInput::from_file(file, 0));
+        }
+        // SAFETY: file is opened read-only and not truncated/mutated while
+        // the mmap is alive (same contract as Java MMapDirectory).
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(IndexInput::from_mmap(std::sync::Arc::new(mmap)))
     }
 
     /// Directory.openChecksumInput (commit/codec metadata files are read

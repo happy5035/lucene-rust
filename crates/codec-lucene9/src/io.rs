@@ -640,6 +640,11 @@ enum InputSource {
         data: Arc<Vec<u8>>,
         offset: u64,
     },
+    /// Memory-mapped file; reads are pointer dereferences (zero syscall).
+    Mmap {
+        data: Arc<memmap2::Mmap>,
+        offset: u64,
+    },
 }
 
 /// Buffered, position-tracking data input with Lucene `DataInput` primitives
@@ -673,6 +678,19 @@ impl IndexInput {
         let length = bytes.len() as u64;
         IndexInput {
             source: InputSource::Memory { data: Arc::new(bytes), offset: 0 },
+            length,
+            buffer: [0; INPUT_BUFFER_CAPACITY],
+            buffer_start: 0,
+            buffer_len: 0,
+            position: 0,
+        }
+    }
+
+    /// An input over a memory-mapped file (zero-syscall reads after page-in).
+    pub fn from_mmap(mmap: Arc<memmap2::Mmap>) -> Self {
+        let length = mmap.len() as u64;
+        IndexInput {
+            source: InputSource::Mmap { data: mmap, offset: 0 },
             length,
             buffer: [0; INPUT_BUFFER_CAPACITY],
             buffer_start: 0,
@@ -727,6 +745,10 @@ impl IndexInput {
                 data: Arc::clone(data),
                 offset: parent_off + offset,
             },
+            InputSource::Mmap { data, offset: parent_off } => InputSource::Mmap {
+                data: Arc::clone(data),
+                offset: parent_off + offset,
+            },
         };
         Ok(IndexInput {
             source,
@@ -766,6 +788,10 @@ impl IndexInput {
                 }
             }
             InputSource::Memory { data, offset } => {
+                let start = (offset + self.position) as usize;
+                self.buffer[..n].copy_from_slice(&data[start..start + n]);
+            }
+            InputSource::Mmap { data, offset } => {
                 let start = (offset + self.position) as usize;
                 self.buffer[..n].copy_from_slice(&data[start..start + n]);
             }
@@ -909,14 +935,19 @@ pub trait DataInput {
 impl DataInput for IndexInput {
     /// BufferedIndexInput.readByte (:52-58).
     fn read_byte(&mut self) -> io::Result<u8> {
-        if let InputSource::Memory { data, offset } = &self.source {
+        let direct: Option<(&[u8], u64)> = match &self.source {
+            InputSource::Memory { data, offset } => Some((data.as_slice(), *offset)),
+            InputSource::Mmap { data, offset } => Some((data.as_ref(), *offset)),
+            _ => None,
+        };
+        if let Some((bytes, offset)) = direct {
             if self.position >= self.length {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("read past EOF: {}", self.length),
                 ));
             }
-            let b = data[(offset + self.position) as usize];
+            let b = bytes[(offset + self.position) as usize];
             self.position += 1;
             return Ok(b);
         }
@@ -930,7 +961,12 @@ impl DataInput for IndexInput {
 
     /// BufferedIndexInput.readBytes (:91-133) — Memory reads directly, File through buffer.
     fn read_bytes(&mut self, mut buf: &mut [u8]) -> io::Result<()> {
-        if let InputSource::Memory { data, offset } = &self.source {
+        let direct: Option<(&[u8], u64)> = match &self.source {
+            InputSource::Memory { data, offset } => Some((data.as_slice(), *offset)),
+            InputSource::Mmap { data, offset } => Some((data.as_ref(), *offset)),
+            _ => None,
+        };
+        if let Some((bytes, offset)) = direct {
             let start = (offset + self.position) as usize;
             let end = start + buf.len();
             if end > (offset + self.length) as usize {
@@ -939,7 +975,7 @@ impl DataInput for IndexInput {
                     format!("read past EOF: {}", self.length),
                 ));
             }
-            buf.copy_from_slice(&data[start..end]);
+            buf.copy_from_slice(&bytes[start..end]);
             self.position += buf.len() as u64;
             return Ok(());
         }

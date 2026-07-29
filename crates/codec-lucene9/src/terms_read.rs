@@ -13,7 +13,7 @@ use crate::codec_util::{check_footer, check_footer_structure, check_index_header
 use crate::directory::FSDirectory;
 use crate::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use crate::automaton::{DEAD, WildcardDfa};
-use crate::fst::{FstArc, FstMetadata, FstReader};
+use crate::fst::{FstMetadata, FstReader};
 use crate::io::{DataInput, IndexInput, SliceInput};
 use crate::postings::{
     BLOCKTREE_VERSION, OUTPUT_FLAG_IS_FLOOR, POSTINGS_VERSION,
@@ -69,7 +69,6 @@ pub struct TermsDict {
 /// Kept on the reader so a term lookup allocates nothing.
 #[derive(Default)]
 struct SeekScratch {
-    arcs: Vec<FstArc>,
     out: Vec<u8>,
     final_out: Vec<u8>,
     output: Vec<u8>,
@@ -263,12 +262,11 @@ impl TermsDict {
         let _ = self.fst(field_index)?; // ensure loaded
         let fst = self.fsts[field_index].as_ref().unwrap();
         let SeekScratch {
-            arcs,
             out,
             final_out,
             output,
         } = &mut self.seek_scratch;
-        let depth = fst.trace_deepest(term, arcs, out, final_out, output)?;
+        let depth = fst.trace_deepest(term, out, final_out, output)?;
         let (depth, output) = match depth {
             Some(d) => (d, output.as_slice()),
             None => (0, self.fields[field_index].root_code.as_slice()),

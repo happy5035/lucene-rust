@@ -20,9 +20,10 @@ pub(crate) const BOOLEAN_REWRITE_THRESHOLD: usize = 16;
 
 /// Terms of one query present in one segment's dictionary, df-sorted
 /// (spec §4: 集合收集后按 df 排序交给双路). Generic over the leaf's term
-/// handle type (`L::TermHandle`).
+/// handle type (`L::TermHandle`). The term bytes themselves are not kept:
+/// no consumer reads them (postings work off the handles), and collecting
+/// them cost one Vec per matched term on multi-term queries.
 pub(crate) struct CollectedTerms<H> {
-    pub terms: Vec<Vec<u8>>,
     pub entries: Vec<(u32, H)>,
 }
 
@@ -36,13 +37,7 @@ impl<H> CollectedTerms<H> {
     }
 
     pub(crate) fn sort_by_df(&mut self) {
-        let mut pairs: Vec<(Vec<u8>, (u32, H))> =
-            self.terms.drain(..).zip(self.entries.drain(..)).collect();
-        pairs.sort_by_key(|(_, (df, _))| *df);
-        for (t, e) in pairs {
-            self.terms.push(t);
-            self.entries.push(e);
-        }
+        self.entries.sort_by_key(|(df, _)| *df);
     }
 }
 
@@ -57,13 +52,11 @@ pub(crate) fn collect_direct<L: LeafAccess>(
         return Ok(None);
     };
     let mut collected = CollectedTerms {
-        terms: Vec::new(),
         entries: Vec::new(),
     };
     for t in terms {
         if let Some((_, entry)) = seg.seek_term(field, t)? {
             let df = seg.term_doc_freq(&entry);
-            collected.terms.push(t.clone());
             collected.entries.push((df, entry));
         }
     }
@@ -83,7 +76,7 @@ pub(crate) fn collect_prefix<L: LeafAccess>(
     let Some(has_freqs) = seg.field_has_freqs(field) else {
         return Ok(None);
     };
-    let mut pairs: Vec<(Vec<u8>, L::TermHandle)> = Vec::new();
+    let mut handles: Vec<L::TermHandle> = Vec::new();
     {
         let Some(mut it) = seg.terms_iter(field) else {
             return Ok(None);
@@ -93,16 +86,14 @@ pub(crate) fn collect_prefix<L: LeafAccess>(
             if !term.starts_with(prefix) {
                 break;
             }
-            pairs.push((term, handle));
+            handles.push(handle);
         }
     }
     let mut collected = CollectedTerms {
-        terms: Vec::with_capacity(pairs.len()),
-        entries: Vec::with_capacity(pairs.len()),
+        entries: Vec::with_capacity(handles.len()),
     };
-    for (term, handle) in pairs {
+    for handle in handles {
         let df = seg.term_doc_freq(&handle);
-        collected.terms.push(term);
         collected.entries.push((df, handle));
     }
     collected.sort_by_df();
@@ -220,12 +211,10 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
                 return Ok(None);
             };
             let mut collected = CollectedTerms {
-                terms: Vec::with_capacity(results.len()),
                 entries: Vec::with_capacity(results.len()),
             };
-            for (term, handle) in results {
+            for (_term, handle) in results {
                 let df = seg.term_doc_freq(&handle);
-                collected.terms.push(term);
                 collected.entries.push((df, handle));
             }
             collected.sort_by_df();
@@ -264,6 +253,15 @@ pub(crate) fn segment_iterator<L: LeafAccess>(
 
 /// Count fast path (spec §4: count 路径直接 popcount): `Some(popcount)` on
 /// the bitset path, `None` when the OR path applies (caller iterates).
+/// For <=16 terms the caller's disjunction iteration wins at small df
+/// (no bitset alloc/popcount fixed cost), but loses at large df: the
+/// k-way merge costs ~28ns/emitted doc while bitset materialization costs
+/// ~5ns/decoded doc + ~20us fixed — measured on enwiki (terms high:
+/// 4 terms, 11470 df-sum, 315us disjunction vs ~80us bitset). Crossover
+/// is at ~1-2k df-sum, so above a threshold even few-term counts take
+/// the bitset path (identical OR-set semantics).
+pub(crate) const BITSET_COUNT_MIN_DF_SUM: u64 = 2048;
+
 pub(crate) fn bitset_count<L: LeafAccess>(
     seg: &L,
     has_freqs: bool,
@@ -273,7 +271,10 @@ pub(crate) fn bitset_count<L: LeafAccess>(
         return Ok(Some(collected.entries[0].0 as u64));
     }
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
-        return Ok(None);
+        let df_sum: u64 = collected.entries.iter().map(|(df, _)| *df as u64).sum();
+        if df_sum < BITSET_COUNT_MIN_DF_SUM {
+            return Ok(None);
+        }
     }
     Ok(Some(
         materialize(seg, &collected.entries, has_freqs)?.popcount(),

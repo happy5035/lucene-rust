@@ -553,6 +553,15 @@ impl OutBuf {
     }
 }
 
+/// The matched arc from [`FstReader::find_arc_in_node`]: outputs as
+/// reversed byte spans into the FST image (decoded lazily by the caller).
+pub struct ArcHit {
+    pub output: Option<(u32, u32)>,
+    pub final_output: Option<(u32, u32)>,
+    pub is_final: bool,
+    pub target: i64,
+}
+
 /// One arc of an unpacked node (FST.Arc).
 #[derive(Clone, Debug)]
 pub struct FstArc {
@@ -736,6 +745,86 @@ impl FstReader {
             .filter(|a| a.label == label)
     }
 
+    /// Streaming findTargetArc: scans one node's arcs in ascending label
+    /// order and stops at the first `label >= target`. Unlike
+    /// `read_node_into` + `find_arc` it does not unpack the whole node —
+    /// wide nodes (the root can have 50+ arcs) are scanned at most up to
+    /// the match, and skipped arcs' outputs/targets are stepped over
+    /// without decoding. Outputs are returned as reversed byte spans into
+    /// the FST image.
+    fn find_arc_in_node(&self, addr: u64, target: u8) -> io::Result<Option<ArcHit>> {
+        if addr as usize >= self.bytes.len() {
+            return Err(corrupt("FST node address out of bounds"));
+        }
+        let mut pos = addr as i64;
+        let mut hit: Option<ArcHit> = None;
+        loop {
+            let flags = self.bytes[pos as usize];
+            pos -= 1;
+            if pos < 0 {
+                return Err(corrupt("FST arc overruns the image"));
+            }
+            let label = self.bytes[pos as usize];
+            pos -= 1;
+            if hit.is_none() && label == target {
+                // decode the matched arc fully
+                let output = if flags & BIT_ARC_HAS_OUTPUT != 0 {
+                    Some(self.skip_output_rev(&mut pos)?)
+                } else {
+                    None
+                };
+                let final_output = if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
+                    Some(self.skip_output_rev(&mut pos)?)
+                } else {
+                    None
+                };
+                let arc_target = if flags & BIT_STOP_NODE != 0 {
+                    if flags & BIT_FINAL_ARC != 0 {
+                        FINAL_END_NODE
+                    } else {
+                        NON_FINAL_END_NODE
+                    }
+                } else if flags & BIT_TARGET_NEXT != 0 {
+                    i64::MIN // resolved to the node start after the loop
+                } else {
+                    self.read_vlong_rev(&mut pos)? as i64
+                };
+                hit = Some(ArcHit {
+                    output,
+                    final_output,
+                    is_final: flags & BIT_FINAL_ARC != 0,
+                    target: arc_target,
+                });
+                if arc_target != i64::MIN {
+                    return Ok(hit);
+                }
+            } else {
+                if hit.is_none() && label > target {
+                    return Ok(None); // labels ascend: miss
+                }
+                // skip this arc without decoding (either past the match —
+                // TARGET_NEXT resolution — or not the target label)
+                if flags & BIT_ARC_HAS_OUTPUT != 0 {
+                    self.skip_output_rev(&mut pos)?;
+                }
+                if flags & BIT_ARC_HAS_FINAL_OUTPUT != 0 {
+                    self.skip_output_rev(&mut pos)?;
+                }
+                if flags & (BIT_STOP_NODE | BIT_TARGET_NEXT) == 0 {
+                    self.read_vlong_rev(&mut pos)?;
+                }
+            }
+            if flags & BIT_LAST_ARC != 0 {
+                break;
+            }
+        }
+        if let Some(mut h) = hit {
+            h.target = pos; // TARGET_NEXT: target node starts where this node ends
+            return Ok(Some(h));
+        }
+        Ok(None)
+    }
+
     /// FST.Util.get semantics: the full output of `input` (empty vec when
     /// the FST maps it to NO_OUTPUT), or `None` when `input` is rejected.
     pub fn lookup(&self, input: &[u8]) -> io::Result<Option<Vec<u8>>> {
@@ -785,26 +874,24 @@ impl FstReader {
         }
         let mut out: Vec<u8> = Vec::new();
         let mut node = self.start_node as i64;
-        let mut arcs: Vec<FstArc> = Vec::with_capacity(8);
         for (i, &b) in input.iter().enumerate() {
             if node <= 0 {
                 break;
             }
-            self.read_node_into(node as u64, &mut arcs)?;
-            let Some(arc) = Self::find_arc(&arcs, b) else {
+            let Some(hit) = self.find_arc_in_node(node as u64, b)? else {
                 break;
             };
-            if let Some(o) = &arc.output {
-                out.extend_from_slice(o.as_slice());
+            if let Some((s, e)) = hit.output {
+                out.extend(self.bytes[s as usize..=e as usize].iter().rev().copied());
             }
-            if arc.is_final {
+            if hit.is_final {
                 let mut full = out.clone();
-                if let Some(fo) = self.final_output(arc) {
-                    full.extend_from_slice(&fo);
+                if let Some((s, e)) = hit.final_output {
+                    full.extend(self.bytes[s as usize..=e as usize].iter().rev().copied());
                 }
                 frames.push((i + 1, full));
             }
-            node = arc.target;
+            node = hit.target;
         }
         Ok(frames)
     }
@@ -812,14 +899,14 @@ impl FstReader {
     /// Deepest final frame on the matched path of `input`. Unlike
     /// `trace_path` (which copies the accumulated output at every final arc
     /// for `seek_ceil`'s ancestor frames), this keeps only the deepest
-    /// frame and works in caller-owned scratch, so a lookup allocates
-    /// nothing once the buffers have reached steady-state capacity.
+    /// frame, uses the streaming arc scan, and works in caller-owned
+    /// scratch, so a lookup allocates nothing once the buffers have reached
+    /// steady-state capacity.
     /// On a match, returns the depth and writes the composed output
     /// (accumulated outputs + the last final arc's final output) to `output`.
     pub fn trace_deepest(
         &self,
         input: &[u8],
-        arcs: &mut Vec<FstArc>,
         out: &mut Vec<u8>,
         final_out: &mut Vec<u8>,
         output: &mut Vec<u8>,
@@ -835,18 +922,24 @@ impl FstReader {
             if node <= 0 {
                 break;
             }
-            self.read_node_into(node as u64, arcs)?;
-            let Some(arc) = Self::find_arc(arcs, b) else {
+            let Some(hit) = self.find_arc_in_node(node as u64, b)? else {
                 break;
             };
-            if let Some(o) = &arc.output {
-                out.extend_from_slice(o.as_slice());
+            if let Some((s, e)) = hit.output {
+                out.extend(
+                    self.bytes[s as usize..=e as usize].iter().rev().copied(),
+                );
             }
-            if arc.is_final {
-                self.final_output_into(arc, final_out);
+            if hit.is_final {
+                final_out.clear();
+                if let Some((s, e)) = hit.final_output {
+                    final_out.extend(
+                        self.bytes[s as usize..=e as usize].iter().rev().copied(),
+                    );
+                }
                 best = Some((i + 1, out.len()));
             }
-            node = arc.target;
+            node = hit.target;
         }
         let Some((depth, out_len)) = best else {
             return Ok(None);

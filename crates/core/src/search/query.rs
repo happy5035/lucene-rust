@@ -2,7 +2,9 @@
 //! Prefix, Wildcard, Phrase, Bool. All queries have ConstantScore semantics.
 
 use std::io;
+use std::sync::Arc;
 
+use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
 
@@ -51,6 +53,7 @@ pub enum Query {
     Wildcard {
         field: String,
         pattern: Vec<u8>,
+        dfa: Arc<WildcardDfa>,
     },
     Phrase {
         field: String,
@@ -116,9 +119,11 @@ impl Query {
 
     /// Wildcard query with '*' and '?' (spec M2 §5 classification).
     pub fn wildcard(field: &str, pattern: &str) -> Query {
+        let dfa = Arc::new(WildcardDfa::compile(pattern.as_bytes()));
         Query::Wildcard {
             field: field.to_string(),
             pattern: pattern.as_bytes().to_vec(),
+            dfa,
         }
     }
 
@@ -170,9 +175,9 @@ impl Query {
                 };
                 multi_term::bitset_count(seg, has_freqs, &collected)
             }
-            Query::Wildcard { field, pattern } => {
+            Query::Wildcard { field, pattern, dfa } => {
                 let pat = multi_term::WildcardPattern::parse(pattern);
-                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)?
+                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat, dfa)?
                 else {
                     return Ok(Some(0));
                 };
@@ -233,9 +238,9 @@ impl Query {
                 };
                 multi_term::segment_iterator(seg, field, has_freqs, &collected, needs_freq)
             }
-            Query::Wildcard { field, pattern } => {
+            Query::Wildcard { field, pattern, dfa } => {
                 let pat = multi_term::WildcardPattern::parse(pattern);
-                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)?
+                let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat, dfa)?
                 else {
                     return Ok(None);
                 };
@@ -642,9 +647,9 @@ fn materialize_query_bitmap<L: LeafAccess>(
             };
             fold_term_entries(seg, &collected.entries, has_freqs, false, budget, cost)
         }
-        Query::Wildcard { field, pattern } => {
+        Query::Wildcard { field, pattern, dfa } => {
             let pat = multi_term::WildcardPattern::parse(pattern);
-            let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat)?
+            let Some((has_freqs, collected)) = multi_term::collect_wildcard(seg, field, &pat, dfa)?
             else {
                 return Ok(MatOutcome::Hits(MaterializedBitmap::of(&[])));
             };

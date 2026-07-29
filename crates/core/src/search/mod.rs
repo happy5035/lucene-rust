@@ -22,7 +22,7 @@ pub use reader::Reader;
 pub use searcher::Searcher;
 pub use segment_reader::SegmentReader;
 pub use sorted_collector::{SearchResults, SortedTopN};
-pub use leaf_access::{LeafAccess, PointsAccess, TermEntryLike, TermsIterAccess};
+pub use leaf_access::{LeafAccess, PointsAccess, TermsIterAccess};
 
 #[cfg(test)]
 mod block_tests;

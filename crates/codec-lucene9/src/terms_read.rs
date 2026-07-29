@@ -420,9 +420,8 @@ impl TermsDict {
     }
 
     /// Enumerate all terms in `field` accepted by the DFA.
-    /// Uses FST intersection to prune non-matching subtrees, then verifies
-    /// full terms within candidate blocks. Reuses `load_frame_block` and
-    /// `next_frame_entry` for block decoding.
+    /// Uses a lazy frame-stack iterator with transition-range skipping
+    /// (Java IntersectTermsEnum algorithm).
     pub fn intersect(
         &mut self,
         field: &FieldInfo,
@@ -433,102 +432,231 @@ impl TermsDict {
             None => return Ok(Vec::new()),
         };
 
+        if let Some(single) = dfa.single_string() {
+            return Ok(match self.seek_exact(field, single)? {
+                Some(entry) => vec![(single.to_vec(), entry)],
+                None => Vec::new(),
+            });
+        }
+
         let has_freqs = field.index_options != IndexOptions::Docs;
         let has_positions = field_has_positions(field);
-        let mut results: Vec<(Vec<u8>, TermEntry)> = Vec::new();
 
-        // Always scan the root block (FST only covers sub-blocks).
-        let root_code = self.fields[field_index].root_code.clone();
-        let mut root_in = IndexInput::in_memory(root_code);
-        let root_fp = read_msb_vlong(&mut root_in)? >> 2;
-        self.intersect_scan_block(
-            root_fp,
-            0,
-            &[],
-            0, // DFA start state
+        // FST-guided initial descent: skip root block for prefixed patterns.
+        let (det_prefix, _det_state) = dfa.deterministic_prefix();
+        let (start_fp, start_prefix_len, start_dfa_state) = if det_prefix.is_empty() {
+            let root_code = self.fields[field_index].root_code.clone();
+            let mut root_in = IndexInput::in_memory(root_code);
+            let root_fp = read_msb_vlong(&mut root_in)? >> 2;
+            (root_fp, 0, 0u32)
+        } else {
+            // Walk FST on the deterministic prefix to find deepest block.
+            let traces = self.fst(field_index)?.trace_path(&det_prefix)?;
+            if traces.is_empty() {
+                // FST has no entry — all terms may be in root block. Fall back.
+                let root_code = self.fields[field_index].root_code.clone();
+                let mut root_in = IndexInput::in_memory(root_code);
+                let root_fp = read_msb_vlong(&mut root_in)? >> 2;
+                (root_fp, 0, 0u32)
+            } else {
+                let (depth, output) = &traces[traces.len() - 1];
+                let (_fp_anchor, fp) = fst_output_block_fp(output, &det_prefix, *depth)?;
+                let mut state = 0u32;
+                for &b in &det_prefix[..*depth] {
+                    state = dfa.transition(state, b);
+                }
+                (fp, *depth, state)
+            }
+        };
+
+        let mut iter = IntersectTermsEnum::new(
+            &mut self.tim_in,
             dfa,
+            start_fp,
+            start_prefix_len,
+            start_dfa_state,
+            &det_prefix[..start_prefix_len],
             has_freqs,
             has_positions,
-            &mut results,
         )?;
-
-        // Scan FST candidate blocks (sub-blocks pruned by DFA).
-        let candidates = self.fst(field_index)?.intersect_candidates(dfa)?;
-        for candidate in &candidates {
-            let mut out_in = IndexInput::in_memory(candidate.output.clone());
-            let code = read_msb_vlong(&mut out_in)?;
-            let fp = code >> 2;
-            self.intersect_scan_block(
-                fp,
-                candidate.depth,
-                &candidate.prefix,
-                candidate.dfa_state,
-                dfa,
-                has_freqs,
-                has_positions,
-                &mut results,
-            )?;
+        let mut results = Vec::new();
+        while let Some(pair) = iter.next()? {
+            results.push(pair);
         }
-
         Ok(results)
     }
+}
 
-    /// Helper: load a block at `fp` (and its floor siblings), scan term
-    /// entries, verify suffixes against the DFA from `dfa_state`, and push
-    /// accepted terms into `results`. Sub-block entries are skipped (they
-    /// appear as separate FST candidates).
-    #[allow(clippy::too_many_arguments)]
-    fn intersect_scan_block(
-        &mut self,
-        fp: u64,
-        prefix_len: usize,
-        prefix: &[u8],
-        dfa_state: u32,
-        dfa: &WildcardDfa,
+struct IntersectFrame {
+    base: IterFrame,
+    dfa_state: u32,
+    trans_index: usize,
+    trans_min: u8,
+    trans_max: u8,
+    trans_dest: u32,
+}
+
+impl IntersectFrame {
+    fn new(prefix_len: usize, fp: u64, dfa_state: u32, dfa: &WildcardDfa) -> Self {
+        let ranges = dfa.ranges(dfa_state);
+        let (trans_min, trans_max, trans_dest) = if let Some(r) = ranges.first() {
+            (r.min, r.max, r.dest)
+        } else {
+            (0, 0, DEAD)
+        };
+        IntersectFrame {
+            base: IterFrame::new(prefix_len, fp),
+            dfa_state,
+            trans_index: 0,
+            trans_min,
+            trans_max,
+            trans_dest,
+        }
+    }
+
+    fn advance_range(&mut self, dfa: &WildcardDfa) -> bool {
+        self.trans_index += 1;
+        let ranges = dfa.ranges(self.dfa_state);
+        if self.trans_index >= ranges.len() {
+            return false;
+        }
+        let r = &ranges[self.trans_index];
+        self.trans_min = r.min;
+        self.trans_max = r.max;
+        self.trans_dest = r.dest;
+        true
+    }
+}
+
+struct IntersectTermsEnum<'a> {
+    tim_in: &'a mut IndexInput,
+    dfa: &'a WildcardDfa,
+    frames: Vec<IntersectFrame>,
+    term: Vec<u8>,
+    has_freqs: bool,
+    has_positions: bool,
+}
+
+impl<'a> IntersectTermsEnum<'a> {
+    fn new(
+        tim_in: &'a mut IndexInput,
+        dfa: &'a WildcardDfa,
+        start_fp: u64,
+        start_prefix_len: usize,
+        start_dfa_state: u32,
+        initial_prefix: &[u8],
         has_freqs: bool,
         has_positions: bool,
-        results: &mut Vec<(Vec<u8>, TermEntry)>,
-    ) -> io::Result<()> {
-        let mut frame = IterFrame::new(prefix_len, fp);
-        load_frame_block(&mut self.tim_in, &mut frame)?;
+    ) -> io::Result<Self> {
+        let mut root = IntersectFrame::new(start_prefix_len, start_fp, start_dfa_state, dfa);
+        load_frame_block(tim_in, &mut root.base)?;
+        Ok(IntersectTermsEnum {
+            tim_in,
+            dfa,
+            frames: vec![root],
+            term: initial_prefix.to_vec(),
+            has_freqs,
+            has_positions,
+        })
+    }
 
-        loop {
-            while let Some((off, len, entry)) =
-                next_frame_entry(&mut frame, has_freqs, has_positions)?
-            {
-                match entry {
-                    NextEntry::SubBlock(_) => {
-                        // Sub-blocks have their own FST entries and will
-                        // appear as separate candidates; skip here.
-                    }
-                    NextEntry::Term(te) => {
-                        let suffix = &frame.suffix_bytes[off..off + len];
-                        // DFA verification: run from dfa_state on the suffix.
-                        let mut state = dfa_state;
-                        let mut matched = true;
-                        for &b in suffix {
-                            state = dfa.transition(state, b);
-                            if state == DEAD {
-                                matched = false;
-                                break;
-                            }
-                        }
-                        if matched && dfa.is_accept(state) {
-                            let mut full_term = prefix.to_vec();
-                            full_term.extend_from_slice(suffix);
-                            results.push((full_term, te));
-                        }
+    fn next(&mut self) -> io::Result<Option<(Vec<u8>, TermEntry)>> {
+        'outer: loop {
+            let Some(frame) = self.frames.last_mut() else {
+                return Ok(None);
+            };
+
+            let entry = next_frame_entry(&mut frame.base, self.has_freqs, self.has_positions)?;
+
+            let Some((off, len, entry)) = entry else {
+                // Frame exhausted: floor sibling or pop
+                if !frame.base.is_last_in_floor {
+                    let fp = frame.base.fp_end;
+                    let frame = self.frames.last_mut().unwrap();
+                    frame.base.fp = fp;
+                    load_frame_block(self.tim_in, &mut frame.base)?;
+                    continue 'outer;
+                }
+                self.frames.pop();
+                if let Some(parent) = self.frames.last() {
+                    self.term.truncate(parent.base.prefix_len);
+                }
+                continue 'outer;
+            };
+
+            if len == 0 {
+                if let NextEntry::Term(te) = entry {
+                    if self.dfa.is_accept(frame.dfa_state) {
+                        self.term.truncate(frame.base.prefix_len);
+                        return Ok(Some((self.term.clone(), te)));
                     }
                 }
+                continue 'outer;
             }
-            // Chain floor siblings (consecutive in .tim)
-            if frame.is_last_in_floor {
-                break;
+
+            let label = frame.base.suffix_bytes[off];
+
+            if label < frame.trans_min {
+                continue 'outer;
             }
-            frame.fp = frame.fp_end;
-            load_frame_block(&mut self.tim_in, &mut frame)?;
+
+            while label > frame.trans_max {
+                if !frame.advance_range(self.dfa) {
+                    self.frames.pop();
+                    if let Some(parent) = self.frames.last() {
+                        self.term.truncate(parent.base.prefix_len);
+                    }
+                    continue 'outer;
+                }
+            }
+
+            if label < frame.trans_min {
+                continue 'outer;
+            }
+
+            let dest = frame.trans_dest;
+            let prefix_len = frame.base.prefix_len;
+            let suffix = &frame.base.suffix_bytes[off..off + len];
+
+            match entry {
+                NextEntry::Term(te) => {
+                    let mut state = dest;
+                    let mut matched = true;
+                    for &b in &suffix[1..] {
+                        state = self.dfa.transition(state, b);
+                        if state == DEAD {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched && self.dfa.is_accept(state) {
+                        self.term.truncate(prefix_len);
+                        self.term.extend_from_slice(suffix);
+                        return Ok(Some((self.term.clone(), te)));
+                    }
+                }
+                NextEntry::SubBlock(sub_fp) => {
+                    let mut state = dest;
+                    let mut alive = true;
+                    for &b in &suffix[1..] {
+                        state = self.dfa.transition(state, b);
+                        if state == DEAD {
+                            alive = false;
+                            break;
+                        }
+                    }
+                    if !alive {
+                        continue 'outer;
+                    }
+                    self.term.truncate(prefix_len);
+                    self.term.extend_from_slice(suffix);
+                    let new_prefix_len = self.term.len();
+                    let mut child = IntersectFrame::new(new_prefix_len, sub_fp, state, self.dfa);
+                    load_frame_block(self.tim_in, &mut child.base)?;
+                    self.frames.push(child);
+                }
+            }
         }
-        Ok(())
     }
 }
 

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::sync::Arc;
 
 /// Large output buffer; avoids per-byte syscalls (cf. BufferedIndexOutput).
 const BUFFER_CAPACITY: usize = 1 << 16;
@@ -629,12 +630,16 @@ pub mod io_stats {
 
 enum InputSource {
     /// Positional reads at `base + pos`; slices share the file handle via
-    /// `try_clone` and shift `base` (read_at on unix, seek_read on windows).
+    /// Arc clone (no dup syscall) and shift `base`.
     File {
-        file: File,
+        file: Arc<File>,
         base: u64,
     },
-    Memory(Vec<u8>),
+    /// In-memory image; slices share the data via Arc clone + offset (no copy).
+    Memory {
+        data: Arc<Vec<u8>>,
+        offset: u64,
+    },
 }
 
 /// Buffered, position-tracking data input with Lucene `DataInput` primitives
@@ -643,6 +648,7 @@ enum InputSource {
 pub struct IndexInput {
     source: InputSource,
     length: u64,
+    // Only used for File source; Memory reads bypass this entirely.
     buffer: [u8; INPUT_BUFFER_CAPACITY],
     buffer_start: u64, // absolute position of buffer[0]
     buffer_len: usize, // valid bytes in buffer
@@ -653,7 +659,7 @@ impl IndexInput {
     /// An input over `file[0..length]` (FSDirectory.openInput).
     pub fn from_file(file: File, length: u64) -> Self {
         IndexInput {
-            source: InputSource::File { file, base: 0 },
+            source: InputSource::File { file: Arc::new(file), base: 0 },
             length,
             buffer: [0; INPUT_BUFFER_CAPACITY],
             buffer_start: 0,
@@ -664,9 +670,10 @@ impl IndexInput {
 
     /// An input over an in-memory image (unit tests, in-memory blob parsing).
     pub fn in_memory(bytes: Vec<u8>) -> Self {
+        let length = bytes.len() as u64;
         IndexInput {
-            length: bytes.len() as u64,
-            source: InputSource::Memory(bytes),
+            source: InputSource::Memory { data: Arc::new(bytes), offset: 0 },
+            length,
             buffer: [0; INPUT_BUFFER_CAPACITY],
             buffer_start: 0,
             buffer_len: 0,
@@ -713,12 +720,13 @@ impl IndexInput {
         }
         let source = match &self.source {
             InputSource::File { file, base } => InputSource::File {
-                file: file.try_clone()?,
+                file: Arc::clone(file),
                 base: base + offset,
             },
-            InputSource::Memory(bytes) => {
-                InputSource::Memory(bytes[offset as usize..end as usize].to_vec())
-            }
+            InputSource::Memory { data, offset: parent_off } => InputSource::Memory {
+                data: Arc::clone(data),
+                offset: parent_off + offset,
+            },
         };
         Ok(IndexInput {
             source,
@@ -757,9 +765,9 @@ impl IndexInput {
                     file.seek_read(&mut self.buffer[..n], base + self.position)?;
                 }
             }
-            InputSource::Memory(bytes) => {
-                self.buffer[..n]
-                    .copy_from_slice(&bytes[self.position as usize..self.position as usize + n]);
+            InputSource::Memory { data, offset } => {
+                let start = (offset + self.position) as usize;
+                self.buffer[..n].copy_from_slice(&data[start..start + n]);
             }
         }
         self.buffer_start = self.position;
@@ -901,6 +909,17 @@ pub trait DataInput {
 impl DataInput for IndexInput {
     /// BufferedIndexInput.readByte (:52-58).
     fn read_byte(&mut self) -> io::Result<u8> {
+        if let InputSource::Memory { data, offset } = &self.source {
+            if self.position >= self.length {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("read past EOF: {}", self.length),
+                ));
+            }
+            let b = data[(offset + self.position) as usize];
+            self.position += 1;
+            return Ok(b);
+        }
         if self.buffered() == 0 {
             self.refill()?;
         }
@@ -909,8 +928,21 @@ impl DataInput for IndexInput {
         Ok(b)
     }
 
-    /// BufferedIndexInput.readBytes (:91-133) — always through the buffer.
+    /// BufferedIndexInput.readBytes (:91-133) — Memory reads directly, File through buffer.
     fn read_bytes(&mut self, mut buf: &mut [u8]) -> io::Result<()> {
+        if let InputSource::Memory { data, offset } = &self.source {
+            let start = (offset + self.position) as usize;
+            let end = start + buf.len();
+            if end > (offset + self.length) as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("read past EOF: {}", self.length),
+                ));
+            }
+            buf.copy_from_slice(&data[start..end]);
+            self.position += buf.len() as u64;
+            return Ok(());
+        }
         while !buf.is_empty() {
             if self.buffered() == 0 {
                 self.refill()?;

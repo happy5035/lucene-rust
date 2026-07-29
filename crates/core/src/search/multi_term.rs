@@ -8,6 +8,7 @@
 
 use std::io;
 
+use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::bitset::FixedBitSet;
@@ -206,6 +207,7 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
     seg: &mut L,
     field: &str,
     pat: &WildcardPattern,
+    dfa: &WildcardDfa,
 ) -> io::Result<Option<(bool, CollectedTerms<L::TermHandle>)>> {
     match pat.class {
         WildcardClass::Exact => collect_direct(seg, field, std::slice::from_ref(&pat.pattern)),
@@ -214,8 +216,7 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
             let Some(has_freqs) = seg.field_has_freqs(field) else {
                 return Ok(None);
             };
-            let dfa = codec_lucene9::automaton::WildcardDfa::compile(&pat.pattern);
-            let Some(results) = seg.intersect_terms(field, &dfa)? else {
+            let Some(results) = seg.intersect_terms(field, dfa)? else {
                 return Ok(None);
             };
             let mut collected = CollectedTerms {
@@ -268,6 +269,9 @@ pub(crate) fn bitset_count<L: LeafAccess>(
     has_freqs: bool,
     collected: &CollectedTerms<L::TermHandle>,
 ) -> io::Result<Option<u64>> {
+    if collected.len() == 1 {
+        return Ok(Some(collected.entries[0].0 as u64));
+    }
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
         return Ok(None);
     }

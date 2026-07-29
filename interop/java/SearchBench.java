@@ -125,18 +125,29 @@ public class SearchBench {
         int maxDoc = reader.maxDoc();
         TermsEnum te = terms.iterator();
         BytesRef term;
+        // Reservoir sampling per bucket: keeps memory bounded on large
+        // indexes (loading the whole dictionary OOMs at multi-GB corpora).
+        // Same uniform distribution as the old shuffle-then-truncate.
+        Map<FreqBucket, Long> seen = new EnumMap<>(FreqBucket.class);
+        for (FreqBucket b : FreqBucket.values()) seen.put(b, 0L);
         while ((term = te.next()) != null) {
             long df = te.docFreq();
-            buckets.get(classify(df, maxDoc)).add(new TermStats(term, df));
+            FreqBucket b = classify(df, maxDoc);
+            long n = seen.get(b) + 1;
+            seen.put(b, n);
+            List<TermStats> list = buckets.get(b);
+            if (list.size() < maxPerBucket) {
+                list.add(new TermStats(term, df));
+            } else {
+                long j = rng.nextLong(n);
+                if (j < maxPerBucket) {
+                    list.set((int) j, new TermStats(term, df));
+                }
+            }
         }
 
         for (FreqBucket b : FreqBucket.values()) {
-            List<TermStats> list = buckets.get(b);
-            if (list.size() > maxPerBucket) {
-                Collections.shuffle(list, rng);
-                list.subList(maxPerBucket, list.size()).clear();
-            }
-            list.sort((a, b2) -> Long.compare(b2.docFreq, a.docFreq));
+            buckets.get(b).sort((a, b2) -> Long.compare(b2.docFreq, a.docFreq));
         }
         return buckets;
     }

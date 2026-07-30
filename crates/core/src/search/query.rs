@@ -9,8 +9,8 @@ use codec_lucene9::postings_read::NO_MORE_DOCS;
 use codec_lucene9::roaring::MaterializedBitmap;
 
 use super::doc_iter::{
-    ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter, DocIter,
-    ExcludingDocIter, MatchAllIter, MaterializedDocIter, PhraseDocIter, PostingsIter,
+    BitsetDocIter, ConjOverDocIter, ConjunctionDocIter, DisjOverDocIter, DisjunctionDocIter,
+    DocIter, ExcludingDocIter, MatchAllIter, MaterializedDocIter, PhraseDocIter, PostingsIter,
     RoaringDocIter, SegmentDocIter,
 };
 use super::leaf_access::LeafAccess;
@@ -434,6 +434,16 @@ fn or_segment_iterator<L: LeafAccess, T: AsRef<[u8]>>(
         }
     }
     // 档 3：经 trait 逐 clause 建 postings 迭代器，from_iters 装配析取。
+    // 无 bitmap 且 df 总和过阈值时改走 bitset 物化（同 multi_term 的
+    // BITSET_COUNT_MIN_DF_SUM 交叉点：k-way 归并 ~28ns/emitted doc，
+    // 块批量物化 ~3ns/decoded doc + bitset 固定成本；enwiki 5M or high
+    // 实测 3.54ms，其中归并常数项是对 Java 2.0x 差距的主因）。
+    // needs_freq 门控：bitset 无 per-doc freq，打分调用方保留析取。
+    let df_sum: u64 = entries.iter().map(|(df, _)| *df as u64).sum();
+    if !needs_freq && df_sum >= multi_term::BITSET_COUNT_MIN_DF_SUM {
+        let bits = multi_term::materialize(seg, &entries, has_freqs)?;
+        return Ok(Some(SegmentDocIter::Bitset(BitsetDocIter::new(bits))));
+    }
     let mut sub = Vec::with_capacity(entries.len());
     for (_, entry) in &entries {
         let it = if has_freqs {

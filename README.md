@@ -369,35 +369,39 @@ roaring（`--bitmap` 索引）vs 同索引纯 PFOR（`RL_BITMAP=0`）vs Java Luc
 ### 搜索性能（enwiki 真实语料，2026-07-30，commit `da8006c`/`c9021c8` + postings 批量直供）
 
 130K docs（页缓存内，906 条查询 × 27 桶，Java 9.12.3 `--no-cache` 同口径）：
-**27 桶中 Rust 更快 15 桶、>1.5x 仅 3 桶（最差 1.58x）**（优化前同口径为 3–14x 全面落后）：
+**27 桶中 Rust 更快 15 桶、>1.5x 仅 2 桶（最差 1.58x）**（优化前同口径为 3–14x 全面落后）：
 
 | 分组 | Rust / Java（p50 比值） |
 |---|---|
 | term / iterm | **0.43–0.47x / 0.75–0.86x** |
-| and / or | **0.35–1.06x / 0.54–1.55x** |
+| and / or | **0.35–1.06x / 0.54–1.14x** |
 | phrase / prefix | **0.46–1.15x / 0.66–1.55x** |
 | wildcard | **1.02–1.26x** |
 | terms / termsbig | **0.81–1.58x / 0.70–1.46x**（high 桶已反超） |
 
-四轮根因均为热路径常数工程（无格式/架构变更）：① 词典查找分配税
+五轮根因均为热路径常数工程（无格式/架构变更）：① 词典查找分配税
 （实测 474 次堆分配/查询 → 2 次，FST arc output 内联化 + 懒解码 + scratch 复用）；
 ② 扫描路径对齐 Java 懒解码设计（对照 Lucene 源码：拒绝的 term 不解码 stats/meta）
 + 帧池 + postings enum 的 8KB buffer 懒初始化；③ FST 流式 arc 扫描（不再整节点解包）
 + 多词项 count 的 bitset 阈值路径；④ postings 块解码直供物化（`next_block`/`next_docs`
 128-doc 窗口替换逐 doc `next_doc`，物化路径 ~7.4ns/doc → 接近 2–3ns/doc 解码下限；
-kway 归并 heads 改栈数组快照，去每轮 2 次堆分配）。
+kway 归并 heads 改栈数组快照，去每轮 2 次堆分配）；⑤ 高 df 析取 bitset 化
+（df 总和 ≥2048 的 Terms/Or 迭代路径改走 bitset 物化，替代 ~28ns/doc 的
+k-way 归并；打分路径 needs_freq 保留析取）。另测过 `target-cpu=native`：
+本机全面 0.87–1.0x 负收益，已否决。
 
 5M docs 磁盘环境（索引 5.2GB > 可用页缓存，`/data` 落盘，forcemerge 单段对单段）：
 **27 桶中 Rust 更快 19 桶**（term 0.42–0.45x、and/or low-med 0.42–0.72x、
 prefix/wildcard high 0.41–0.54x、**terms/termsbig high 0.71–0.75x**）；落后桶为
-百万级命中的解码常数项（or high 2.00x、and high 1.53x、phrase high 1.53x、
+百万级命中的解码常数项（or high 1.58x、and high 1.53x、phrase high 1.53x、
 termsbig low 1.73x、wildcard low 1.41x）。④ 使 terms/termsbig high 相对自身
-提速 1.71–1.75x 并转入反超。注意：Rust 写侧无后台 merge（5M docs 落 38 段 vs
+提速 1.71–1.75x 并转入反超；⑤ 使 or high 相对自身提速 1.26x（3.54ms → 2.80ms，
+对 Java 2.00x → 1.58x）。注意：Rust 写侧无后台 merge（5M docs 落 38 段 vs
 Java 6 段），未合并前小查询被段数放大 2–8x——单段化是公平口径的前提。
 写入吞吐 Rust 12.9k vs Java 9.3k docs/s（1.39x）。
 
 完整报告见 `docs/enwiki-search-bench-report.md`（5M 数字见 7-29/7-30 会话记录，
-`/tmp/5m1-{rust,java}.txt`、`/tmp/n5m2-rust.txt` 原始表）。
+`/tmp/5m1-{rust,java}.txt`、`/tmp/n5m2-rust.txt`、`/tmp/n5m4-rust.txt` 原始表）。
 
 ### 实时内存搜索性能（LeafAccess 统一路径，4 核云主机，release profile）
 

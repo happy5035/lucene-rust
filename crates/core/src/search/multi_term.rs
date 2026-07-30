@@ -226,6 +226,14 @@ pub(crate) fn collect_wildcard<L: LeafAccess>(
 
 /// Threshold dispatch (spec §4): <=16 terms build a DisjunctionDocIter
 /// directly from collected handles (no re-seek); >16 materialize a FixedBitSet.
+///
+/// 2..=16 terms with large df-sum also take the bitset path (same crossover
+/// as bitset_count, BITSET_COUNT_MIN_DF_SUM): the k-way merge costs
+/// ~28ns/emitted doc while block-batch materialization costs ~2-3ns/decoded
+/// doc + bitset fixed cost — measured on enwiki 5M (or high: 2 词高 df
+/// 析取 3.54ms vs java 1.77ms，差距主要是归并常数项)。Gated on
+/// !needs_freq: BitsetDocIter carries no per-doc freq (freq()=1),
+/// scoring callers keep the disjunction.
 pub(crate) fn segment_iterator<L: LeafAccess>(
     seg: &mut L,
     _field: &str,
@@ -237,6 +245,11 @@ pub(crate) fn segment_iterator<L: LeafAccess>(
         return Ok(None);
     }
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
+        let df_sum: u64 = collected.entries.iter().map(|(df, _)| *df as u64).sum();
+        if collected.len() >= 2 && !needs_freq && df_sum >= BITSET_COUNT_MIN_DF_SUM {
+            let bits = materialize(seg, &collected.entries, has_freqs)?;
+            return Ok(Some(SegmentDocIter::Bitset(BitsetDocIter::new(bits))));
+        }
         let mut sub = Vec::with_capacity(collected.len());
         for (_, entry) in &collected.entries {
             let it = if has_freqs {

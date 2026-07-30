@@ -169,6 +169,37 @@ termsbig low、wildcard low。
 产物：`/tmp/ab-{old,new}-{1,2}.txt`（交替 A/B）、`/tmp/n5m2-rust.txt`、
 `/tmp/n2-rust.txt`；counts 对拍 `/tmp/n5m2-counts.txt`、`/tmp/n2-counts.txt`。
 
+## 4b. 第五轮：高 df 析取 bitset 化（2026-07-30）
+
+先验假设被证伪后修正的一次优化。原判断 or high（2.00x）瓶颈在 multi_term
+析取归并；实测默认 bench 模式下 `Terms` 已走 `bitset_count` 快路径，而
+`Query::Or` count 走 `roaring_exec::count` → 无 bitmap 索引上 tier-3 →
+回退 `or_segment_iterator` 的 PFOR k-way 归并——归并常数项才是真瓶颈。
+
+改动（无格式变更）：
+
+- `multi_term::segment_iterator`：2..=16 词且 df 总和 ≥ `BITSET_COUNT_MIN_DF_SUM`
+  且 `!needs_freq` → bitset 物化替代 DisjunctionDocIter（count 阈值扩展到
+  迭代路径；打分语义保留析取）。`--no-fast-count` 模式 terms high
+  276 → 121µs（2.28x，交替 A/B）。
+- `or_segment_iterator` 档 3 同款阈值 → bitset 物化（or high 主修复）。
+- 顺带否决项：`RUSTFLAGS=-C target-cpu=native` 本机 27 桶 0.87–1.0x
+  全面负收益（虚拟机 CPU 模型下 native codegen 无利），不纳入构建配置。
+
+结果（p50，counts 两基准逐字节一致，测试 431 全绿）：
+
+| 桶 | 130K 前 → 后 | 130K vs Java | 5M 前 → 后 | 5M vs Java |
+|---|---|---|---|---|
+| or high | 142.5 → 107.3µs（1.33x） | 1.55x → 1.14x | 3.54 → 2.80ms（1.26x） | 2.00x → 1.58x |
+
+130K >1.5x 桶从 3 个降到 2 个（prefix med 1.55、terms med 1.58）。
+5M 剩余落后桶：or high 1.58x（残余为每查询 625KB FixedBitSet 分配/缺页
++ popcount 固定成本，可做 bitset 池化）、and high 1.53x、phrase high 1.53x、
+termsbig low 1.73x、wildcard low 1.41x。
+
+产物：`/tmp/ob-{bitset,orbitset}-{1,2}.txt`、`/tmp/nfc{generic,bitset}-{1,2}.txt`、
+`/tmp/n5m4-rust.txt`；counts 对拍 `/tmp/n5m4-counts.txt`、`/tmp/n3-counts.txt`。
+
 ## 5. 复现命令
 
 ```bash

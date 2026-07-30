@@ -245,10 +245,12 @@ pub(crate) fn segment_iterator<L: LeafAccess>(
         return Ok(None);
     }
     if collected.len() <= BOOLEAN_REWRITE_THRESHOLD {
-        let df_sum: u64 = collected.entries.iter().map(|(df, _)| *df as u64).sum();
-        if collected.len() >= 2 && !needs_freq && df_sum >= BITSET_COUNT_MIN_DF_SUM {
-            let bits = materialize(seg, &collected.entries, has_freqs)?;
-            return Ok(Some(SegmentDocIter::Bitset(BitsetDocIter::new(bits))));
+        if collected.len() >= 2 && !needs_freq {
+            let df_sum: u64 = collected.entries.iter().map(|(df, _)| *df as u64).sum();
+            if df_sum >= BITSET_COUNT_MIN_DF_SUM {
+                let bits = materialize(seg, &collected.entries, has_freqs)?;
+                return Ok(Some(SegmentDocIter::Bitset(BitsetDocIter::new(bits))));
+            }
         }
         let mut sub = Vec::with_capacity(collected.len());
         for (_, entry) in &collected.entries {

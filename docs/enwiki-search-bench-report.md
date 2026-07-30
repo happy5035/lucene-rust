@@ -153,6 +153,9 @@ PGO、or/and high 的块级 intersect/union 内核向量化。预期单项收益
   两次堆分配 → 栈数组快照（`kway_union_curs`，k ≤ 32 走 slice 内核，
   大 k 退化游标直读）。初版游标直读循环在 or high 回退 ~5%（每 doc 2k 次
   Box 追随 > 省下的分配），栈数组版在交替 A/B 中确认无回退。
+  **（2026-07-30 复审后于 `bc2d275` 回退**：收益从未单独证实；⑤ 之后
+  高 df 析取改走 bitset，k-way 归并仅剩冷路径；双内核 + trait +
+  STACK_HEADS 悬崖的维护成本不抵。仅保留 consumed 提出循环。）
 
 结果（p50，counts 与基线逐字节一致，测试 431 全绿）：
 

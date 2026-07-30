@@ -162,8 +162,8 @@ fn leaves_block_vs_per_doc_random() {
 }
 
 use super::doc_iter::{
-    block_andnot, block_intersect, kway_union, ConjOverDocIter, DisjOverDocIter, DocSource,
-    ExcludingDocIter, RoaringOrDocIter,
+    block_andnot, block_intersect, kway_union, kway_union_curs, BlockCursor, ConjOverDocIter,
+    DisjOverDocIter, DocSource, ExcludingDocIter, RoaringOrDocIter,
 };
 
 fn run(
@@ -262,6 +262,40 @@ fn kway_union_dedup_and_order() {
             }
         }
         assert_eq!(got, expect, "k={k}");
+    }
+}
+
+#[test]
+fn kway_union_curs_matches_slice_kernel() {
+    // 生产内核（BlockCursor 直读）对拍参考内核（slice 版）：同输入同
+    // limit 下产出与消费坐标必须逐一相等。每路 ≤128 doc（单窗游标）。
+    let mut lcg = Lcg(7);
+    for _ in 0..50 {
+        let k = 1 + (lcg.next_u32() % 6) as usize;
+        let mut curs = Vec::with_capacity(k);
+        let mut sets: Vec<Vec<u32>> = Vec::with_capacity(k);
+        for _ in 0..k {
+            let cnt = (lcg.next_u32() % 128) as usize;
+            let s = lcg.doc_set(3_000, cnt);
+            curs.push(BlockCursor::from_docs_for_test(&s));
+            sets.push(s);
+        }
+        let limit = if lcg.next_u32() % 3 == 0 {
+            lcg.next_u32() % 3_000
+        } else {
+            u32::MAX
+        };
+        let cap = 1 + (lcg.next_u32() % 128) as usize;
+        let mut out_a = vec![0u32; cap];
+        let mut out_b = vec![0u32; cap];
+        let heads: Vec<&[u32]> = sets.iter().map(|s| &s[..]).collect();
+        let mut consumed_a = vec![0usize; k];
+        let mut consumed_b = vec![0usize; k];
+        let na = kway_union(&heads, &mut consumed_a, &mut out_a, limit);
+        let nb = kway_union_curs(&curs, &mut consumed_b, &mut out_b, limit);
+        assert_eq!(na, nb, "n k={k} limit={limit}");
+        assert_eq!(out_a[..na], out_b[..nb], "out k={k} limit={limit}");
+        assert_eq!(consumed_a, consumed_b, "consumed k={k} limit={limit}");
     }
 }
 

@@ -9,10 +9,11 @@
 use std::io;
 
 use codec_lucene9::automaton::WildcardDfa;
-use codec_lucene9::postings_read::NO_MORE_DOCS;
 
 use super::bitset::FixedBitSet;
-use super::doc_iter::{BitsetDocIter, DisjunctionDocIter, DocIter, PostingsIter, SegmentDocIter};
+use super::doc_iter::{
+    BitsetDocIter, DisjunctionDocIter, DocBlockBuf, DocIter, PostingsIter, SegmentDocIter,
+};
 use super::leaf_access::LeafAccess;
 
 /// AbstractMultiTermQueryConstantScoreWrapper.java:44.
@@ -285,29 +286,30 @@ pub(crate) fn bitset_count<L: LeafAccess>(
 /// the M3 tier-2 roaring materialization: feeds every doc of `entry`'s
 /// postings to `f` in ascending order. Uses no-freq enums on freqs fields —
 /// the materialized sets carry no per-doc freq (ConstantScore).
+///
+/// Drives the postings enum through `next_block` (codec `next_docs` 批量
+/// 出口，128 doc/窗口) instead of per-doc `next_doc`: measured on enwiki
+/// the per-doc dispatch costs ~7.4ns/doc vs a ~2-3ns/doc decode floor —
+/// the gap is call/state-machine overhead, not decoding.
 pub(crate) fn for_each_doc<L: LeafAccess>(
     seg: &L,
     entry: &L::TermHandle,
     has_freqs: bool,
     f: &mut impl FnMut(u32),
 ) -> io::Result<()> {
-    if has_freqs {
-        let mut en = seg.docs_freqs_enum(entry, false)?;
-        loop {
-            let d = en.next_doc()?;
-            if d == NO_MORE_DOCS {
-                break;
-            }
-            f(d as u32);
-        }
+    let mut it = if has_freqs {
+        seg.docs_freqs_enum(entry, false)?
     } else {
-        let mut en = seg.docs_enum(entry)?;
-        loop {
-            let d = en.next_doc()?;
-            if d == NO_MORE_DOCS {
-                break;
-            }
-            f(d as u32);
+        seg.docs_enum(entry)?
+    };
+    let mut buf = DocBlockBuf::new();
+    loop {
+        let n = it.next_block(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &d in &buf.docs[..n] {
+            f(d);
         }
     }
     Ok(())

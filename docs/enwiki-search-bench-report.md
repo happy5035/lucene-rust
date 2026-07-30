@@ -138,9 +138,36 @@ Java 同操作（含 harness）7–8.4µs、零分配。474 次 malloc/free ≈ 
 | wildcard low | 1.26x | 全字典扫描残余 per-term 成本（suffix vint + DFA 逐字节），已同构于 Java |
 
 共性：剩余差距全部是**解码/合并循环的常数项**（边界检查、逐字节 vlong、无 JIT
-向量化），不再存在结构性/算法性差距。继续压缩的方向： postings 块解码批量接口
-直供 bitset（跳过逐 doc next_doc）、vlong 解码的查表/批量变体、PGO。预期单项
-收益 10–40%，优先级递减。
+向量化），不再存在结构性/算法性差距。继续压缩的方向：vlong 解码的查表/批量变体、
+PGO、or/and high 的块级 intersect/union 内核向量化。预期单项收益 10–40%，优先级递减。
+（原首项"postings 块解码批量接口直供 bitset"已于 2026-07-30 落地，见 §4a。）
+
+## 4a. 第四轮：postings 块解码直供物化（2026-07-30）
+
+落实 §4 预告的首个方向。改动（`multi_term.rs` / `doc_iter.rs`，无格式变更）：
+
+- `for_each_doc` 由逐 doc `next_doc` 改为 `next_block` 驱动（codec `next_docs`
+  128-doc 窗口直供），物化路径从 ~7.4ns/doc 压向 2–3ns/doc 解码下限；
+  bitset 物化与 tier-2 roaring 物化同路受益，所有消费方签名零改动。
+- kway 归并（Disjunction/RoaringOr/DisjOver 三处）每轮 `heads`/`consumed`
+  两次堆分配 → 栈数组快照（`kway_union_curs`，k ≤ 32 走 slice 内核，
+  大 k 退化游标直读）。初版游标直读循环在 or high 回退 ~5%（每 doc 2k 次
+  Box 追随 > 省下的分配），栈数组版在交替 A/B 中确认无回退。
+
+结果（p50，counts 与基线逐字节一致，测试 431 全绿）：
+
+| 桶 | 130K 旧 → 新 | 130K vs Java | 5M 旧 → 新 | 5M vs Java |
+|---|---|---|---|---|
+| terms high | 104 → 72µs（1.44x） | 1.12x → **0.81x** | 23.8ms → 13.9ms（1.71x） | 1.29x → **0.75x** |
+| termsbig high | 1234 → 767µs（1.61x） | 1.07x → **0.70x** | 21.7ms → 12.4ms（1.75x） | 1.24x → **0.71x** |
+| or high | 147 → 142µs（持平） | 1.50x → 1.55x | 3.58ms → 3.54ms（持平） | 2.02x → 2.00x |
+
+130K 反超 14 → 15 桶（>1.5x 仅剩 or high 1.55 / prefix med 1.55 / terms med 1.58）；
+5M 反超 17 → 19 桶。剩余落后桶不变：or/and/phrase high（百万级命中解码常数）、
+termsbig low、wildcard low。
+
+产物：`/tmp/ab-{old,new}-{1,2}.txt`（交替 A/B）、`/tmp/n5m2-rust.txt`、
+`/tmp/n2-rust.txt`；counts 对拍 `/tmp/n5m2-counts.txt`、`/tmp/n2-counts.txt`。
 
 ## 5. 复现命令
 

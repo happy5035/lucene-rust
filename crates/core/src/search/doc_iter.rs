@@ -629,6 +629,7 @@ impl DocIter for DisjunctionDocIter {
     }
     fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
         let mut prod = 0;
+        let mut consumed = vec![0usize; self.sub.len()];
         while prod < DOC_BLOCK {
             // 耗尽 child 的游标补块
             let mut any = false;
@@ -648,11 +649,8 @@ impl DocIter for DisjunctionDocIter {
                 .filter_map(|i| self.curs[i].max_remaining())
                 .min()
                 .unwrap_or(u32::MAX);
-            let heads: Vec<&[u32]> = (0..self.sub.len())
-                .map(|i| self.curs[i].remaining())
-                .collect();
-            let mut consumed = vec![0usize; self.sub.len()];
-            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
+            consumed.iter_mut().for_each(|c| *c = 0);
+            let n = kway_union_curs(&self.curs, &mut consumed, &mut out.docs[prod..], limit);
             for i in 0..self.sub.len() {
                 self.curs[i].consume(consumed[i]);
             }
@@ -1488,6 +1486,12 @@ impl SourceCursor {
     }
 }
 
+impl UnionCursor for SourceCursor {
+    fn remaining(&self) -> &[u32] {
+        self.remaining()
+    }
+}
+
 /// 窗口定位 for DocSource：消费块内 < e 的前缀，跨块 refill 直到
 /// 首元素 >= e。返回 Some(首元素 == e) / None = 耗尽。
 fn position_source(curs: &mut SourceCursor, src: &mut DocSource, e: u32) -> Option<bool> {
@@ -1763,6 +1767,7 @@ impl DocIter for RoaringOrDocIter {
 
     fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
         let mut prod = 0;
+        let mut consumed = vec![0usize; self.sources.len()];
         while prod < DOC_BLOCK {
             // 耗尽 source 的游标补块
             let mut any = false;
@@ -1782,11 +1787,8 @@ impl DocIter for RoaringOrDocIter {
                 .filter_map(|i| self.curs[i].max_remaining())
                 .min()
                 .unwrap_or(u32::MAX);
-            let heads: Vec<&[u32]> = (0..self.sources.len())
-                .map(|i| self.curs[i].remaining())
-                .collect();
-            let mut consumed = vec![0usize; self.sources.len()];
-            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
+            consumed.iter_mut().for_each(|c| *c = 0);
+            let n = kway_union_curs(&self.curs, &mut consumed, &mut out.docs[prod..], limit);
             for i in 0..self.sources.len() {
                 self.curs[i].consume(consumed[i]);
             }
@@ -2300,9 +2302,10 @@ impl DocIter for DisjOverDocIter {
         self.next_doc()
     }
     fn next_block(&mut self, out: &mut DocBlockBuf) -> io::Result<usize> {
-        // k 路块归并：heads = 各 child 未消费切片，kway_union 满 128 即停。
+        // k 路块归并：heads = 各 child 未消费切片，kway_union_curs 满 128 即停。
         // matches() 已由 child 的 next_block 吸收（子句恒单阶段亦无害）。
         let mut prod = 0;
+        let mut consumed = vec![0usize; self.sub.len()];
         while prod < DOC_BLOCK {
             // 耗尽 child 的游标补块
             let mut any = false;
@@ -2322,11 +2325,8 @@ impl DocIter for DisjOverDocIter {
                 .filter_map(|i| self.curs[i].max_remaining())
                 .min()
                 .unwrap_or(u32::MAX);
-            let heads: Vec<&[u32]> = (0..self.sub.len())
-                .map(|i| self.curs[i].remaining())
-                .collect();
-            let mut consumed = vec![0usize; self.sub.len()];
-            let n = kway_union(&heads, &mut consumed, &mut out.docs[prod..], limit);
+            consumed.iter_mut().for_each(|c| *c = 0);
+            let n = kway_union_curs(&self.curs, &mut consumed, &mut out.docs[prod..], limit);
             for i in 0..self.sub.len() {
                 self.curs[i].consume(consumed[i]);
             }
@@ -2567,11 +2567,67 @@ pub(super) fn kway_union(
     n
 }
 
+/// kway_union_curs 的游标访问抽象（BlockCursor / SourceCursor 同形），
+/// 单态化零开销。consumed 语义同 kway_union（调用方每次调用前清零）。
+pub(super) trait UnionCursor {
+    fn remaining(&self) -> &[u32];
+}
+
+/// k 路归并热路径入口：k ≤ STACK_HEADS 时把各游标的 remaining() 切片
+/// 收集进栈数组后走 slice 内核——每轮每游标仅一次解引用，且无每轮
+/// heads Vec 堆分配（实测 enwiki 5M or high：游标直读循环每 doc 2k 次
+/// Box 追随比栈数组快照慢 ~5%）。k > STACK_HEADS 退化为游标直读循环
+/// （无界 bool 子句场景，分配换访问的权衡反转）。
+const STACK_HEADS: usize = 32;
+
+pub(super) fn kway_union_curs<C: UnionCursor>(
+    curs: &[C],
+    consumed: &mut [usize],
+    out: &mut [u32],
+    limit: u32,
+) -> usize {
+    debug_assert_eq!(curs.len(), consumed.len());
+    if curs.len() <= STACK_HEADS {
+        let mut heads: [&[u32]; STACK_HEADS] = [&[]; STACK_HEADS];
+        for (i, c) in curs.iter().enumerate() {
+            heads[i] = c.remaining();
+        }
+        return kway_union(&heads[..curs.len()], consumed, out, limit);
+    }
+    let mut n = 0;
+    while n < out.len() {
+        // 选最小头
+        let mut best: Option<(usize, u32)> = None;
+        for (i, c) in curs.iter().enumerate() {
+            let rest = &c.remaining()[consumed[i]..];
+            if let Some(&d) = rest.first() {
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((i, d));
+                }
+            }
+        }
+        let Some((_, d)) = best else { break };
+        if d > limit {
+            break;
+        }
+        // 推进所有等于 d 的头（去重）
+        for (i, c) in curs.iter().enumerate() {
+            let rest = &c.remaining()[consumed[i]..];
+            if rest.first() == Some(&d) {
+                consumed[i] += 1;
+            }
+        }
+        out[n] = d;
+        n += 1;
+    }
+    n
+}
+
 // ── 组合器块路径游标（spec §4） ───────────────────────────────────────
 
 /// 组合器块路径的 child 游标（spec §4）：持有 child 的当前块切片窗口。
 /// 18.7KB 的 SegmentDocIter 子迭代器不进此结构——只存 1KB 块缓冲（堆）。
-struct BlockCursor {
+pub(super) struct BlockCursor {
     buf: Box<DocBlockBuf>,
     pos: usize,
     len: usize,
@@ -2631,6 +2687,22 @@ impl BlockCursor {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// 测试构造：整窗装入 docs（≤ DOC_BLOCK），供 kway_union_curs 对拍。
+    #[cfg(test)]
+    pub(super) fn from_docs_for_test(docs: &[u32]) -> BlockCursor {
+        assert!(docs.len() <= DOC_BLOCK);
+        let mut cur = BlockCursor::new();
+        cur.buf.docs[..docs.len()].copy_from_slice(docs);
+        cur.len = docs.len();
+        cur
+    }
+}
+
+impl UnionCursor for BlockCursor {
+    fn remaining(&self) -> &[u32] {
+        self.remaining()
     }
 }
 

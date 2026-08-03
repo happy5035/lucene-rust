@@ -83,7 +83,14 @@ impl FSDirectory {
     /// Directory.sync: fsyncs the given files (FSyncDirectory.wrap / FSDirectory.sync).
     pub fn sync(&self, names: &[&str]) -> io::Result<()> {
         for name in names {
-            File::open(self.resolve(name))?.sync_all()?;
+            // Windows FlushFileBuffers requires GENERIC_WRITE; opening
+            // read-only yields ERROR_ACCESS_DENIED. The files are our own
+            // (already closed), so read+write is safe on all platforms.
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.resolve(name))?;
+            file.sync_all()?;
         }
         Ok(())
     }
@@ -94,9 +101,18 @@ impl FSDirectory {
     }
 
     /// Directory.syncMetaData: on Linux this fsyncs the directory fd so that
-    /// renames/creations are durable (FSDirectory.syncMetaData).
+    /// renames/creations are durable (FSDirectory.syncMetaData). On Windows a
+    /// directory cannot be opened as a file handle for fsync — Java Lucene's
+    /// FSDirectory.syncMetaData is likewise a no-op there.
     pub fn sync_metadata(&self) -> io::Result<()> {
-        File::open(&self.root)?.sync_all()
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
     }
 
     /// Directory.listAll: file names in the directory (no subdirectories).

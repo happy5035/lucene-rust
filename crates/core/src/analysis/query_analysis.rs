@@ -214,4 +214,37 @@ mod tests {
         let q = analyze_query(&Query::point_range("ts", 1, 2), &s).unwrap();
         assert_eq!(q, Query::point_range("ts", 1, 2));
     }
+
+    /// End-to-end: write -> index-side analysis -> query-side rewrite ->
+    /// search, on a schema declared through the spec string.
+    #[test]
+    fn lowercase_write_search_roundtrip() {
+        use crate::index_writer::{IndexWriter, IndexWriterConfig};
+        use crate::{Document, FieldValue};
+
+        let dir = std::env::temp_dir().join(format!("rl-analyzer-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (schema, _, _) =
+            Schema::parse("message:text+positions+analyzer=whitespace|lowercase,level:keyword")
+                .unwrap();
+        let mut w = IndexWriter::create(&dir, schema, IndexWriterConfig::default()).unwrap();
+        let mut doc = Document::new();
+        doc.add("message", FieldValue::Text("ERROR Failed error".to_string()));
+        doc.add("level", FieldValue::Keyword("ERROR".to_string()));
+        w.add_document(doc).unwrap();
+
+        // analyzed field: mixed-case query hits lowercase-normalized index
+        let q = analyze_query(&Query::term("message", "error"), w.schema()).unwrap();
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 1);
+
+        // terms IN through the same rewrite
+        let q = analyze_query(&Query::terms("level", &["ERROR", "WARN"]), w.schema()).unwrap();
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 1);
+
+        // keyword field keeps exact-case semantics (no analyzer configured)
+        assert_eq!(w.search(&Query::term("level", "error"), None, 10).unwrap().total, 0);
+        assert_eq!(w.search(&Query::term("level", "ERROR"), None, 10).unwrap().total, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

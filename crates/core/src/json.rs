@@ -7,6 +7,8 @@
 //! comma-separated `name:type[+modifier...]` entries, an optional
 //! `lucene名:type+mods@json键` alias suffix per entry, and a leading
 //! `$policy=strict|dynamic|stored-only` directive for unknown JSON fields.
+//! `text` fields accept an `analyzer=tokenizer|filter|...` modifier
+//! (e.g. `message:text+analyzer=whitespace|lowercase`).
 
 use std::collections::HashMap;
 

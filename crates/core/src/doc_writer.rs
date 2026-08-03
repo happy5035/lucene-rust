@@ -4,7 +4,7 @@ use codec_lucene9::StoredField;
 use crate::document::{Document, FieldValue};
 use crate::schema::{FieldSpec, Schema};
 use crate::sort::{DocMap, Key};
-use crate::tokenizer::WhitespaceTokens;
+use crate::analysis::WhitespaceTokens;
 
 /// Postings buffer for one term: parallel doc/freq arrays, ascending doc IDs.
 /// `positions` is only populated for fields with positions: one sorted

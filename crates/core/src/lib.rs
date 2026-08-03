@@ -18,7 +18,7 @@ pub mod schema;
 pub mod search;
 pub mod segment_builder;
 pub mod sort;
-pub mod tokenizer;
+pub mod analysis;
 
 pub use document::{Document, FieldValue};
 pub use index_writer::{commit_segments, DocLocation, IndexWriter, IndexWriterConfig};

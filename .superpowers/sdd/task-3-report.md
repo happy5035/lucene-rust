@@ -1,49 +1,32 @@
-# Task 3 Report: 叶子覆写——MatchAll / Bitmap 游标 / Docs / Freqs
+# Task 3 Report: 名字注册表 + `Analyzer::parse`
 
-## Status: DONE_WITH_CONCERNS
+## Status: DONE
 
 ## Commits
-- `0bb726d` feat(batch): 叶子 next_block 覆写——bitmap 游标 next_many_to / MatchAll 算术填充 / Docs-Freqs codec 批读
+- `core: analyzer name registry and Analyzer::parse`（代码：`crates/core/src/analysis/`）
+- `sdd: task-3 report (analyzer name registry)`（brief + 本报告）
 
 ## Test Summary
-- 281 passed (187 codec + 91 core + 2 bin + 1 jni); +2 vs baseline 279 (new leaf parity tests); 0 failed; 0 warnings.
+- 全绿：lib 173 passed / 0 failed / 1 ignored（含 analysis 11 个：registry 新增 3 个 + analyzer 5 + tokenizer 3），bin/cli 测试全过。
+- 红灯验证：实现前 `cargo test -p rustlucene-core analysis` 编译失败（E0433/E0425：`Analyzer::parse`、`register_filter` 不存在）。
+- 命令：`RUST_MIN_STACK=4194304 cargo test -p rustlucene-core`
+- 3 个 warning 均为 `crates/core/src/search/multi_term.rs` 既存 dead-code 告警，与本任务无关。
 
 ## Files Changed
-- `crates/core/src/search/doc_iter.rs` — 4 edits: `BitmapCursor::next_many_to`, `cursor_next_block` free fn, `RoaringDocIter::next_block`, `MaterializedDocIter::next_block`, `MatchAllIter::next_block`, `SegmentDocIter::next_block` Docs/Freqs arms
-- `crates/core/src/search/block_tests.rs` — added `matchall_block_stream` and `leaves_block_vs_per_doc_random` tests; added `MatchAllIter` import
+- `crates/core/src/analysis/registry.rs` — 新建。`custom_tokenizers()` / `custom_filters()` 两个 `OnceLock<RwLock<HashMap>>` 注册表；`register_tokenizer` / `register_filter`；`impl Analyzer { pub fn parse }`；brief 给定测试模块（3 个测试）。
+- `crates/core/src/analysis/mod.rs` — 增加 `mod registry;` 和 `pub use registry::{register_filter, register_tokenizer};`。
 
-## Self-Review
+## Self-Review（对照 brief 接口清单）
+- [x] `Analyzer::parse(spec: &str) -> Result<Analyzer, String>` — inherent impl，签名逐字一致；`"tokenizer|filter|..."` 语法，链序即声明序。
+- [x] `pub fn register_tokenizer(name: &str, factory: TokenizerFactory)` — 签名逐字一致。
+- [x] `pub fn register_filter(name: &str, filter: Arc<dyn TokenFilter>)` — 签名逐字一致。
+- [x] 实现代码逐字采用 brief Step 3（无改写）。
+- [x] 测试代码逐字采用 brief Step 1（3 个测试全过）。
+- [x] filter 位只查内置 filter 名（`lowercase`）+ 自定义 filter 注册表，不合并 tokenizer 名——`Analyzer::parse("whitespace|letter")` 返回 Err（`unknown token filter: letter`），测试覆盖。
+- [x] 空 spec / 未知 tokenizer / 未知 filter 均报错，测试覆盖。
+- [x] 全 safe Rust（`#![forbid(unsafe_code)]` 下编译通过），无新依赖（仅 std `OnceLock`/`RwLock`/`HashMap`）。
+- [x] 既有测试零改动全绿（173 passed，baseline 170 + 新增 3）。
+- [x] mod.rs re-export 与 brief 一致；`Analyzer::parse` 为 inherent impl 随 `Analyzer` 自动导出。
 
-### Completeness (all 8 steps)
-- [x] Step 1: Tests appended to block_tests.rs
-- [x] Step 2: Baseline confirmed 6/6 block tests pass before overrides (regression guard, not red-light)
-- [x] Step 3: `BitmapCursor::next_many_to` added after `advance` in impl block
-- [x] Step 4: `cursor_next_block<B: DocsBitmap>` free function + one-line call sites in both Roaring and Materialized impls
-- [x] Step 5: `MatchAllIter::next_block` arithmetic fill
-- [x] Step 6: Docs/Freqs arms replaced with codec batch calls
-- [x] Step 7: Full workspace suite green
-- [x] Step 8: Committed with exact message from brief
-
-### Naming contract
-- `next_many_to` ✓
-- `cursor_next_block` ✓
-- `next_docs` / `next_docs_and_freqs` consumption ✓
-
-### Discipline
-- Nothing beyond brief (one minor fix to brief code — see Drift)
-
-### Pristine output
-- No warnings
-
-## Drift / Concerns
-
-### Brief bug fix: `next_many_to` refill invariant
-
-The brief's Step 3 code updates `next_from` only at the **end** of `next_many_to`, after the full while-loop. This creates a correctness bug: when `dst.len() > BITMAP_ITER_BATCH` (here 128 < 512 so not triggered in practice for DOC_BLOCK, but the invariant is wrong), the inner `refill()` call uses `self.next_from` which is stale — it still holds the value from the previous batch's last doc + 1, not from what was just consumed from `self.buf`. This causes `docs_from` to re-fetch overlapping docs, producing duplicates.
-
-**Fix applied**: update `self.next_from = dst[n - 1] + 1` *before* calling `refill()` inside the loop (when `n > 0` and buffer is exhausted), in addition to the final update after the loop. The final update remains for the common case where the loop exits without refilling.
-
-In the current codebase `dst.len() == DOC_BLOCK == 128 <= 512 == BITMAP_ITER_BATCH`, so a single buffer always suffices and the mid-loop refill never fires. The fix is defensive — corrects the invariant for future callers with larger dst.
-
-### §12 Design deviation (as specified in brief)
-`BitsetDocIter` retains the default `next_block` fill. `FixedBitSet` exposes no word-level access; `next_set_bit` is already a word-level trailing_zeros scan. A specialized override would yield no incremental benefit. If Phase 1 profiling confirms bitset-path hotspots, revisit.
+## 疑虑
+无。

@@ -226,13 +226,23 @@ impl Schema {
                 modifiers = m;
             }
             let has = |m: &str| modifiers.split('+').any(|x| x.trim() == m);
+            let analyzer = modifiers
+                .split('+')
+                .find_map(|m| m.trim().strip_prefix("analyzer="));
+            if analyzer.is_some() && ty != "text" {
+                return Err(format!("field {name}: analyzer= is only valid on text fields"));
+            }
             let spec = match ty {
                 "text" => {
-                    if has("positions") {
+                    let mut s = if has("positions") {
                         FieldSpec::text_with_positions(name)
                     } else {
                         FieldSpec::text(name)
+                    };
+                    if let Some(a) = analyzer {
+                        s = s.with_analyzer(a);
                     }
+                    s
                 }
                 "keyword" => {
                     let mut s = FieldSpec::keyword(name);
@@ -260,6 +270,10 @@ impl Schema {
                 "stored" => FieldSpec::stored(name),
                 other => return Err(format!("unknown field type: {other}")),
             };
+            if let Some(a) = analyzer {
+                crate::analysis::Analyzer::parse(a)
+                    .map_err(|e| format!("field {name}: invalid analyzer spec: {e}"))?;
+            }
             schema.add(spec);
             if let Some(k) = json_key {
                 if k.is_empty() {
@@ -460,5 +474,25 @@ mod tests {
         assert!(s2.get("message").unwrap().has_positions());
         assert!(Schema::parse("$policy=bogus,x:keyword").is_err());
         assert!(Schema::parse("x:keyword@").is_err());
+    }
+
+    #[test]
+    fn analyzer_modifier_attaches_to_text_fields() {
+        let (s, _, _) = Schema::parse("message:text+positions+analyzer=whitespace|lowercase").unwrap();
+        assert_eq!(
+            s.get("message").unwrap().analyzer.as_deref(),
+            Some("whitespace|lowercase")
+        );
+        // plain text without analyzer keeps None (legacy behavior)
+        let (s2, _, _) = Schema::parse("message:text").unwrap();
+        assert!(s2.get("message").unwrap().analyzer.is_none());
+    }
+
+    #[test]
+    fn analyzer_modifier_rejected_on_non_text_and_unknown_components() {
+        assert!(Schema::parse("level:keyword+analyzer=whitespace").is_err());
+        assert!(Schema::parse("ts:longpoint+analyzer=whitespace").is_err());
+        assert!(Schema::parse("message:text+analyzer=nosuchtok").is_err());
+        assert!(Schema::parse("message:text+analyzer=whitespace|nosuchfilter").is_err());
     }
 }

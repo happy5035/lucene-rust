@@ -1,215 +1,163 @@
-### Task 4: 共享块代数——intersect / andnot / kway-union
+### Task 4: FieldSpec.analyzer + Schema 校验 + spec 字符串语法
 
 **Files:**
-- Modify: `crates/core/src/search/doc_iter.rs`（`SegmentDocIter` 定义 :1495 之前新增代数区）
-- Modify: `crates/core/src/search/block_tests.rs`（代数单测）
+- Modify: `crates/core/src/schema.rs`（FieldSpec 加字段、构造函数、`Schema::add` 校验、`with_analyzer`）
+- Modify: `crates/core/src/json.rs:229-263`（`Schema::parse` 的 `analyzer=` modifier）
 
 **Interfaces:**
-- Consumes: 无（纯函数）
-- Produces: `block_intersect(a, b, out) -> (usize, usize, usize)`、`block_andnot(a, b, out) -> (usize, usize, usize)`、`kway_union(heads, consumed, out) -> usize`——Task 5/6 组合器覆写的内核；Phase 2 SIMD 只换这三个函数内核，签名不动
+- Consumes: Task 3 的 `Analyzer::parse`
+- Produces:
+  - `FieldSpec.analyzer: Option<String>`（规格文本，如 `"whitespace|lowercase"`）
+  - `FieldSpec::with_analyzer(self, spec: &str) -> Self`
+  - spec 语法：`message:text+positions+analyzer=whitespace|lowercase`（`analyzer=` 只对 `text` 类型合法）
 
-- [ ] **Step 1: 写失败测试——代数四象限**
+- [ ] **Step 1: Write the failing test**
 
-`block_tests.rs` 尾部追加：
+`crates/core/src/json.rs` 测试模块追加：
 
 ```rust
-use super::doc_iter::{block_andnot, block_intersect, kway_union};
-
-fn run(f: impl Fn(&[u32], &[u32], &mut [u32]) -> (usize, usize, usize), a: &[u32], b: &[u32]) -> Vec<u32> {
-    // 分片消费至耗尽（模拟组合器跨调用状态机）
-    let mut out = vec![0u32; 128];
-    let mut res = Vec::new();
-    let (mut pa, mut pb) = (0, 0);
-    loop {
-        let (ca, cb, n) = f(&a[pa..], &b[pb..], &mut out);
-        res.extend_from_slice(&out[..n]);
-        pa += ca;
-        pb += cb;
-        if n == 0 || (pa == a.len() && (ca == 0 || cb == 0 && pb == b.len())) {
-            break;
-        }
-        if ca == 0 && cb == 0 {
-            break;
-        }
-    }
-    res
-}
-
-fn expect_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
-    a.iter().filter(|x| b.contains(x)).copied().collect()
-}
-
-fn expect_andnot(a: &[u32], b: &[u32]) -> Vec<u32> {
-    a.iter().filter(|x| !b.contains(x)).copied().collect()
+#[test]
+fn analyzer_modifier_attaches_to_text_fields() {
+    let (s, _, _) = Schema::parse("message:text+positions+analyzer=whitespace|lowercase").unwrap();
+    assert_eq!(
+        s.get("message").unwrap().analyzer.as_deref(),
+        Some("whitespace|lowercase")
+    );
+    // plain text without analyzer keeps None (legacy behavior)
+    let (s2, _, _) = Schema::parse("message:text").unwrap();
+    assert!(s2.get("message").unwrap().analyzer.is_none());
 }
 
 #[test]
-fn algebra_quadrants() {
-    let cases: Vec<(Vec<u32>, Vec<u32>)> = vec![
-        (vec![], vec![]),
-        (vec![1, 2, 3], vec![]),
-        (vec![], vec![1, 2, 3]),
-        (vec![1, 3, 5], vec![2, 4, 6]),          // 不相交
-        (vec![1, 2, 3], vec![1, 2, 3]),          // 全等
-        (vec![2, 4], vec![1, 2, 3, 4, 5]),       // 包含
-        ((0..300).step_by(2).collect(), (0..300).step_by(3).collect()), // 交错跨块
-        ((0..128).collect(), (0..256).collect()),                      // 128 整数倍
-        ((0..127).collect(), (0..129).collect()),                      // 尾块
-    ];
-    for (a, b) in cases {
-        assert_eq!(run(block_intersect, &a, &b), expect_intersect(&a, &b), "intersect {a:?} {b:?}");
-        assert_eq!(run(block_andnot, &a, &b), expect_andnot(&a, &b), "andnot {a:?} {b:?}");
-        // andnot 反对称
-        assert_eq!(run(block_andnot, &b, &a), expect_andnot(&b, &a), "andnot rev {a:?} {b:?}");
-    }
+fn analyzer_modifier_rejected_on_non_text_and_unknown_components() {
+    assert!(Schema::parse("level:keyword+analyzer=whitespace").is_err());
+    assert!(Schema::parse("ts:longpoint+analyzer=whitespace").is_err());
+    assert!(Schema::parse("message:text+analyzer=nosuchtok").is_err());
+    assert!(Schema::parse("message:text+analyzer=whitespace|nosuchfilter").is_err());
 }
+```
 
-#[test]
-fn kway_union_dedup_and_order() {
-    let mut lcg = Lcg(99);
-    for _ in 0..30 {
-        let k = 2 + (lcg.next_u32() % 5) as usize;
-        let sets: Vec<Vec<u32>> = (0..k)
-            .map(|_| lcg.doc_set(3_000, (lcg.next_u32() % 400) as usize))
-            .collect();
-        // 期望 = 并集去重升序
-        let mut expect: Vec<u32> = sets.iter().flatten().copied().collect();
-        expect.sort_unstable();
-        expect.dedup();
-        // 分片消费
-        let mut got = Vec::new();
-        let mut pos = vec![0usize; k];
-        let mut out = vec![0u32; 64]; // 故意 <128 触发多次归并
-        loop {
-            let heads: Vec<&[u32]> = sets.iter().enumerate().map(|(i, s)| &s[pos[i]..]).collect();
-            let mut consumed = vec![0usize; k];
-            let n = kway_union(&heads, &mut consumed, &mut out);
-            got.extend_from_slice(&out[..n]);
-            for i in 0..k {
-                pos[i] += consumed[i];
-            }
-            if n == 0 {
-                break;
-            }
-        }
-        assert_eq!(got, expect, "k={k}");
+`crates/core/src/schema.rs` 测试模块追加（若无测试模块则新建）：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyzer_only_on_indexed_tokenized_fields() {
+        let (result, _) = {
+            let mut s = Schema::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.add(FieldSpec::keyword("level").with_analyzer("whitespace"));
+            }))
+        };
+        assert!(result.is_err(), "keyword field with analyzer must be rejected");
+    }
+
+    #[test]
+    fn with_analyzer_roundtrip() {
+        let f = FieldSpec::text("message").with_analyzer("whitespace|lowercase");
+        assert_eq!(f.analyzer.as_deref(), Some("whitespace|lowercase"));
     }
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustlucene-core algebra_ 2>&1 | tail -5; cargo test -p rustlucene-core kway_ 2>&1 | tail -5`
-Expected: 编译错误——三个函数未定义
+Run: `cargo test -p rustlucene-core schema json 2>&1 | tail -5`
+Expected: FAIL（`analyzer` 字段 / `with_analyzer` 不存在）
 
-- [ ] **Step 3: 实现三个代数内核**
+- [ ] **Step 3: Write minimal implementation**
 
-在 `doc_iter.rs` 的 `// ── SegmentDocIter ──` 注释行（:1493）之前插入：
+`crates/core/src/schema.rs`：
+
+`FieldSpec` 增加字段（struct 定义处，约 line 20-32）：
 
 ```rust
-// ── 块代数内核（spec 2026-07-26 §4；Phase 2 SIMD 只换这里） ─────────
+    /// Analyzer spec text (e.g. "whitespace|lowercase"), only legal on
+    /// indexed tokenized text fields. Not persisted — analyzer config is
+    /// application-level, same as Lucene.
+    pub analyzer: Option<String>,
+```
 
-/// 双指针 intersect，部分消费语义：对 a/b 前缀求交写入 out（至多
-/// out.len() 个），返回 (消费 a 数, 消费 b 数, 产出数)。产出满或
-/// 某侧耗尽即停——调用方按返回值推进游标跨调用续算。
-/// 输入要求：a/b 升序（块契约）。
-fn block_intersect(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
-    let (mut ia, mut ib, mut n) = (0, 0, 0);
-    while ia < a.len() && ib < b.len() && n < out.len() {
-        let (x, y) = (a[ia], b[ib]);
-        if x == y {
-            out[n] = x;
-            n += 1;
-            ia += 1;
-            ib += 1;
-        } else if x < y {
-            ia += 1;
-        } else {
-            ib += 1;
-        }
+各构造函数补 `analyzer: None`：`text()`、`keyword()`、`base()`（其余构造函数走 `..Self::base(name)` 自动继承）。
+
+新增链式方法（放在 `with_stored` 之后）：
+
+```rust
+    /// Attaches an analyzer chain spec ("tokenizer|filter|...") to this
+    /// field. Only valid on indexed tokenized text fields (enforced by
+    /// `Schema::add`).
+    pub fn with_analyzer(mut self, spec: &str) -> Self {
+        self.analyzer = Some(spec.to_string());
+        self
     }
-    (ia, ib, n)
-}
+```
 
-/// slice 差集 a \ b，部分消费语义同 block_intersect。注意：b 侧消费
-/// 只推进到"已确认 < a 当前尾"的前缀——b 游标跨调用留存（Excl 的
-/// prohibited 块语义）。
-fn block_andnot(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize) {
-    let (mut ia, mut ib, mut n) = (0, 0, 0);
-    while ia < a.len() && n < out.len() {
-        let x = a[ia];
-        while ib < b.len() && b[ib] < x {
-            ib += 1;
-        }
-        if ib < b.len() && b[ib] == x {
-            ib += 1; // 排除；b 该元素已消费
-        } else {
-            out[n] = x;
-            n += 1;
-        }
-        ia += 1;
-    }
-    (ia, ib, n)
-}
+`Schema::add` 的 `if spec.is_indexed()` assert 块之后追加：
 
-/// k 路有序 slice 归并去重，out 满即停。consumed[i] 写回各 head 消费
-/// 数（调用方初始化长度 = heads.len()）。k 小（bool 子句数）→ 线性扫
-/// 最小头，不上堆（堆化是 bool-bench-report §11 P2 议题）。
-fn kway_union(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u32]) -> usize {
-    debug_assert_eq!(heads.len(), consumed.len());
-    let mut n = 0;
-    let mut last: Option<u32> = None;
-    while n < out.len() {
-        // 选最小头
-        let mut best: Option<(usize, u32)> = None;
-        for (i, h) in heads.iter().enumerate() {
-            let rest = &h[consumed[i]..];
-            if let Some(&d) = rest.first() {
-                if best.is_none_or(|(_, bd)| d < bd) {
-                    best = Some((i, d));
+```rust
+        if let Some(a) = &spec.analyzer {
+            assert!(
+                spec.tokenized && spec.is_indexed(),
+                "field {}: analyzer requires an indexed tokenized text field",
+                spec.name
+            );
+            if let Err(e) = crate::analysis::Analyzer::parse(a) {
+                panic!("field {}: invalid analyzer spec: {e}", spec.name);
+            }
+        }
+```
+
+`crates/core/src/json.rs` 的 `Schema::parse`（约 line 228-263）：在 `let has = ...` 之后、match 之前提取 analyzer modifier：
+
+```rust
+            let analyzer = modifiers
+                .split('+')
+                .find_map(|m| m.trim().strip_prefix("analyzer="));
+            if analyzer.is_some() && ty != "text" {
+                return Err(format!("field {name}: analyzer= is only valid on text fields"));
+            }
+```
+
+`"text"` 分支改为：
+
+```rust
+                "text" => {
+                    let mut s = if has("positions") {
+                        FieldSpec::text_with_positions(name)
+                    } else {
+                        FieldSpec::text(name)
+                    };
+                    if let Some(a) = analyzer {
+                        s = s.with_analyzer(a);
+                    }
+                    s
                 }
-            }
-        }
-        let Some((_, d)) = best else { break };
-        // 推进所有等于 d 的头（去重）
-        for (i, h) in heads.iter().enumerate() {
-            let rest = &h[consumed[i]..];
-            if rest.first() == Some(&d) {
-                consumed[i] += 1;
-            }
-        }
-        if last != Some(d) {
-            out[n] = d;
-            n += 1;
-            last = Some(d);
-        }
-    }
-    n
-}
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+（未知名称/非法链不能依赖 `Schema::add` 的 assert——`Schema::parse` 是 Result 风格且走 JNI，panic 不可接受。因此在 match 之后、**`schema.add(spec);` 之前**插入显式校验：）
 
-Run: `cargo test -p rustlucene-core algebra_ kway_ 2>&1 | tail -4`
-Expected: 2 测试 PASS
+```rust
+            if let Some(a) = analyzer {
+                crate::analysis::Analyzer::parse(a)
+                    .map_err(|e| format!("field {name}: invalid analyzer spec: {e}"))?;
+            }
+```
 
-Run: `cargo test --workspace 2>&1 | tail -3`
-Expected: 全绿（281 passed）
+注意：`Schema::add` 里对非法 analyzer 用 panic 是为了与现有 assert 风格一致（直接 Rust 调用方）；`Schema::parse` 路径必须先转成 `Err` 返回（JNI 侧 fail fast）。
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p rustlucene-core`
+Expected: PASS（新增 4 项 + 现有全绿）
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/core/src/search/doc_iter.rs crates/core/src/search/block_tests.rs
-git commit -m "$(cat <<'EOF'
-feat(batch): 共享块代数内核 block_intersect / block_andnot / kway_union
-
-spec 2026-07-26 §4：部分消费语义（组合器跨调用游标状态机基础），
-标量双指针/线性归并——Phase 2 SIMD 只换内核不改签名。四象限 +
-随机 30 组 k 路（k=2..6，out=64 故意触发多轮）对拍。
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-EOF
-)"
+git add crates/core/src/schema.rs crates/core/src/json.rs
+git commit -m "core: per-field analyzer spec on FieldSpec and schema spec syntax"
 ```
 
 ---

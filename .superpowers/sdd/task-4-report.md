@@ -1,142 +1,48 @@
-# Task 4 Report: 共享块代数——intersect / andnot / kway-union
+# Task 4 报告：FieldSpec.analyzer + Schema 校验 + spec 字符串语法
 
-## Status: DONE
+## 状态
 
-## Implemented
+DONE
 
-Three pure scalar kernel functions in `crates/core/src/search/doc_iter.rs` (before the `// ── SegmentDocIter ──` section):
+## 变更文件
 
-1. **`block_intersect(a, b, out) -> (consumed_a, consumed_b, produced)`** — sorted-slice intersection via two-pointer scan
-2. **`block_andnot(a, b, out) -> (consumed_a, consumed_b, produced)`** — sorted-slice set difference a \ b
-3. **`kway_union(heads, consumed, out) -> produced`** — k-way sorted-slice merge with deduplication
+- `crates/core/src/schema.rs`
+- `crates/core/src/json.rs`
 
-All three use partial-consumption semantics: they stop when `out` fills or any input exhausts, returning how far each input was consumed so the caller can advance cursors across calls.
+## TDD 过程
 
-Two test functions in `crates/core/src/search/block_tests.rs`:
+1. **先写失败测试**：json.rs 测试模块追加 `analyzer_modifier_attaches_to_text_fields` 和 `analyzer_modifier_rejected_on_non_text_and_unknown_components`（按 brief 逐字）；schema.rs 新建 `#[cfg(test)] mod tests`，含 `analyzer_only_on_indexed_tokenized_fields`（catch_unwind 验证 panic 拒绝）和 `with_analyzer_roundtrip`。
+2. **确认失败**：`RUST_MIN_STACK=4194304 cargo test -p rustlucene-core` 编译失败（E0599 method not found / E0609 no field `analyzer`），符合预期。
+3. **最小实现**：
+   - `FieldSpec` 新增 `pub analyzer: Option<String>`（含 brief 给的 doc comment）。
+   - `text()`、`keyword()`、`base()` 三个直接构造函数补 `analyzer: None`；其余构造函数经 `..Self::text(name)` / `..Self::base(name)` 自动继承。
+   - `with_analyzer(mut self, spec: &str) -> Self` 放在 `with_stored` 之后（逐字）。
+   - `Schema::add` 在 `is_indexed()` assert 块之后追加 analyzer 校验（逐字）：非 tokenized/非 indexed 字段带 analyzer → assert panic；`Analyzer::parse` 失败 → panic。
+   - `json.rs` `Schema::parse`：在 `let has = ...` 之后、match 之前提取 `analyzer=` modifier；非 text 类型携带时返回 `Err`；`"text"` 分支按 brief 改写；在 match 之后、**`schema.add(spec);` 之前**插入显式 `Analyzer::parse` 校验，失败返回 `Err`（不走 `Schema::add` 的 panic 路径，JNI 侧 fail fast）。
+4. **确认通过**：全量测试绿。
 
-1. **`algebra_quadrants`** — 9 cases (empty, disjoint, identical, subset, cross-block, multiples of 128, tail block) for both intersect and andnot (including andnot antisymmetry)
-2. **`kway_union_dedup_and_order`** — 30 random rounds with k=2..6, universe=3000, out=64 (intentionally <128 to force multi-call merging)
+## 与 brief 的偏差
 
-## RED Output
+一处：`analyzer_only_on_indexed_tokenized_fields` 测试中 brief 写的是
+`let (result, _) = { ... catch_unwind(...) };`，但 `catch_unwind` 返回
+`Result<(), Box<dyn Any + Send>>`，不能按元组解构（E0308 编译错误）。已最小修正为
+`let result = { ... };`，测试语义（catch_unwind + AssertUnwindSafe + 断言 is_err）与 brief 完全一致。其余代码均逐字采用 brief。
 
-```
-error[E0432]: unresolved imports `super::doc_iter::block_andnot`, `super::doc_iter::block_intersect`, `super::doc_iter::kway_union`
-   --> crates/core/src/search/block_tests.rs:159:23
-    |
-159 | use super::doc_iter::{block_andnot, block_intersect, kway_union};
-    |                       ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^ no `kway_union` in `search::doc_iter`
-```
-
-## GREEN Output
-
-```
-test search::block_tests::algebra_quadrants ... ok
-test search::block_tests::kway_union_dedup_and_order ... ok
-```
-
-## Full-Suite Numbers
+## 验证
 
 ```
-test result: ok. 187 passed; 0 failed; 1 ignored (codec)
-test result: ok. 93 passed; 0 failed; 1 ignored (core)
-test result: ok. 2 passed; 0 failed (cli integration)
-test result: ok. 1 passed; 0 failed (cli unit)
+RUST_MIN_STACK=4194304 cargo test -p rustlucene-core
 ```
 
-**Total: 283 passed, 0 failed** (baseline 281 + 2 new tests). Zero warnings.
+结果：177 passed; 0 failed; 1 ignored（lib）+ 其余 target 全绿。新增 4 个测试全部通过：
 
-## Files Changed
+- `json::tests::analyzer_modifier_attaches_to_text_fields`
+- `json::tests::analyzer_modifier_rejected_on_non_text_and_unknown_components`
+- `schema::tests::analyzer_only_on_indexed_tokenized_fields`
+- `schema::tests::with_analyzer_roundtrip`
 
-| File | Change |
-|------|--------|
-| `crates/core/src/search/doc_iter.rs` | +78 lines: 3 kernel functions with doc comments, `#[allow(dead_code)]` (consumers in Tasks 5/6), `pub(super)` visibility |
-| `crates/core/src/search/block_tests.rs` | +90 lines: `use` import, `run()` harness, `expect_intersect`/`expect_andnot` reference impls, 2 test functions |
+既有测试零改动，无失败。3 个 dead-code warning（`pattern_chars`/`matches`/`glob_match`）为既有代码遗留，与本任务无关；无新依赖，`#![forbid(unsafe_code)]` 未受影响。
 
-**Commit:** `3e4f97f feat(batch): 共享块代数内核 block_intersect / block_andnot / kway_union`
+## 疑虑
 
-## Self-Review
-
-### Naming Contract
-- ✅ `block_intersect` — exact signature `(a: &[u32], b: &[u32], out: &mut [u32]) -> (usize, usize, usize)`
-- ✅ `block_andnot` — exact same signature
-- ✅ `kway_union` — exact signature `(heads: &[&[u32]], consumed: &mut [usize], out: &mut [u32]) -> usize`
-
-### Discipline
-- ✅ Nothing beyond the brief (no SIMD, no extra kernel variants)
-- ✅ Scalar-only dual-pointer / linear-scan implementations
-- ✅ `#[allow(dead_code)]` added to suppress warnings (Tasks 5/6 will consume these)
-
-### Hand Trace: Partial-Fill Case
-
-**Scenario:** `a = [0,1,...,199]` (200 elements), `b = [0,1,...,199]` (200 elements), `out` capacity = 128.
-
-**First call:** `block_intersect(a[0..200], b[0..200], out[128])`
-- All 200 elements match, but `out` fills after 128 matches.
-- Loop exits when `n == 128` (== `out.len()`).
-- State: `ia=128, ib=128, n=128`.
-- Returns `(128, 128, 128)`.
-- Caller advances: `pa=128, pb=128`.
-
-**Second call:** `block_intersect(a[128..200], b[128..200], out[128])`
-- Remaining: 72 elements in each slice, all match.
-- Loop exits when `ia == 72` (== remaining `a.len()`).
-- State: `ia=72, ib=72, n=72`.
-- Returns `(72, 72, 72)`.
-- Caller advances: `pa=200, pb=200`.
-
-**Third call:** `block_intersect(a[200..], b[200..], out[128])`
-- Both slices empty. Loop exits immediately.
-- Returns `(0, 0, 0)`.
-- `n == 0` → break.
-
-**Result:** `[0,1,...,199]` (200 elements). ✅ Correct.
-
-The partial-consumption semantics work: `consumed_a`/`consumed_b` correctly report how far to advance each cursor, even when `out` fills before either input is exhausted.
-
-## Drift
-
-**Minor deviation from brief:** The brief's test code had a borrow-checker error:
-
-```rust
-// Brief (fails E0499: cannot borrow `lcg` as mutable more than once)
-let sets: Vec<Vec<u32>> = (0..k)
-    .map(|_| lcg.doc_set(3_000, (lcg.next_u32() % 400) as usize))
-    .collect();
-```
-
-**Fix:** Extracted the count computation to a separate statement:
-
-```rust
-let mut sets: Vec<Vec<u32>> = Vec::with_capacity(k);
-for _ in 0..k {
-    let cnt = (lcg.next_u32() % 400) as usize;
-    sets.push(lcg.doc_set(3_000, cnt));
-}
-```
-
-This is a mechanical fix for a Rust borrow-checker constraint; semantics unchanged.
-
-**Additional:** Added `#[allow(dead_code)]` to the three kernel functions. The brief specified `pub(super)` visibility, but since Tasks 5/6 haven't been implemented yet, the lib build emits "never used" warnings. The brief requires "pristine output (no warnings)", so `#[allow(dead_code)]` is necessary until the consumers land.
-
-## Fix I-1
-
-**Test added:** `algebra_consumed_coordinates_partial_fill` in `crates/core/src/search/block_tests.rs` — pins resumption coordinates for partial-fill (out capacity = 2 < available result = 3), then verifies the resume path assembles the full intersect without loss or duplication.
-
-**Coordinate adjustment from brief:** Yes. The brief asserted `block_andnot` should return `(ca, cb, n) = (2, 1, 2)`. Actual kernel semantics give `(3, 1, 2)`: the loop body `ia += 1` runs unconditionally after emitting `3` (the second output element), so `ia` advances to 3 rather than stopping at 2. This is the legitimate implementation semantics — the resume assertion (no-loss-no-dup across the coordinate boundary) holds either way, but the direct coordinate pin uses the implementation's true values. The intersect coordinates `(4, 2, 2)` match the brief exactly.
-
-**Doc edit:** Appended `调用方每次调用前初始化为 0；` to the `consumed` clause of `kway_union`'s doc comment in `doc_iter.rs` (M-1 clarification).
-
-**Test command + output:**
-```
-$ RUST_MIN_STACK=4194304 cargo test -p rustlucene-core block_ 2>&1 | tail -3
-test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out
-
-$ RUST_MIN_STACK=4194304 cargo test --workspace 2>&1 | grep "test result"
-test result: ok. 187 passed; 0 failed; 1 ignored  (codec)
-test result: ok. 94 passed; 0 failed; 1 ignored   (core)
-test result: ok. 2 passed; 0 failed                (cli integration)
-test result: ok. 1 passed; 0 failed                (cli unit)
-```
-Total 284 passed, 0 failed, 0 warnings. New test + all existing pass.
-
-**New SHA:** `50c02a3 feat(batch): 共享块代数内核 block_intersect / block_andnot / kway_union`
+无。

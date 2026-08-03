@@ -29,6 +29,10 @@ pub struct FieldSpec {
     pub tokenized: bool,
     pub doc_values: DocValuesType,
     pub points: Option<PointSpec>,
+    /// Analyzer spec text (e.g. "whitespace|lowercase"), only legal on
+    /// indexed tokenized text fields. Not persisted — analyzer config is
+    /// application-level, same as Lucene.
+    pub analyzer: Option<String>,
 }
 
 impl FieldSpec {
@@ -42,6 +46,7 @@ impl FieldSpec {
             tokenized: true,
             doc_values: DocValuesType::None,
             points: None,
+            analyzer: None,
         }
     }
 
@@ -64,6 +69,7 @@ impl FieldSpec {
             tokenized: false,
             doc_values: DocValuesType::None,
             points: None,
+            analyzer: None,
         }
     }
 
@@ -126,6 +132,7 @@ impl FieldSpec {
             tokenized: false,
             doc_values: DocValuesType::None,
             points: None,
+            analyzer: None,
         }
     }
 
@@ -152,6 +159,14 @@ impl FieldSpec {
     /// Marks this field stored (or not).
     pub fn with_stored(mut self, stored: bool) -> Self {
         self.stored = stored;
+        self
+    }
+
+    /// Attaches an analyzer chain spec ("tokenizer|filter|...") to this
+    /// field. Only valid on indexed tokenized text fields (enforced by
+    /// `Schema::add`).
+    pub fn with_analyzer(mut self, spec: &str) -> Self {
+        self.analyzer = Some(spec.to_string());
         self
     }
 
@@ -197,6 +212,16 @@ impl Schema {
                 spec.name
             );
         }
+        if let Some(a) = &spec.analyzer {
+            assert!(
+                spec.tokenized && spec.is_indexed(),
+                "field {}: analyzer requires an indexed tokenized text field",
+                spec.name
+            );
+            if let Err(e) = crate::analysis::Analyzer::parse(a) {
+                panic!("field {}: invalid analyzer spec: {e}", spec.name);
+            }
+        }
         if let Some(p) = spec.points {
             assert!(
                 p.bytes_per_dim == 4 || p.bytes_per_dim == 8,
@@ -214,5 +239,27 @@ impl Schema {
 
     pub fn fields(&self) -> &[FieldSpec] {
         &self.fields
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyzer_only_on_indexed_tokenized_fields() {
+        let result = {
+            let mut s = Schema::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                s.add(FieldSpec::keyword("level").with_analyzer("whitespace"));
+            }))
+        };
+        assert!(result.is_err(), "keyword field with analyzer must be rejected");
+    }
+
+    #[test]
+    fn with_analyzer_roundtrip() {
+        let f = FieldSpec::text("message").with_analyzer("whitespace|lowercase");
+        assert_eq!(f.analyzer.as_deref(), Some("whitespace|lowercase"));
     }
 }

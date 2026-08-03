@@ -280,6 +280,10 @@ pub struct FieldBuf {
     pub sorted_dv: Option<SortedDvBuf>,
     pub binary_dv: Option<BinaryDvBuf>,
     pub points: Option<PointsBuf>,
+    /// Compiled analyzer chain for analyzer-configured text fields
+    /// (spec §索引侧接入): compiled once per field per writer, reused
+    /// across docs via its stateless template.
+    pub analyzer: Option<crate::analysis::Analyzer>,
 }
 
 impl FieldBuf {
@@ -292,6 +296,9 @@ impl FieldBuf {
         let binary_dv =
             (spec.doc_values == codec_lucene9::DocValuesType::Binary).then(BinaryDvBuf::default);
         let points = spec.points.map(|_| PointsBuf::default());
+        let analyzer = spec.analyzer.as_deref().map(|a| {
+            crate::analysis::Analyzer::parse(a).expect("analyzer spec validated by Schema::add")
+        });
         Self {
             spec,
             dict,
@@ -300,6 +307,7 @@ impl FieldBuf {
             sorted_dv,
             binary_dv,
             points,
+            analyzer,
         }
     }
 
@@ -337,6 +345,27 @@ const TERM_RAM: usize = 88;
 const POSTING_NEW_DOC_RAM: usize = 24;
 /// Estimated bytes of a repeat posting in the same doc.
 const POSTING_SAME_DOC_RAM: usize = 8;
+
+/// Indexes one analyzed token into the field dictionary; returns the RAM
+/// delta. Shared by the legacy whitespace fast path and the analyzer path.
+fn index_token(
+    dict: &mut TermDict,
+    doc_id: u32,
+    tok: &[u8],
+    has_positions: bool,
+    position: u32,
+) -> usize {
+    let (id, is_new) = dict.lookup_or_insert_flag(tok);
+    let new_doc = dict.recs[id as usize]
+        .postings
+        .add_occurrence(doc_id, if has_positions { Some(position) } else { None });
+    (if is_new { TERM_RAM + tok.len() } else { 0 })
+        + if new_doc {
+            POSTING_NEW_DOC_RAM
+        } else {
+            POSTING_SAME_DOC_RAM
+        }
+}
 
 impl DocWriter {
     pub fn new() -> Self {
@@ -396,21 +425,28 @@ impl DocWriter {
                         let has_positions = buf.spec.has_positions();
                         let mut saw_term = false;
                         let mut position = 0u32;
-                        for token in WhitespaceTokens::new(&text) {
-                            let tok = token.as_bytes();
-                            let (id, is_new) = dict.lookup_or_insert_flag(tok);
-                            let new_doc = dict.recs[id as usize].postings.add_occurrence(
-                                doc_id,
-                                if has_positions { Some(position) } else { None },
-                            );
-                            self.ram_bytes += if is_new { TERM_RAM + tok.len() } else { 0 }
-                                + if new_doc {
-                                    POSTING_NEW_DOC_RAM
-                                } else {
-                                    POSTING_SAME_DOC_RAM
-                                };
-                            saw_term = true;
-                            position += 1;
+                        match &buf.analyzer {
+                            Some(analyzer) => {
+                                for tok in analyzer.analyze(&text) {
+                                    self.ram_bytes +=
+                                        index_token(dict, doc_id, &tok, has_positions, position);
+                                    saw_term = true;
+                                    position += 1;
+                                }
+                            }
+                            None => {
+                                for token in WhitespaceTokens::new(&text) {
+                                    self.ram_bytes += index_token(
+                                        dict,
+                                        doc_id,
+                                        token.as_bytes(),
+                                        has_positions,
+                                        position,
+                                    );
+                                    saw_term = true;
+                                    position += 1;
+                                }
+                            }
                         }
                         if saw_term {
                             buf.doc_count += 1;
@@ -711,6 +747,36 @@ mod tests {
         assert_eq!(b.docs, vec![0]);
         assert_eq!(b.freqs, vec![1]);
         assert!(dict.find(b"never-seen").is_none());
+    }
+
+    #[test]
+    fn analyzer_normalizes_terms_at_index_time() {
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::text("message").with_analyzer("whitespace|lowercase"));
+        let mut dw = DocWriter::new();
+        let mut d0 = Document::new();
+        d0.add("message", FieldValue::Text("ERROR Failed error".to_string()));
+        dw.add_document(&schema, d0, None).unwrap();
+
+        let dict = dw.field_buffer(0).unwrap().dict.as_ref().unwrap();
+        assert_eq!(dict.len(), 2); // error, failed
+        assert!(dict.find(b"error").is_some());
+        assert!(dict.find(b"failed").is_some());
+        assert!(dict.find(b"ERROR").is_none());
+    }
+
+    #[test]
+    fn no_analyzer_keeps_original_bytes() {
+        let mut schema = Schema::new();
+        schema.add(FieldSpec::text("message"));
+        let mut dw = DocWriter::new();
+        let mut d0 = Document::new();
+        d0.add("message", FieldValue::Text("ERROR Failed".to_string()));
+        dw.add_document(&schema, d0, None).unwrap();
+
+        let dict = dw.field_buffer(0).unwrap().dict.as_ref().unwrap();
+        assert!(dict.find(b"ERROR").is_some());
+        assert!(dict.find(b"error").is_none());
     }
 
     #[test]

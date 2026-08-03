@@ -198,4 +198,17 @@ mod tests {
         let toks: Vec<_> = an.analyze("ok").collect();
         assert!(matches!(toks[0], std::borrow::Cow::Borrowed(_)));
     }
+
+    #[test]
+    fn lowercase_ascii_uppercase_single_alloc() {
+        // ASCII with uppercase: one allocation via to_ascii_lowercase,
+        // no Unicode tables (ERROR, NullPointerException path)
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![FilterKind::Lowercase],
+        };
+        let toks: Vec<_> = an.analyze("ERROR").collect();
+        assert_eq!(&*toks[0], b"error");
+        assert!(matches!(toks[0], std::borrow::Cow::Owned(_)));
+    }
 }

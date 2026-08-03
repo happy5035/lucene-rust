@@ -13,15 +13,22 @@ pub trait TokenFilter: Send + Sync {
     fn normalizes(&self) -> bool;
 }
 
-/// Lucene `LowerCaseFilter` analog. ASCII fast path: a pure-ASCII token
-/// with no uppercase bytes passes through borrowed (zero allocation);
-/// anything else goes through Unicode `to_lowercase`.
+/// Lucene `LowerCaseFilter` analog. ASCII fast paths: a pure-ASCII token
+/// with no uppercase bytes passes through borrowed (zero allocation); an
+/// ASCII token with uppercase goes through `to_ascii_lowercase` (one
+/// allocation, no Unicode tables); anything else goes through Unicode
+/// `to_lowercase`.
 pub struct LowercaseFilter;
 
 impl TokenFilter for LowercaseFilter {
     fn filter<'a>(&self, token: Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
         if token.is_ascii() && !token.iter().any(u8::is_ascii_uppercase) {
             return Some(token);
+        }
+        if token.is_ascii() {
+            // ASCII with uppercase: single allocation, no Unicode tables —
+            // the common log-level/class-name path (ERROR, NullPointerException).
+            return Some(Cow::Owned(token.to_ascii_lowercase()));
         }
         Some(Cow::Owned(
             String::from_utf8_lossy(&token)

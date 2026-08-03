@@ -20,7 +20,12 @@ fn custom_filters() -> &'static RwLock<HashMap<String, Arc<dyn TokenFilter>>> {
 
 /// Registers a custom tokenizer under `name` (spec string first component).
 /// Must be called before any schema referencing the name is parsed.
+/// Built-in names cannot be overridden.
 pub fn register_tokenizer(name: &str, factory: TokenizerFactory) {
+    assert!(
+        !matches!(name, "whitespace" | "letter" | "keyword"),
+        "cannot override built-in tokenizer: {name}"
+    );
     custom_tokenizers()
         .write()
         .unwrap()
@@ -28,7 +33,12 @@ pub fn register_tokenizer(name: &str, factory: TokenizerFactory) {
 }
 
 /// Registers a custom token filter under `name` (spec string 2nd+ component).
+/// Built-in names cannot be overridden.
 pub fn register_filter(name: &str, filter: Arc<dyn TokenFilter>) {
+    assert!(
+        !matches!(name, "lowercase"),
+        "cannot override built-in token filter: {name}"
+    );
     custom_filters()
         .write()
         .unwrap()
@@ -118,5 +128,34 @@ mod tests {
         assert_eq!(toks, vec![b"cba".to_vec()]);
         // normalizes() = false: normalize channel skips it
         assert_eq!(an.normalize("abc"), std::borrow::Cow::Borrowed("abc"));
+    }
+
+    #[test]
+    fn builtin_tokenizer_names_cannot_be_overridden() {
+        for name in ["whitespace", "letter", "keyword"] {
+            let result = std::panic::catch_unwind(|| {
+                register_tokenizer(name, std::sync::Arc::new(|_| {
+                    Box::new(crate::analysis::WhitespaceTokens::new(""))
+                }));
+            });
+            assert!(result.is_err(), "registering built-in tokenizer {name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn builtin_filter_names_cannot_be_overridden() {
+        struct Noop;
+        impl crate::analysis::TokenFilter for Noop {
+            fn filter<'a>(&self, t: std::borrow::Cow<'a, [u8]>) -> Option<std::borrow::Cow<'a, [u8]>> {
+                Some(t)
+            }
+            fn normalizes(&self) -> bool {
+                false
+            }
+        }
+        let result = std::panic::catch_unwind(|| {
+            register_filter("lowercase", std::sync::Arc::new(Noop));
+        });
+        assert!(result.is_err(), "registering built-in filter lowercase must be rejected");
     }
 }

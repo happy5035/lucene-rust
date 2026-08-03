@@ -245,6 +245,15 @@ mod tests {
         assert_eq!(w.search(&Query::term("level", "error"), None, 10).unwrap().total, 0);
         assert_eq!(w.search(&Query::term("level", "ERROR"), None, 10).unwrap().total, 1);
 
+        // index-side discriminative proof: the original uppercase form is gone
+        // from the dictionary, and a mixed-case-only token was normalized.
+        assert_eq!(
+            w.search(&Query::term("message", "ERROR"), None, 10).unwrap().total,
+            0
+        );
+        let q = analyze_query(&Query::term("message", "failed"), w.schema()).unwrap();
+        assert_eq!(w.search(&q, None, 10).unwrap().total, 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

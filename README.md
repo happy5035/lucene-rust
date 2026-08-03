@@ -17,7 +17,7 @@
 | 排序列存 | `SortedDocValues` | 64 项/块前缀压缩 terms dict + 裸 LZ4 |
 | 二进制列存 | `BinaryDocValues` | 变长 DirectMonotonic 地址 + IndexedDISI，Lucene90 兼容 |
 | 存储字段 | `StoredField` | LZ4 BEST_SPEED，字符串 / int / long |
-| 分析器 | per-field analyzer（`analyzer=whitespace\|lowercase`） | whitespace / letter / keyword tokenizer + lowercase filter，注册表可扩展（自定义组件名不得含 `+` `,` `:` `|`，与 schema spec 分隔符冲突）；索引与查询双通道归一化 |
+| 分析器 | per-field analyzer（`analyzer=whitespace\|lowercase`） | whitespace / letter / keyword tokenizer + lowercase filter，注册表可扩展（自定义组件名不得含 `+` `,` `:` `@` `|`，与 schema spec 分隔符冲突）；索引与查询双通道归一化 |
 
 同一字段可组合多种能力（如 `timestamp = LongPoint + NumericDV + stored`），对应 Java 同名多字段语义。
 

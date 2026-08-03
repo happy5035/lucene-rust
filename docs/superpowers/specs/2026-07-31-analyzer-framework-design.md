@@ -121,7 +121,7 @@ analyzer 配置存在 writer 的 schema 里，**不在索引格式里**（Lucene
 样如此——`.fnm` 不记 analyzer，分析是应用层职责）。分析动作放在查询
 构建层，执行引擎（`Query` / postings）完全不感知 analyzer。
 
-- 新函数 `analysis::analyze_query(q: &Query, specs: &FieldAnalyzers)
+- 新函数 `analysis::analyze_query(query: &Query, schema: &Schema)
   -> Result<Query, String>`：输入已解析的 Query + 字段→预解析
   analyzer 规格表，输出重写后的 Query。JNI `nativeSearch` 在
   `spec_to_query` 之后调用。

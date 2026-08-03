@@ -17,6 +17,7 @@
 | 排序列存 | `SortedDocValues` | 64 项/块前缀压缩 terms dict + 裸 LZ4 |
 | 二进制列存 | `BinaryDocValues` | 变长 DirectMonotonic 地址 + IndexedDISI，Lucene90 兼容 |
 | 存储字段 | `StoredField` | LZ4 BEST_SPEED，字符串 / int / long |
+| 分析器 | per-field analyzer（`analyzer=whitespace\|lowercase`） | whitespace / letter / keyword tokenizer + lowercase filter，注册表可扩展；索引与查询双通道归一化 |
 
 同一字段可组合多种能力（如 `timestamp = LongPoint + NumericDV + stored`），对应 Java 同名多字段语义。
 
@@ -42,6 +43,7 @@
 - **架构**：方案 C——执行语义逐行对照 Lucene 9.12.3 源码（advance 协议、position 合取、BKD 边界、MISSING 排序），对象结构 Rust 化：`enum Query` + `trait DocIter`，不做 Java 式 Query/Weight/Scorer 继承体系
 - **快照语义**：open 即快照，重开即刷新（无 NRT 原地 refresh）；单线程逐段执行
 - 只保证读**本系统写出的**索引（无 delete / `.liv` / norms）；Java 写的索引可读但不做删除语义
+- **查询侧分析**（`analyzer=` 字段的 term 归一化重写）只在 JNI `nativeSearch` 入口生效；CLI / 磁盘 `Searcher` 直查时需调用方先经 `analyze_query` 或自行归一化
 
 ### 实时内存搜索（RwLock 并发 + LeafAccess 统一执行）
 
@@ -84,7 +86,7 @@ trait LeafAccess {
 
 - CLI `rustlucene-cli`：`write` / `bench` / `index <文件或目录> [--positions] [--docs N]` / `logwrite [--bitmap]` / `logbench` / `searchbench <indexDir> <field> [--load-queries F] [--warmup N] [--iter N]` / `jsonindex <jsonlFile> <indexDir> <schemaSpec>` / `jsongen`
 - JNI 绑定（`crates/jni-binding`，cdylib）：`RustIndexWriter` 供 Java 进程内调用；除逐字段 API 外提供**批量 JSON 写入** `addJsonBatch(byte[][])`——原始 JSON 字节整批一次 JNI 穿越，解析 / 强转 / 过滤 / 绑定全在 Rust 内闭环
-- JSON 绑定层（`core/src/json.rs`）：schema spec 声明类型与索引配置（`name:type+mods[@json键]`、`$policy=` 指令），未知字段三策略：`strict`（过滤）/ `dynamic`（按值类型推断并自动注册，对齐 Lucene 动态字段语义）/ `stored-only`
+- JSON 绑定层（`core/src/json.rs`）：schema spec 声明类型与索引配置（`name:type+mods[@json键]`、`$policy=` 指令；`text` 类型可配 `analyzer=whitespace|lowercase` 等 analyzer modifier），未知字段三策略：`strict`（过滤）/ `dynamic`（按值类型推断并自动注册，对齐 Lucene 动态字段语义）/ `stored-only`
 - 互操作脚本：`interop/verify-index.sh`、`interop/verify-log.sh`、`interop/compare-index.sh`（同语料双侧建索引 + CheckIndex + term 级 diff，`--json` 模式为 rust / java-jni / java 三方对比）；`make interop-test` / `log-test` / `bench` / `log-bench` / `compare`
 
 ### 时序指标存储（`crates/metric`）

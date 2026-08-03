@@ -89,3 +89,27 @@ Task 10: complete (commit ccaaef4)
 
 提交纪律追加（用户指示）：.superpowers/sdd/ 已纳入版本控制（根 .gitignore 改为 .superpowers/* + !.superpowers/sdd/）——T5-T10 每个任务的 brief/report/review/review-package 与代码同提交，不再留本地 scratch
 坑记录：superpowers 的 task-brief / review-package 脚本每次运行会在 .superpowers/sdd/ 重建 .gitignore（内容 *）——提交新产物前先 rm 该文件，或直接 git add -f
+
+## Analyzer 框架（2026-07-31 plan: docs/superpowers/plans/2026-07-31-analyzer-framework.md）
+
+Task 1: complete (commits 24e9066..1d917a8, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 168 passed（3 新 tokenizer 测试），既有测试零改动
+  deferred Minor: lib.rs 模块列表字母序被原位替换打破；task-1-brief.md 混入代码 commit（流程噪音）
+Task 2: complete (commits 1d917a8..6ab62c0, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 170 passed（analysis 8 项），既有测试零改动
+  deferred Minor: LowercaseFilter 慢路径对纯 ASCII 含大写也两次分配（可 to_ascii_lowercase 特判，性能轮再处理）
+Task 3: complete (commits 6ab62c0..d12656c, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 173 passed，既有测试零改动
+  deferred Minor: 注册表锁中毒 unwrap；空 filter 名错误消息难看；测试污染全局注册表（唯一名前缀）；内置名可被注册但静默遮蔽
+Task 4: complete (commits d12656c..b3d8f5e, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 177 passed（4 新），既有测试零改动
+  偏差裁决: brief 测试 catch_unwind 解构笔误 → let result 最小修正，批准
+  deferred Minor: catch_unwind 测试 panic 信息打 stderr；非索引字段+非法 spec 的 panic 分支无直测；parse/add 双路径校验重复（有意设计）
+Task 5: complete (commits b3d8f5e..16527b1, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 179 passed（2 新），无 analyzer 分支与原循环逐语句等价（RAM/position/doc_count 审查逐项核对）
+  deferred Minor: FieldBuf::new 不检查 tokenized 即编译 analyzer（依赖 Schema::add 兜底，仅浪费）；make log-test 字节级实证安排在 Task 8
+Task 6: complete (commits 16527b1..576e3dd, review clean)
+  verified: RUST_MIN_STACK=4M cargo test -p rustlucene-core → 186 passed（7 新），既有测试零改动
+  deferred Minor: And/Or 的 Err 路径无专属测试（共享 analyze_each 间接覆盖）；normalize 产空串语义（filter 丢 token → 空前缀/空 pattern 而非 Err，内置 lowercase 不触发，设计文档可留一句）；Bool 嵌套递归无深度上限
+Task 7: complete (commits 576e3dd..5b9d1cb, review clean)
+  verified: cargo test -p rustlucene-jni 12/12（2 新），core 186 全绿；包名实为 rustlucene-jni（brief 笔误已注）

@@ -1,118 +1,3 @@
-### Task 6: 查询侧 `analyze_query`
-
-**Files:**
-- Create: `crates/core/src/analysis/query_analysis.rs`
-- Modify: `crates/core/src/analysis/mod.rs`
-
-**Interfaces:**
-- Consumes: Task 3 `Analyzer::parse`、Task 4 `FieldSpec.analyzer`、`crate::search::query::{Query, Occur}`
-- Produces: `pub fn analyze_query(query: &Query, schema: &Schema) -> Result<Query, String>`
-  - Term：analyze；0 token → Err；1 → 替换；多 → Bool SHOULD
-  - Terms/And/Or/Phrase：每个 value 恰好 1 token，否则 Err
-  - Prefix/Wildcard：normalize（Wildcard 重建 DFA）
-  - Bool：递归；MatchAll/PointRange：原样
-  - 无 analyzer 字段：原样透传
-
-- [ ] **Step 1: Write the failing test**
-
-`crates/core/src/analysis/query_analysis.rs` 测试模块：
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::schema::{FieldSpec, Schema};
-
-    fn test_schema() -> Schema {
-        let mut s = Schema::new();
-        s.add(FieldSpec::text("message").with_analyzer("whitespace|lowercase"));
-        s.add(FieldSpec::keyword("level"));
-        s
-    }
-
-    #[test]
-    fn term_is_lowercased_for_analyzed_field() {
-        let s = test_schema();
-        let q = analyze_query(&Query::term("message", "ERROR"), &s).unwrap();
-        assert_eq!(q, Query::term("message", "error"));
-    }
-
-    #[test]
-    fn term_passes_through_for_plain_field() {
-        let s = test_schema();
-        let q = analyze_query(&Query::term("level", "ERROR"), &s).unwrap();
-        assert_eq!(q, Query::term("level", "ERROR"));
-    }
-
-    #[test]
-    fn term_with_multiple_tokens_becomes_bool_should() {
-        let s = test_schema();
-        let q = analyze_query(&Query::term("message", "connection FAILED"), &s).unwrap();
-        assert_eq!(
-            q,
-            Query::bool(vec![
-                (Occur::Should, Query::term("message", "connection")),
-                (Occur::Should, Query::term("message", "failed")),
-            ])
-        );
-    }
-
-    #[test]
-    fn terms_and_phrase_require_exactly_one_token_per_value() {
-        let s = test_schema();
-        let q = analyze_query(&Query::terms("message", &["ERROR", "Warn"]), &s).unwrap();
-        assert_eq!(q, Query::terms("message", &["error", "warn"]));
-        // two-token value is an error
-        assert!(analyze_query(&Query::terms("message", &["two words"]), &s).is_err());
-        assert!(analyze_query(&Query::phrase("message", &["two words", "x"]), &s).is_err());
-        let q = analyze_query(&Query::phrase("message", &["Connection", "Failed"]), &s).unwrap();
-        assert_eq!(q, Query::phrase("message", &["connection", "failed"]));
-    }
-
-    #[test]
-    fn prefix_and_wildcard_are_normalized_not_tokenized() {
-        let s = test_schema();
-        let q = analyze_query(&Query::prefix("message", "ERR"), &s).unwrap();
-        assert_eq!(q, Query::prefix("message", "err"));
-        let q = analyze_query(&Query::wildcard("message", "ERR*"), &s).unwrap();
-        assert_eq!(q, Query::wildcard("message", "err*"));
-    }
-
-    #[test]
-    fn bool_recurses_and_other_variants_pass_through() {
-        let s = test_schema();
-        let q = Query::bool(vec![
-            (Occur::Must, Query::term("message", "ERROR")),
-            (Occur::MustNot, Query::term("level", "DEBUG")),
-        ]);
-        let out = analyze_query(&q, &s).unwrap();
-        assert_eq!(
-            out,
-            Query::bool(vec![
-                (Occur::Must, Query::term("message", "error")),
-                (Occur::MustNot, Query::term("level", "DEBUG")),
-            ])
-        );
-        let q = analyze_query(&Query::MatchAll, &s).unwrap();
-        assert_eq!(q, Query::MatchAll);
-        let q = analyze_query(&Query::point_range("ts", 1, 2), &s).unwrap();
-        assert_eq!(q, Query::point_range("ts", 1, 2));
-    }
-}
-```
-
-注意：letter tokenizer 的 0-token 场景（`analyze_query(&Query::term("message", "!!!"), ...)` 配 `letter` analyzer）也加一条 Err 断言（用 `FieldSpec::text("m2").with_analyzer("letter")` 的 schema）。
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p rustlucene-core analysis 2>&1 | tail -5`
-Expected: FAIL（`analyze_query` 不存在）
-
-- [ ] **Step 3: Write minimal implementation**
-
-`crates/core/src/analysis/query_analysis.rs`：
-
-```rust
 //! Query-side analysis (spec §查询侧双通道): rewrites a parsed `Query` so
 //! its term bytes match what the index holds for analyzer-configured
 //! fields. Fields without an analyzer pass through byte-identical.
@@ -240,27 +125,93 @@ fn analyze_each(
             .collect(),
     }
 }
-```
 
-`crates/core/src/analysis/mod.rs` 增加：
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FieldSpec, Schema};
 
-```rust
-mod query_analysis;
+    fn test_schema() -> Schema {
+        let mut s = Schema::new();
+        s.add(FieldSpec::text("message").with_analyzer("whitespace|lowercase"));
+        s.add(FieldSpec::keyword("level"));
+        s
+    }
 
-pub use query_analysis::analyze_query;
-```
+    #[test]
+    fn term_is_lowercased_for_analyzed_field() {
+        let s = test_schema();
+        let q = analyze_query(&Query::term("message", "ERROR"), &s).unwrap();
+        assert_eq!(q, Query::term("message", "error"));
+    }
 
-- [ ] **Step 4: Run test to verify it passes**
+    #[test]
+    fn term_passes_through_for_plain_field() {
+        let s = test_schema();
+        let q = analyze_query(&Query::term("level", "ERROR"), &s).unwrap();
+        assert_eq!(q, Query::term("level", "ERROR"));
+    }
 
-Run: `cargo test -p rustlucene-core analysis`
-Expected: PASS
+    #[test]
+    fn term_with_multiple_tokens_becomes_bool_should() {
+        let s = test_schema();
+        let q = analyze_query(&Query::term("message", "connection FAILED"), &s).unwrap();
+        assert_eq!(
+            q,
+            Query::bool(vec![
+                (Occur::Should, Query::term("message", "connection")),
+                (Occur::Should, Query::term("message", "failed")),
+            ])
+        );
+    }
 
-- [ ] **Step 5: Commit**
+    #[test]
+    fn term_with_zero_tokens_is_an_error() {
+        // letter tokenizer drops non-letters: "!!!" analyzes to no tokens.
+        let mut s = Schema::new();
+        s.add(FieldSpec::text("m2").with_analyzer("letter"));
+        assert!(analyze_query(&Query::term("m2", "!!!"), &s).is_err());
+    }
 
-```bash
-git add crates/core/src/analysis
-git commit -m "core: query-side dual-channel analysis (analyze_query)"
-```
+    #[test]
+    fn terms_and_phrase_require_exactly_one_token_per_value() {
+        let s = test_schema();
+        let q = analyze_query(&Query::terms("message", &["ERROR", "Warn"]), &s).unwrap();
+        assert_eq!(q, Query::terms("message", &["error", "warn"]));
+        // two-token value is an error
+        assert!(analyze_query(&Query::terms("message", &["two words"]), &s).is_err());
+        assert!(analyze_query(&Query::phrase("message", &["two words", "x"]), &s).is_err());
+        let q = analyze_query(&Query::phrase("message", &["Connection", "Failed"]), &s).unwrap();
+        assert_eq!(q, Query::phrase("message", &["connection", "failed"]));
+    }
 
----
+    #[test]
+    fn prefix_and_wildcard_are_normalized_not_tokenized() {
+        let s = test_schema();
+        let q = analyze_query(&Query::prefix("message", "ERR"), &s).unwrap();
+        assert_eq!(q, Query::prefix("message", "err"));
+        let q = analyze_query(&Query::wildcard("message", "ERR*"), &s).unwrap();
+        assert_eq!(q, Query::wildcard("message", "err*"));
+    }
 
+    #[test]
+    fn bool_recurses_and_other_variants_pass_through() {
+        let s = test_schema();
+        let q = Query::bool(vec![
+            (Occur::Must, Query::term("message", "ERROR")),
+            (Occur::MustNot, Query::term("level", "DEBUG")),
+        ]);
+        let out = analyze_query(&q, &s).unwrap();
+        assert_eq!(
+            out,
+            Query::bool(vec![
+                (Occur::Must, Query::term("message", "error")),
+                (Occur::MustNot, Query::term("level", "DEBUG")),
+            ])
+        );
+        let q = analyze_query(&Query::MatchAll, &s).unwrap();
+        assert_eq!(q, Query::MatchAll);
+        let q = analyze_query(&Query::point_range("ts", 1, 2), &s).unwrap();
+        assert_eq!(q, Query::point_range("ts", 1, 2));
+    }
+}

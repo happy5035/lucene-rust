@@ -113,3 +113,11 @@ Task 6: complete (commits 16527b1..576e3dd, review clean)
   deferred Minor: And/Or 的 Err 路径无专属测试（共享 analyze_each 间接覆盖）；normalize 产空串语义（filter 丢 token → 空前缀/空 pattern 而非 Err，内置 lowercase 不触发，设计文档可留一句）；Bool 嵌套递归无深度上限
 Task 7: complete (commits 576e3dd..5b9d1cb, review clean)
   verified: cargo test -p rustlucene-jni 12/12（2 新），core 186 全绿；包名实为 rustlucene-jni（brief 笔误已注）
+Task 8: complete (commits 5b9d1cb..c94aa28, review clean after fix)
+  verified: cargo test --workspace 全绿（codec 218 + core 187 + metric 47 + jni）；make log-test exit=0，15× No problems / 15× INTEROP_OK；logwrite 183925 docs/s（+1.0% 持平）
+  important fix resolved: E2E 首条断言缺索引侧判别性 → 补两条判别性断言（c94aa28）
+  deferred Minor: terms IN 的 E2E 走 keyword 字段只证 plumbing（单测已覆盖真实重写）；report 中 log-test 计数拆分括号注释算错（头条数字可信）；E2E 临时目录 panic 时留残（开头预清理兜底）
+
+最终全分支 review: approved (24e9066..c94aa28, "With fixes" → 修复后 Yes)
+  important fixes resolved: LowercaseFilter ASCII 单分配特判（b5ec87e）；注册表拒绝内置名覆盖（b5ec87e）；spec/README 文档同步（5757dbc, 复审两处一行级补漏已修）
+  deferred Minor 分诊: 全部可留（lib.rs 字母序、锁中毒 unwrap、空名消息、测试全局态、FieldBuf::new 浪费、And/Or Err 无专属测试、normalize 空串语义、Bool 递归无上限、E2E 目录留残、组件名字符集已文档化）

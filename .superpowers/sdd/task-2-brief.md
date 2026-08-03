@@ -1,238 +1,309 @@
-### Task 2: codec 窗口批读——EnumCore::next_docs
+### Task 2: LowercaseFilter + Analyzer 模板与 TokenStream
 
 **Files:**
-- Modify: `crates/codec-lucene9/src/postings_read.rs`（EnumCore impl :245-630 区间；DocsEnum :656-672；DocsFreqsEnum :675-698；tests mod :791+）
+- Create: `crates/core/src/analysis/filter.rs`
+- Create: `crates/core/src/analysis/analyzer.rs`
+- Modify: `crates/core/src/analysis/mod.rs`
 
 **Interfaces:**
-- Consumes: `EnumCore` 私有状态（`doc_buffer: [u64; BLOCK_SIZE+1]`、`doc_buffer_upto`、`freq_buffer`、`level0_last_doc`、`move_to_next_level0_block()`、NO_MORE_DOCS 哨兵）
-- Produces: `EnumCore::next_docs`、`DocsEnum::next_docs`、`DocsFreqsEnum::{next_docs, next_docs_and_freqs, decodes_freqs}`——Task 3 的 `SegmentDocIter::Docs/Freqs` 覆写依赖这些
+- Consumes: Task 1 的 `Tokenizer<'a>`、`WhitespaceTokens`、`LetterTokens`、`KeywordTokens`
+- Produces:
+  - `pub trait TokenFilter: Send + Sync { fn filter<'a>(&self, token: Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>>; fn normalizes(&self) -> bool; }`
+  - `pub struct LowercaseFilter;`
+  - `pub enum FilterKind { Lowercase, Custom(Arc<dyn TokenFilter>) }`（`Clone`）
+  - `pub type TokenizerFactory = Arc<dyn for<'a> Fn(&'a str) -> Box<dyn Tokenizer<'a> + 'a> + Send + Sync>;`
+  - `pub enum TokenizerTemplate { Whitespace, Letter, Keyword, Custom(TokenizerFactory) }`（`Clone`）
+  - `pub struct Analyzer { pub(crate) tokenizer: TokenizerTemplate, pub(crate) filters: Vec<FilterKind> }`（`Clone`）
+  - `Analyzer::analyze<'a, 'b>(&'b self, input: &'a str) -> TokenStream<'a, 'b>`
+  - `Analyzer::normalize<'a>(&self, input: &'a str) -> Cow<'a, str>`
+  - `pub struct TokenStream<'a, 'b>`，`impl Iterator<Item = Cow<'a, [u8]>>`
 
-- [ ] **Step 1: 写失败测试——codec 批读对拍**
+- [ ] **Step 1: Write the failing test**
 
-在 `postings_read.rs` 的 `mod tests` 尾部追加（helper `write_segment`/`seek`/`temp_dir` 已存在 :800-860）：
+`crates/core/src/analysis/analyzer.rs` 测试模块（骨架先行）：
 
 ```rust
-    /// 批读 vs 逐 doc 全量对拍：kw:big（df=200 稠密）/ kw:tail（df=3 尾块）/
-    /// tx:hot（df=5000，跨 level-1 边界 4096）/ tx:warm（df=200 步长3 +
-    /// freq 异常值）/ tx:one（singleton）。多种 dst 尺寸含 1（退化）与
-    /// 4096（超 level-1 组）。
-    fn drain_next_docs(en: &mut DocsEnum, step: usize) -> Vec<u32> {
-        let mut docs = Vec::new();
-        let mut buf = vec![0u32; step];
-        loop {
-            let n = en.next_docs(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            docs.extend_from_slice(&buf[..n]);
-        }
-        docs
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn drain_per_doc(en: &mut DocsEnum) -> Vec<u32> {
-        let mut docs = Vec::new();
-        loop {
-            let d = en.next_doc().unwrap();
-            if d == NO_MORE_DOCS {
-                break;
-            }
-            docs.push(d as u32);
-        }
-        docs
+    fn analyze_to_vec(an: &Analyzer, input: &str) -> Vec<Vec<u8>> {
+        an.analyze(input).map(|t| t.into_owned()).collect()
     }
 
     #[test]
-    fn next_docs_matches_next_doc_all_terms() {
-        let dir = temp_dir("nextdocs");
-        fs::create_dir_all(&dir).unwrap();
-        let fsdir = FSDirectory::open(&dir).unwrap();
-        let (fis, warm_docs, warm_freqs) = write_segment(&fsdir);
-        let reader = PostingsReader::open(&fsdir, "_0", &[4u8; 16]).unwrap();
-
-        // (field, term, expect_docs, expect_freqs)
-        let big: Vec<u32> = (0..200).collect();
-        let hot: Vec<u32> = (0..5000).collect();
-        let cases: Vec<(&str, &[u8], Vec<u32>, Option<Vec<u32>>)> = vec![
-            ("kw", b"big", big.clone(), None),
-            ("kw", b"tail", vec![10, 20, 30], None),
-            ("tx", b"hot", hot, Some(vec![1; 5000])),
-            ("tx", b"warm", warm_docs, Some(warm_freqs)),
-            ("tx", b"one", vec![42], Some(vec![7])),
-        ];
-        for (field, term, expect_docs, expect_freqs) in cases {
-            let entry = seek(&fsdir, &fis, field, term);
-            for step in [1usize, 7, 128, 200, 4096] {
-                let mut en = reader.docs(&entry).unwrap();
-                assert_eq!(drain_next_docs(&mut en, step), expect_docs,
-                    "{field}:{term:?} step={step} docs");
-            }
-            // 逐 doc 参照路径同集
-            let mut en = reader.docs(&entry).unwrap();
-            assert_eq!(drain_per_doc(&mut en), expect_docs);
-            // freqs 对拍（仅 has_freqs 字段）
-            if let Some(expect_f) = expect_freqs {
-                let mut en = reader.docs_and_freqs(&entry).unwrap();
-                assert!(en.decodes_freqs());
-                let mut docs = Vec::new();
-                let mut freqs = Vec::new();
-                let (mut db, mut fb) = (vec![0u32; 64], vec![0u32; 64]);
-                loop {
-                    let n = en.next_docs_and_freqs(&mut db, &mut fb).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    docs.extend_from_slice(&db[..n]);
-                    freqs.extend_from_slice(&fb[..n]);
-                }
-                assert_eq!(docs, expect_docs, "{field}:{term:?} freq-mode docs");
-                assert_eq!(freqs, expect_f, "{field}:{term:?} freqs");
-            }
-        }
-        fs::remove_dir_all(&dir).unwrap();
+    fn whitespace_lowercase_normalizes_case() {
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![FilterKind::Lowercase],
+        };
+        assert_eq!(
+            analyze_to_vec(&an, "ERROR Failed error"),
+            vec![b"error".to_vec(), b"failed".to_vec(), b"error".to_vec()]
+        );
     }
 
     #[test]
-    fn no_freq_enum_does_not_decode_freqs() {
-        let dir = temp_dir("nofreqbatch");
-        fs::create_dir_all(&dir).unwrap();
-        let fsdir = FSDirectory::open(&dir).unwrap();
-        let (fis, warm_docs, _) = write_segment(&fsdir);
-        let reader = PostingsReader::open(&fsdir, "_0", &[4u8; 16]).unwrap();
-        let entry = seek(&fsdir, &fis, "tx", b"warm");
-        let mut en = reader.docs_and_freqs_no_freq(&entry).unwrap();
-        assert!(!en.decodes_freqs());
-        assert_eq!(drain_next_docs_enum(&mut en, 128), warm_docs);
-        fs::remove_dir_all(&dir).unwrap();
+    fn no_filter_passes_bytes_through() {
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![],
+        };
+        assert_eq!(
+            analyze_to_vec(&an, "ERROR error"),
+            vec![b"ERROR".to_vec(), b"error".to_vec()]
+        );
     }
 
-    fn drain_next_docs_enum(en: &mut DocsFreqsEnum, step: usize) -> Vec<u32> {
-        let mut docs = Vec::new();
-        let mut buf = vec![0u32; step];
-        loop {
-            let n = en.next_docs(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            docs.extend_from_slice(&buf[..n]);
-        }
-        docs
+    #[test]
+    fn lowercase_unicode_semantics() {
+        // Non-ASCII uppercase goes through Unicode to_lowercase
+        // (Lucene LowerCaseFilter semantics).
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![FilterKind::Lowercase],
+        };
+        assert_eq!(analyze_to_vec(&an, "ÄBC"), vec!["äbc".as_bytes().to_vec()]);
     }
+
+    #[test]
+    fn normalize_applies_filters_without_tokenizing() {
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![FilterKind::Lowercase],
+        };
+        // whole input as one token, lowercased — for Prefix/Wildcard
+        assert_eq!(an.normalize("Err*"), std::borrow::Cow::Borrowed("err*"));
+        assert_eq!(an.normalize("err*"), std::borrow::Cow::Borrowed("err*"));
+    }
+
+    #[test]
+    fn lowercase_ascii_fast_path_is_borrowed() {
+        // zero-alloc guarantee: pure-ASCII lowercase token stays borrowed
+        let an = Analyzer {
+            tokenizer: TokenizerTemplate::Whitespace,
+            filters: vec![FilterKind::Lowercase],
+        };
+        let toks: Vec<_> = an.analyze("ok").collect();
+        assert!(matches!(toks[0], std::borrow::Cow::Borrowed(_)));
+    }
+}
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p codec-lucene9 next_docs 2>&1 | tail -5`
-Expected: 编译错误——`next_docs` / `decodes_freqs` / `next_docs_and_freqs` 未定义
+Run: `cargo test -p rustlucene-core analysis 2>&1 | tail -5`
+Expected: FAIL（编译错误：`analyzer` 模块不存在）
 
-- [ ] **Step 3: EnumCore::next_docs 实现**
+- [ ] **Step 3: Write minimal implementation**
 
-在 `impl EnumCore` 块内 `next_doc` 方法（:295-309）之后插入：
+`crates/core/src/analysis/filter.rs`：
 
 ```rust
-    /// 批量版 next_doc（spec 2026-07-26 Task 2）：仅 docs / docs+freqs
-    /// profile（pos.is_none()）——把 doc_buffer 里已解码的绝对 doc 窗口
-    /// 直接拷出，跨 128-block 边界透明 refill。freqs = Some 时同步拷
-    /// freq_buffer 同窗口（调用方保证 decode_freqs）。EverythingEnum 的
-    /// position 簿记不走这里——PositionsEnum 保持逐 doc（phrase 两阶段）。
-    /// 返回 0 = 耗尽。
-    fn next_docs(&mut self, docs: &mut [u32], mut freqs: Option<&mut [u32]>) -> io::Result<usize> {
-        debug_assert!(self.pos.is_none());
-        let mut n = 0;
-        while n < docs.len() {
-            if self.doc == NO_MORE_DOCS as i64 {
-                break;
+//! Token filters: one token in, one token out (or dropped). Filters are
+//! stateless and shared by reference, so `&Analyzer` works under a read
+//! lock (query-side analysis) as well as in the write hot path.
+
+use std::borrow::Cow;
+
+/// One token in, one token out; `None` drops the token (reserved for
+/// future stop filters — not implemented this round).
+pub trait TokenFilter: Send + Sync {
+    fn filter<'a>(&self, token: Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>>;
+    /// Whether this filter participates in the normalize channel
+    /// (Lucene `MultiTermAwareComponent` semantics; `LowerCaseFilter` does).
+    fn normalizes(&self) -> bool;
+}
+
+/// Lucene `LowerCaseFilter` analog. ASCII fast path: a pure-ASCII token
+/// with no uppercase bytes passes through borrowed (zero allocation);
+/// anything else goes through Unicode `to_lowercase`.
+pub struct LowercaseFilter;
+
+impl TokenFilter for LowercaseFilter {
+    fn filter<'a>(&self, token: Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
+        if token.is_ascii() && !token.iter().any(u8::is_ascii_uppercase) {
+            return Some(token);
+        }
+        Some(Cow::Owned(
+            String::from_utf8_lossy(&token)
+                .into_owned()
+                .to_lowercase()
+                .into_bytes(),
+        ))
+    }
+
+    fn normalizes(&self) -> bool {
+        true
+    }
+}
+```
+
+`crates/core/src/analysis/analyzer.rs`：
+
+```rust
+//! Analyzer: a compiled chain of one tokenizer + ordered filters.
+//! Stateless template — `analyze` builds a fresh stream per call
+//! (built-in construction is allocation-free), so one `&Analyzer` serves
+//! both the index hot path and read-lock query analysis.
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use super::filter::{LowercaseFilter, TokenFilter};
+use super::tokenizer::{KeywordTokens, LetterTokens, Tokenizer, WhitespaceTokens};
+
+/// Factory for externally registered tokenizers (方案 A 逃生舱).
+pub type TokenizerFactory =
+    Arc<dyn for<'a> Fn(&'a str) -> Box<dyn Tokenizer<'a> + 'a> + Send + Sync>;
+
+/// Which tokenizer a chain starts from. Built-ins dispatch statically.
+#[derive(Clone)]
+pub enum TokenizerTemplate {
+    Whitespace,
+    Letter,
+    Keyword,
+    Custom(TokenizerFactory),
+}
+
+/// Compiled filter chain entry: built-ins dispatch statically; custom
+/// filters hang off the registry.
+#[derive(Clone)]
+pub enum FilterKind {
+    Lowercase,
+    Custom(Arc<dyn TokenFilter>),
+}
+
+impl FilterKind {
+    fn apply<'a>(&self, token: Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
+        match self {
+            FilterKind::Lowercase => LowercaseFilter.filter(token),
+            FilterKind::Custom(f) => f.filter(token),
+        }
+    }
+
+    fn normalizes(&self) -> bool {
+        match self {
+            FilterKind::Lowercase => true,
+            FilterKind::Custom(f) => f.normalizes(),
+        }
+    }
+}
+
+enum ActiveTokenizer<'a> {
+    Whitespace(WhitespaceTokens<'a>),
+    Letter(LetterTokens<'a>),
+    Keyword(KeywordTokens<'a>),
+    Custom(Box<dyn Tokenizer<'a> + 'a>),
+}
+
+impl<'a> ActiveTokenizer<'a> {
+    fn next(&mut self) -> Option<&'a [u8]> {
+        match self {
+            ActiveTokenizer::Whitespace(t) => t.next_token(),
+            ActiveTokenizer::Letter(t) => t.next_token(),
+            ActiveTokenizer::Keyword(t) => t.next_token(),
+            ActiveTokenizer::Custom(t) => t.next_token(),
+        }
+    }
+}
+
+/// A compiled analyzer chain (spec: static enum dispatch + Custom escape
+/// hatch). pos_incr is always 1 for built-ins; positions are the running
+/// token counter at the call site.
+#[derive(Clone)]
+pub struct Analyzer {
+    pub(crate) tokenizer: TokenizerTemplate,
+    pub(crate) filters: Vec<FilterKind>,
+}
+
+impl Analyzer {
+    /// Full token stream (Lucene `Analyzer.tokenStream`): indexing and
+    /// Term/Phrase/Terms query rewriting.
+    pub fn analyze<'a, 'b>(&'b self, input: &'a str) -> TokenStream<'a, 'b> {
+        let tokenizer = match &self.tokenizer {
+            TokenizerTemplate::Whitespace => {
+                ActiveTokenizer::Whitespace(WhitespaceTokens::new(input))
             }
-            if self.doc == self.level0_last_doc {
-                self.move_to_next_level0_block()?;
-            }
-            let upto = self.doc_buffer_upto;
-            // 窗口 = 当前缓冲到哨兵（NO_MORE_DOCS 占位）或 dst 填满
-            let mut take = 0;
-            while take < docs.len() - n
-                && self.doc_buffer[upto + take] != NO_MORE_DOCS as u64
-            {
-                take += 1;
-            }
-            if take == 0 {
-                // 缓冲首槽即哨兵（df 恰为 128 倍数后的空 refill）：
-                // 镜像 next_doc 读哨兵一步，置耗尽态。
-                self.doc = self.doc_buffer[upto] as i64;
-                self.doc_buffer_upto = upto + 1;
-                break;
-            }
-            for j in 0..take {
-                docs[n + j] = self.doc_buffer[upto + j] as u32;
-            }
-            if let Some(f) = freqs.as_deref_mut() {
-                for j in 0..take {
-                    f[n + j] = self.freq_buffer[upto + j];
+            TokenizerTemplate::Letter => ActiveTokenizer::Letter(LetterTokens::new(input)),
+            TokenizerTemplate::Keyword => ActiveTokenizer::Keyword(KeywordTokens::new(input)),
+            TokenizerTemplate::Custom(f) => ActiveTokenizer::Custom(f(input)),
+        };
+        TokenStream {
+            tokenizer,
+            filters: &self.filters,
+        }
+    }
+
+    /// Normalize channel (Lucene `Analyzer.normalize`): the whole input is
+    /// passed through the normalizing filters as a single token — no
+    /// tokenization. Used for Prefix/Wildcard query rewriting.
+    pub fn normalize<'a>(&self, input: &'a str) -> Cow<'a, str> {
+        let mut tok: Cow<'a, [u8]> = Cow::Borrowed(input.as_bytes());
+        for f in &self.filters {
+            if f.normalizes() {
+                match f.apply(tok) {
+                    Some(t) => tok = t,
+                    None => return Cow::Owned(String::new()),
                 }
             }
-            self.doc_buffer_upto = upto + take;
-            self.doc = self.doc_buffer[upto + take - 1] as i64;
-            n += take;
         }
-        Ok(n)
+        match tok {
+            Cow::Borrowed(_) => Cow::Borrowed(input),
+            Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        }
     }
+}
+
+pub struct TokenStream<'a, 'b> {
+    tokenizer: ActiveTokenizer<'a>,
+    filters: &'b [FilterKind],
+}
+
+impl<'a> Iterator for TokenStream<'a, '_> {
+    type Item = Cow<'a, [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        'outer: while let Some(raw) = self.tokenizer.next() {
+            let mut tok = Cow::Borrowed(raw);
+            for f in self.filters {
+                tok = match f.apply(tok) {
+                    Some(t) => t,
+                    None => continue 'outer,
+                };
+            }
+            return Some(tok);
+        }
+        None
+    }
+}
 ```
 
-- [ ] **Step 4: DocsEnum / DocsFreqsEnum 公开包装**
-
-`impl DocsEnum`（:659-672）尾部追加：
+`crates/core/src/analysis/mod.rs` 更新为：
 
 ```rust
-    /// 批量产出已解码 doc（spec 2026-07-26）：0 = 耗尽。
-    pub fn next_docs(&mut self, docs: &mut [u32]) -> io::Result<usize> {
-        self.core.next_docs(docs, None)
-    }
+//! Per-field analysis framework (spec:
+//! docs/superpowers/specs/2026-07-31-analyzer-framework-design.md).
+
+mod analyzer;
+mod filter;
+mod tokenizer;
+
+pub use analyzer::{Analyzer, FilterKind, TokenStream, TokenizerFactory, TokenizerTemplate};
+pub use filter::{LowercaseFilter, TokenFilter};
+pub use tokenizer::{KeywordTokens, LetterTokens, Tokenizer, WhitespaceTokens};
 ```
 
-`impl DocsFreqsEnum`（:677-698）尾部追加：
+- [ ] **Step 4: Run test to verify it passes**
 
-```rust
-    /// 批量产出 doc（不解 freq）：0 = 耗尽。
-    pub fn next_docs(&mut self, docs: &mut [u32]) -> io::Result<usize> {
-        self.core.next_docs(docs, None)
-    }
+Run: `cargo test -p rustlucene-core analysis`
+Expected: PASS（Task 1 的 3 项 + 本任务 5 项）
 
-    /// 批量产出 doc + freq 同窗口。调用方先查 decodes_freqs()——
-    /// no-freq 模式（docs_and_freqs_no_freq 构造）下 freq_buffer 未
-    /// 物化，调用即 panic（同 freq() 的 no-freq 契约）。
-    pub fn next_docs_and_freqs(
-        &mut self,
-        docs: &mut [u32],
-        freqs: &mut [u32],
-    ) -> io::Result<usize> {
-        assert!(self.core.decode_freqs, "next_docs_and_freqs on no-freq enum");
-        self.core.next_docs(docs, Some(freqs))
-    }
-
-    /// freq 块是否实际解码（needs_freq 构造时为真）。
-    pub fn decodes_freqs(&self) -> bool {
-        self.core.decode_freqs
-    }
-```
-
-- [ ] **Step 5: 跑测试确认通过**
-
-Run: `cargo test -p codec-lucene9 2>&1 | tail -3`
-Expected: 全绿（185 + 2 = 187 passed）
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/codec-lucene9/src/postings_read.rs
-git commit -m "$(cat <<'EOF'
-feat(codec): EnumCore::next_docs 窗口批读（128 解码块直拷，跨块透明 refill）
-
-spec 2026-07-26 Task 2：DocsEnum::next_docs / DocsFreqsEnum::
-next_docs_and_freqs + decodes_freqs。pos profile 不走批读（phrase 保持
-逐 doc）。对拍：5 term × 5 dst 尺寸（1/7/128/200/4096）+ freq 异常值 +
-singleton + no-freq 模式，与逐 doc 逐点一致。
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-EOF
-)"
+git add crates/core/src/analysis
+git commit -m "core: Analyzer template, TokenStream, LowercaseFilter"
 ```
 
 ---

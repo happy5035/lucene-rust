@@ -1,78 +1,57 @@
-# Task 2 Report: codec 窗口批读——EnumCore::next_docs
+# Task 2 Report: LowercaseFilter + Analyzer 模板与 TokenStream
 
 ## What was implemented
 
-### EnumCore::next_docs (private method)
-- Batch-reads up to `docs.len()` documents from the decoded `doc_buffer` window
-- Cross-block-boundary transparent refill via `move_to_next_level0_block()`
-- When `freqs = Some(...)`, simultaneously copies the same window from `freq_buffer`
-- Returns 0 when exhausted
-- Handles sentinel edge cases (buffer-first-slot-is-sentinel after exact 128-multiple df)
-- `debug_assert!(self.pos.is_none())` — positions profile stays per-doc
+严格按 brief 逐字实现，无 drift。
 
-### DocsEnum::next_docs (public wrapper)
-- Delegates to `self.core.next_docs(docs, None)`
-- 0 = exhausted
+### `crates/core/src/analysis/filter.rs`（新建）
+- `pub trait TokenFilter: Send + Sync` — `filter<'a>(&self, Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>>` + `normalizes(&self) -> bool`
+- `pub struct LowercaseFilter` — ASCII 快路径：纯 ASCII 且无大写字节的 token 原样 borrowed 返回（零分配）；其余走 `String::from_utf8_lossy` + Unicode `to_lowercase`。`normalizes()` 恒 `true`。
 
-### DocsFreqsEnum (public wrappers)
-- `next_docs(&mut self, docs)` — doc-only batch (no freq decode needed)
-- `next_docs_and_freqs(&mut self, docs, freqs)` — asserts `decode_freqs` then delegates
-- `decodes_freqs(&self)` — **pre-existing** (added in Task 1 fix), verified identical to brief's code, not re-added
+### `crates/core/src/analysis/analyzer.rs`（新建）
+- `pub type TokenizerFactory = Arc<dyn for<'a> Fn(&'a str) -> Box<dyn Tokenizer<'a> + 'a> + Send + Sync>`
+- `pub enum TokenizerTemplate { Whitespace, Letter, Keyword, Custom(TokenizerFactory) }`（`Clone`）
+- `pub enum FilterKind { Lowercase, Custom(Arc<dyn TokenFilter>) }`（`Clone`），内部 `apply`/`normalizes` 静态分发到 `LowercaseFilter` 或自定义 filter
+- `enum ActiveTokenizer<'a>`（私有）— 四种 tokenizer 的静态分发 + Custom 逃生舱
+- `pub struct Analyzer { pub(crate) tokenizer, pub(crate) filters }`（`Clone`）
+  - `analyze<'a, 'b>(&'b self, input: &'a str) -> TokenStream<'a, 'b>`
+  - `normalize<'a>(&self, input: &'a str) -> Cow<'a, str>` — 不分词，整个输入作为单 token 过 normalizing filters；结果被 filter 丢弃时返回空串
+- `pub struct TokenStream<'a, 'b>`，`impl Iterator<Item = Cow<'a, [u8]>>` — filter 返回 `None` 时跳过该 token（`'outer` 标签 continue）
 
-### Tests added
-- `next_docs_matches_next_doc_all_terms` — 5 terms × 5 dst sizes (1/7/128/200/4096), batch vs per-doc full cross-check, plus freq round-trip
-- `no_freq_enum_does_not_decode_freqs` — verifies no-freq mode's `decodes_freqs()` returns false and batch read still works
+### `crates/core/src/analysis/mod.rs`（修改）
+最终形态与 brief 一致：`mod analyzer; mod filter; mod tokenizer;` + 三组 re-export
+（`Analyzer, FilterKind, TokenStream, TokenizerFactory, TokenizerTemplate` / `LowercaseFilter, TokenFilter` / tokenizer 三项）。
 
-## Drift / adjustments from the brief
+## TDD 过程
 
-**One adjustment to the test code.** The brief's test used `reader.docs(&entry)` for all 5 terms including `tx` field terms (which have `IndexOptions::DocsAndFreqs`). However, `reader.docs()` constructs an `EnumCore` with `has_freqs=false`, which fails to skip on-disk freq PFOR blocks — the per-doc `next_doc()` itself produces corrupt output (doc 255 repeated 16 times, then 256 repeated 16 times, etc.) on `tx` terms. This is a pre-existing issue in the `docs()` constructor, not a bug in `next_docs`.
+1. 先写 analyzer.rs 测试模块（5 个测试）+ mod.rs 只声明 `mod analyzer;`：`cargo test -p rustlucene-core analysis` → 编译失败（E0422/E0425/E0433，15 errors），符合预期。
+2. 写入 filter.rs 与 analyzer.rs 完整实现、更新 mod.rs → 测试通过。
 
-**Fix:** Split the test into two loops:
-- `kw` field terms (DOCS-only) → `reader.docs()` + `drain_next_docs` (DocsEnum)
-- `tx` field terms (DOCS_AND_FREQS) → `reader.docs_and_freqs_no_freq()` + `drain_next_docs_enum` (DocsFreqsEnum)
+## 测试命令与输出摘要
 
-Added a `drain_per_doc_freqs` helper mirroring `drain_per_doc` for `DocsFreqsEnum`.
+- `RUST_MIN_STACK=4194304 cargo test -p rustlucene-core analysis`
+  → `test result: ok. 8 passed; 0 failed`（Task 1 的 3 项 + 本任务 5 项）
+- `RUST_MIN_STACK=4194304 cargo test -p rustlucene-core`（全量）
+  → lib `170 passed; 0 failed; 1 ignored`；两个 bin target `1 passed` / `2 passed`；doc-tests 0。既有测试零改动全绿。
+- 警告检查：`cargo check` / 测试构建仅有 3 条预存警告（`pattern_chars`/`matches`/`glob_match` 未使用，位于与本次改动无关的文件），本次新增代码零警告。
 
-The production code (EnumCore::next_docs, DocsEnum::next_docs, DocsFreqsEnum wrappers) was transcribed exactly as specified — no drift.
+## 自审（对照 brief 接口逐项核对）
 
-## RED output (Step 2)
+- `TokenFilter` trait 签名（含 `Send + Sync`、两个方法签名）✓ 逐字一致
+- `LowercaseFilter` 单元结构体 ✓
+- `FilterKind` / `TokenizerTemplate` 枚举变体与 `Clone` derive ✓
+- `TokenizerFactory` 类型别名（HRTB `for<'a>` + `Send + Sync`）✓
+- `Analyzer` 字段可见性 `pub(crate)`、`Clone` ✓
+- `analyze` / `normalize` 签名与生命周期 ✓
+- `TokenStream<'a, 'b>` + `Iterator<Item = Cow<'a, [u8]>>` ✓
+- mod.rs 与 brief 给的最终形态逐字一致 ✓
+- `#![forbid(unsafe_code)]` 合规：全部 safe Rust，无新依赖 ✓
 
-```
-error[E0599]: no method named `next_docs` found for mutable reference `&mut postings_read::DocsEnum`
-error[E0599]: no method named `next_docs_and_freqs` found for struct `postings_read::DocsFreqsEnum`
-error[E0599]: no method named `next_docs` found for mutable reference `&mut postings_read::DocsFreqsEnum`
-error: could not compile `codec-lucene9` (lib test) due to 3 previous errors
-```
+## 疑虑
 
-As predicted in the pre-resolved ambiguity: `decodes_freqs` compiled fine (pre-existing), only `next_docs` and `next_docs_and_freqs` were missing.
+无。代码与 brief 逐字一致，未做任何调整。
 
-## GREEN output (Step 5)
+## 提交说明
 
-### Focused tests
-```
-test postings_read::tests::next_docs_matches_next_doc_all_terms ... ok
-test postings_read::tests::no_freq_enum_does_not_decode_freqs ... ok
-```
-
-### Full workspace suite
-```
-codec-lucene9:  187 passed; 0 failed; 1 ignored
-rustlucene-core: 89 passed; 0 failed; 1 ignored
-rustlucene-jni:  2 passed; 0 failed; 0 ignored
-                 1 passed; 0 failed; 0 ignored (binary)
-Total: 279 passed (baseline 277 + 2 new)
-```
-
-No compiler warnings.
-
-## Files changed
-
-- `crates/codec-lucene9/src/postings_read.rs` (+200 lines)
-
-## Self-review findings
-
-- ✅ **Naming contract:** `EnumCore::next_docs(&mut self, docs: &mut [u32], mut freqs: Option<&mut [u32]>) -> io::Result<usize>`, `DocsEnum::next_docs(&mut self, docs: &mut [u32]) -> io::Result<usize>`, `DocsFreqsEnum::next_docs_and_freqs(&mut self, docs: &mut [u32], freqs: &mut [u32]) -> io::Result<usize>`, `decodes_freqs` pre-existing
-- ✅ **Completeness:** All 6 steps done (RED → implement → GREEN → commit)
-- ✅ **Discipline:** Nothing beyond the brief in production code; test code adjusted minimally to work around pre-existing `docs()` constructor issue with DOCS_AND_FREQS fields
-- ✅ **Pristine output:** Zero warnings
-- ✅ **Commit:** Single file, correct message with Co-Authored-By trailer
+- 本文件覆盖了上一个计划（codec 批读）遗留的同名 `task-2-report.md`——analyzer 框架计划复用了 task-N 编号。
+- `.superpowers/sdd/.gitignore` 内容为 `*`，但 `task-2-brief.md` / `task-2-report.md` 均已被 git 追踪（此前 force-add），故 `git add -f` 正常生效，无需删除 .gitignore。

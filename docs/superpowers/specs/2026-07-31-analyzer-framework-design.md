@@ -126,9 +126,10 @@ analyzer 配置存在 writer 的 schema 里，**不在索引格式里**（Lucene
   analyzer 规格表，输出重写后的 Query。JNI `nativeSearch` 在
   `spec_to_query` 之后调用。
 - **锁问题**：`IndexWriter::search` 持读锁，拿不到 `&mut Analyzer`。
-  查询侧**每查询现组装组件**：writer 构建时只预解析规格文本
-  （`"whitespace|lowercase"` → `Vec<ComponentSpec>`），每查询 new 一
-  组无状态组件（enum 构造，几个小分配），对 <100 QPS 目标无感。
+  查询侧**每查询现组装组件**：`analyze_query` 的 `analyzer_for` 每查
+  询对规格文本调 `Analyzer::parse` 全量重解析——new 一组无状态组
+  件（含一次注册表读锁 + HashMap 查找，成本与预解析方案同阶），对
+  <100 QPS 目标无感。
 - 重写规则：
 
   | 查询类型 | 通道 | 规则 |

@@ -193,6 +193,28 @@ impl<'a> DirectReader<'a> {
     /// DirectReader.get: bit position = offset*8 + index*bpv, LSB-first.
     pub fn get(&self, index: u64) -> u64 {
         let bpv = self.bits_per_value as u64;
+        if self.offset == 0 {
+            // Byte-aligned specializations, mirroring Java's per-bpv readers
+            // (DirectReader.java:199-461): a single LE load replaces the
+            // generic 8-byte window copy + shift/mask. bpv 64 keeps the
+            // no-mask semantics of the generic path. DirectWriter.finish's
+            // PACKED.byteCount truncation is exact for these widths (1/2/4/8
+            // bytes per value), so the last value never reads out of bounds.
+            let start = (index * bpv / 8) as usize;
+            match bpv {
+                8 => return self.data[start] as u64,
+                16 => {
+                    return u16::from_le_bytes(self.data[start..start + 2].try_into().unwrap())
+                        as u64
+                }
+                32 => {
+                    return u32::from_le_bytes(self.data[start..start + 4].try_into().unwrap())
+                        as u64
+                }
+                64 => return u64::from_le_bytes(self.data[start..start + 8].try_into().unwrap()),
+                _ => {}
+            }
+        }
         let bit_offset = self.offset * 8 + index * bpv;
         let byte_offset = (bit_offset / 8) as usize;
         let shift = (bit_offset % 8) as u32;
@@ -416,6 +438,73 @@ mod tests {
             let reader = DirectReader::new(&bytes, bpv, 0).unwrap();
             for (i, &v) in values.iter().enumerate() {
                 assert_eq!(reader.get(i as u64), v, "bpv {bpv} index {i}");
+            }
+        }
+    }
+
+    /// The pre-specialization generic decode, kept as a reference oracle for
+    /// the differential test below.
+    fn reference_get(data: &[u8], bits_per_value: u32, offset: u64, index: u64) -> u64 {
+        let bpv = bits_per_value as u64;
+        let bit_offset = offset * 8 + index * bpv;
+        let byte_offset = (bit_offset / 8) as usize;
+        let shift = (bit_offset % 8) as u32;
+        let mut buf = [0u8; 8];
+        let available = data.len() - byte_offset;
+        let take = available.min(8);
+        buf[..take].copy_from_slice(&data[byte_offset..byte_offset + take]);
+        let raw = u64::from_le_bytes(buf) >> shift;
+        if bpv == 64 {
+            raw
+        } else {
+            raw & ((1u64 << bpv) - 1)
+        }
+    }
+
+    #[test]
+    fn direct_reader_specialized_matches_reference() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for bpv in SUPPORTED_BITS_PER_VALUE {
+            let mask = if bpv == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bpv) - 1
+            };
+            let values: Vec<u64> = (0..300).map(|_| rand() & mask).collect();
+            let bytes = direct_writer_encode(&values, bpv);
+
+            // offset == 0: exercises the byte-aligned fast path for
+            // bpv 8/16/32/64 and the generic path for the rest.
+            let reader = DirectReader::new(&bytes, bpv, 0).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(reader.get(i as u64), v, "bpv {bpv} index {i}");
+                assert_eq!(
+                    reader.get(i as u64),
+                    reference_get(&bytes, bpv, 0, i as u64),
+                    "bpv {bpv} index {i} (specialized vs reference)"
+                );
+            }
+
+            // offset != 0 (as DirectMonotonicReader constructs for non-first
+            // blocks): the specialization must not trigger; results must match
+            // the reference generic decode bit for bit.
+            let prefix = [0xABu8, 0xCD, 0xEF];
+            let mut prefixed = prefix.to_vec();
+            prefixed.extend_from_slice(&bytes);
+            let reader = DirectReader::new(&prefixed, bpv, prefix.len() as u64).unwrap();
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(reader.get(i as u64), v, "bpv {bpv} index {i} (offset != 0)");
+                assert_eq!(
+                    reader.get(i as u64),
+                    reference_get(&prefixed, bpv, prefix.len() as u64, i as u64),
+                    "bpv {bpv} index {i} (offset != 0, specialized vs reference)"
+                );
             }
         }
     }

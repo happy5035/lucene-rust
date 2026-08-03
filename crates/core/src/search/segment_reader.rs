@@ -6,7 +6,7 @@ use std::io;
 
 use codec_lucene9::automaton::WildcardDfa;
 use codec_lucene9::directory::FSDirectory;
-use codec_lucene9::doc_values_read::DocValuesReader;
+use codec_lucene9::doc_values_read::{BinaryDocValues, DocValuesReader, SortedDocValues};
 use codec_lucene9::field_infos::{FieldInfo, FieldInfos, IndexOptions};
 use codec_lucene9::points_read::PointsReader;
 use codec_lucene9::postings_read::{DocsEnum, DocsFreqsEnum, PositionsEnum, PostingsReader};
@@ -21,9 +21,6 @@ use super::doc_iter::{PhraseDocIter, PositionsEnumLike, SegmentDocIter};
 use super::leaf_access::{LeafAccess, PointsAccess, TermsIterAccess};
 
 pub struct SegmentReader {
-    dir: FSDirectory,
-    segment: String,
-    segment_id: [u8; 16],
     max_doc: i32,
     field_infos: FieldInfos,
     terms: TermsDict,
@@ -41,12 +38,8 @@ impl SegmentReader {
         let terms = TermsDict::open(dir, segment, segment_id, &field_infos)?;
         let postings = PostingsReader::open(dir, segment, segment_id)?;
         let points = PointsReader::open(dir, segment, segment_id, &field_infos)?;
-        let dv_suffix = "Lucene90_0";
-        let doc_values = DocValuesReader::open(dir, segment, segment_id, dv_suffix).ok();
+        let doc_values = DocValuesReader::open(dir, segment, segment_id, DV_SUFFIX).ok();
         Ok(SegmentReader {
-            dir: dir.clone(),
-            segment: segment.clone(),
-            segment_id: *segment_id,
             max_doc: sci.info.doc_count,
             field_infos,
             terms,
@@ -69,31 +62,36 @@ impl SegmentReader {
     }
 
     /// Numeric DocValues for a field as (doc, value) ascending by doc.
-    /// Opens the .dvd/.dvm on demand (no random-access cache yet — top-N
-    /// reads each sorted segment once). Unknown field → empty Vec.
+    /// Reuses the DocValuesReader opened with the segment. Unknown field or
+    /// segment without DV data → empty Vec.
     pub fn numeric_values(&self, field: &str) -> io::Result<Vec<(u32, i64)>> {
         let Some(fi) = self.field_infos.by_name(field) else {
             return Ok(Vec::new());
         };
-        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
-        r.numeric_values(fi.number)
+        let Some(dv) = self.doc_values.as_ref() else {
+            return Ok(Vec::new());
+        };
+        dv.numeric_values(fi.number)
     }
 
     /// Binary DocValues for a field as (doc, bytes) ascending by doc.
-    /// Opens the .dvd/.dvm on demand. Unknown field → empty Vec.
+    /// Reuses the DocValuesReader opened with the segment. Unknown field or
+    /// segment without DV data → empty Vec.
     pub fn binary_values(&self, field: &str) -> io::Result<Vec<(u32, Vec<u8>)>> {
         let Some(fi) = self.field_infos.by_name(field) else {
             return Ok(Vec::new());
         };
-        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
-        r.binary_values(fi.number)
+        let Some(dv) = self.doc_values.as_ref() else {
+            return Ok(Vec::new());
+        };
+        dv.binary_values(fi.number)
     }
 
     /// Binary DocValues for a field in packed form: `(doc_ids, data, offsets)`
     /// where `data` is one contiguous buffer and `offsets[i]` is the
     /// `(start, end)` of doc `doc_ids[i]`'s value within `data`. Ascending by
     /// doc. Avoids one allocation per doc — useful when holding a whole field
-    /// (e.g. shard merge). Unknown field → empty.
+    /// (e.g. shard merge). Unknown field or segment without DV data → empty.
     pub fn binary_values_packed(
         &self,
         field: &str,
@@ -101,23 +99,28 @@ impl SegmentReader {
         let Some(fi) = self.field_infos.by_name(field) else {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         };
-        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
-        r.binary_values_packed(fi.number)
+        let Some(dv) = self.doc_values.as_ref() else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        dv.binary_values_packed(fi.number)
     }
 
     /// Sorted DocValues for a field as (doc, term_bytes) ascending by doc.
     /// Combines sorted_ords (doc → ord) with sorted_dict (ord → bytes).
-    /// Opens the .dvd/.dvm on demand. Unknown field → empty Vec.
+    /// Reuses the DocValuesReader opened with the segment. Unknown field or
+    /// segment without DV data → empty Vec.
     pub fn sorted_values(&self, field: &str) -> io::Result<Vec<(u32, Vec<u8>)>> {
         let Some(fi) = self.field_infos.by_name(field) else {
             return Ok(Vec::new());
         };
-        let r = DocValuesReader::open(&self.dir, &self.segment, &self.segment_id, DV_SUFFIX)?;
-        let ords = r.sorted_ords(fi.number)?;
+        let Some(dv) = self.doc_values.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let ords = dv.sorted_ords(fi.number)?;
         if ords.is_empty() {
             return Ok(Vec::new());
         }
-        let dict = r.sorted_dict(fi.number)?;
+        let dict = dv.sorted_dict(fi.number)?;
         Ok(ords
             .into_iter()
             .map(|(doc, ord)| {
@@ -128,6 +131,48 @@ impl SegmentReader {
                 (doc, bytes)
             })
             .collect())
+    }
+
+    /// Binary DocValues as a zero-copy streaming iterator: `next` yields
+    /// `(doc, &[u8])` borrowed straight from the .dvd mmap — no per-doc
+    /// allocation (Java `BytesRef` semantics). Unknown field, segment
+    /// without DV data, or field without a BINARY DV entry → NotFound
+    /// error (the iterator borrows the reader, so unlike the Vec-returning
+    /// APIs it cannot materialize an "empty" value without one).
+    pub fn binary_doc_values(&self, field: &str) -> io::Result<BinaryDocValues<'_>> {
+        let fi = self.field_infos.by_name(field).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown field {field}"),
+            )
+        })?;
+        let dv = self.doc_values.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "segment has no doc-values data",
+            )
+        })?;
+        dv.binary_doc_values(fi.number)
+    }
+
+    /// Sorted DocValues as a zero-copy streaming iterator: `next` yields
+    /// `(doc, &[u8])` borrowed from the iterator's own dict buffer. Unknown
+    /// field, segment without DV data, or field without a SORTED DV entry →
+    /// NotFound error (same rationale as `binary_doc_values`).
+    pub fn sorted_doc_values(&self, field: &str) -> io::Result<SortedDocValues> {
+        let fi = self.field_infos.by_name(field).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown field {field}"),
+            )
+        })?;
+        let dv = self.doc_values.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "segment has no doc-values data",
+            )
+        })?;
+        dv.sorted_doc_values(fi.number)
     }
 
     /// Term lookup: field resolution + terms-dict seek. Returns

@@ -43,17 +43,35 @@ impl FSDirectory {
 
     /// Directory.openInput: opens an existing file for reading via mmap
     /// (zero-syscall reads after initial page-in, matching Java MMapDirectory).
-    #[allow(unsafe_code)]
     pub fn open_input(&self, name: &str) -> io::Result<IndexInput> {
         let file = File::open(self.resolve(name))?;
         let length = file.metadata()?.len();
         if length == 0 {
             return Ok(IndexInput::from_file(file, 0));
         }
+        Ok(IndexInput::from_mmap(Self::mmap_file(&file)?))
+    }
+
+    /// Opens an existing file as a shared mmap, for readers that slice the
+    /// mapping directly instead of copying it into a heap buffer (e.g.
+    /// DocValuesReader holding the whole .dvd). Empty files are rejected
+    /// (memmap2 cannot map a zero-length file).
+    pub fn open_mmap(&self, name: &str) -> io::Result<std::sync::Arc<memmap2::Mmap>> {
+        let file = File::open(self.resolve(name))?;
+        if file.metadata()?.len() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("cannot mmap empty file {name}"),
+            ));
+        }
+        Self::mmap_file(&file)
+    }
+
+    #[allow(unsafe_code)]
+    fn mmap_file(file: &File) -> io::Result<std::sync::Arc<memmap2::Mmap>> {
         // SAFETY: file is opened read-only and not truncated/mutated while
         // the mmap is alive (same contract as Java MMapDirectory).
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(IndexInput::from_mmap(std::sync::Arc::new(mmap)))
+        Ok(std::sync::Arc::new(unsafe { memmap2::Mmap::map(file)? }))
     }
 
     /// Directory.openChecksumInput (commit/codec metadata files are read

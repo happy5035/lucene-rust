@@ -4,6 +4,7 @@
 //! 布局 ground truth：docs/format-notes-docvalues.md + doc_values.rs 写侧注释。
 
 use std::io;
+use std::sync::Arc;
 
 use crate::codec_util::{check_footer, check_footer_structure, check_index_header, corrupt};
 use crate::directory::FSDirectory;
@@ -12,7 +13,7 @@ use crate::doc_values::{
     DISI_SENTINEL_BLOCK, META_CODEC, TERMS_DICT_BLOCK_SIZE, TERMS_DICT_REVERSE_INDEX_SIZE,
     TYPE_BINARY, TYPE_NUMERIC, TYPE_SORTED, VERSION,
 };
-use crate::io::{ChecksumIndexInput, DataInput, IndexInput};
+use crate::io::{ChecksumIndexInput, DataInput, SliceInput};
 use crate::packed::{DirectMonotonicReader, DirectReader};
 
 /// Lucene90DocValuesProducer.readNumeric (:197-224) 的归并子集。
@@ -66,9 +67,10 @@ enum DvEntry {
 
 #[derive(Debug)]
 pub struct DocValuesReader {
-    /// .dvd header 之后的全部字节（footer 除外）；归并逐字段顺序消费。
-    dvd: Vec<u8>,
-    /// .dvd index header 长度：meta 里的 offset 是绝对 fp，切片时减之。
+    /// 整个 .dvd 文件的 mmap（含 header/footer）；meta 里的 offset 即文件内
+    /// 绝对偏移，slice 直接按之切，不做堆拷贝。
+    dvd: Arc<memmap2::Mmap>,
+    /// .dvd index header 长度：数据区起点；slice 校验 offset 不落进 header。
     header_len: u64,
     entries: Vec<(i32, DvEntry)>,
 }
@@ -242,8 +244,9 @@ impl DocValuesReader {
         )?;
         let header_len = dvd_in.file_pointer();
         check_footer_structure(&dvd_in, dvd_in.length())?;
-        let mut dvd = vec![0u8; (dvd_in.length() - header_len - 16) as usize]; // 16 = footer
-        dvd_in.read_bytes(&mut dvd)?;
+        drop(dvd_in);
+        // 校验通过后持有整文件 mmap，逐字段切片零拷贝消费。
+        let dvd = dir.open_mmap(&dvd_name)?;
         Ok(DocValuesReader {
             dvd,
             header_len,
@@ -251,14 +254,16 @@ impl DocValuesReader {
         })
     }
 
-    /// meta 里的 offset 是 .dvd 绝对 fp；self.dvd 以 header 末尾为 0 基。
+    /// meta 里的 offset 是 .dvd 绝对 fp；self.dvd 以整个文件开头为 0 基，
+    /// 直接用 offset 切片（不减 header_len）。
     fn slice(&self, offset: i64, length: i64) -> io::Result<&[u8]> {
         if offset < 0 || length < 0 {
             return Err(corrupt("negative DV slice bounds"));
         }
-        let start = (offset as u64)
-            .checked_sub(self.header_len)
-            .ok_or_else(|| corrupt("DV offset before data"))? as usize;
+        if (offset as u64) < self.header_len {
+            return Err(corrupt("DV offset before data"));
+        }
+        let start = offset as usize;
         let end = start
             .checked_add(length as usize)
             .ok_or_else(|| corrupt("DV slice end overflow"))?;
@@ -271,22 +276,6 @@ impl DocValuesReader {
             )));
         }
         Ok(&self.dvd[start..end])
-    }
-
-    /// 读取 region 中 [p, p+2) 的 LE u16，越界时返回 InvalidData。
-    fn read_u16_le(region: &[u8], p: usize) -> io::Result<u16> {
-        if p + 2 > region.len() {
-            return Err(corrupt("truncated DISI u16"));
-        }
-        Ok(u16::from_le_bytes(region[p..p + 2].try_into().unwrap()))
-    }
-
-    /// 读取 region 中 [p, p+8) 的 LE u64，越界时返回 InvalidData。
-    fn read_u64_le(region: &[u8], p: usize) -> io::Result<u64> {
-        if p + 8 > region.len() {
-            return Err(corrupt("truncated DISI u64"));
-        }
-        Ok(u64::from_le_bytes(region[p..p + 8].try_into().unwrap()))
     }
 
     fn numeric_meta(&self, field_number: i32) -> Option<&NumericMeta> {
@@ -309,68 +298,132 @@ impl DocValuesReader {
             })
     }
 
-    /// docsWithField（IndexedDISI 顺序解码，IndexedDISI.java:102-254）：
-    /// docs_offset==-2 → 空；==-1 → 0..num_values（稠密）；否则逐块——块头
-    /// LE short blockID + LE short cardinality-1；SPARSE（≤4095：LE short
-    /// 低 16 位）、DENSE（256B rank 跳过 + 1024 LE long 位图展开）、
-    /// ALL（==65536：无 payload）；sentinel 块（blockID == 0x7FFF）止；
-    /// jump table 在块区末尾，顺序读不消费。
-    fn read_docs_with_field(&self, m: &NumericMeta) -> io::Result<Vec<u32>> {
-        if m.docs_offset == -2 {
-            return Ok(Vec::new());
+    fn binary_meta(&self, field_number: i32) -> Option<&BinaryMeta> {
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == field_number)
+            .and_then(|(_, e)| match e {
+                DvEntry::Binary(m) => Some(m),
+                _ => None,
+            })
+    }
+}
+
+/// docsWithField 解码结果：空 → Empty；稠密（docs_offset == -1）用 range
+/// 惰性表示，不物化 Vec；稀疏 DISI 解出 Vec<u32>。
+enum DocIds {
+    Empty,
+    Dense(std::ops::Range<u32>),
+    Sparse(Vec<u32>),
+}
+
+impl DocIds {
+    fn len(&self) -> usize {
+        match self {
+            DocIds::Empty => 0,
+            DocIds::Dense(r) => r.len(),
+            DocIds::Sparse(v) => v.len(),
         }
-        if m.docs_offset == -1 {
-            return Ok((0..m.num_values as u32).collect());
+    }
+
+    fn get(&self, i: usize) -> u32 {
+        match self {
+            DocIds::Empty => unreachable!("get on empty DocIds"),
+            DocIds::Dense(r) => r.start + i as u32,
+            DocIds::Sparse(v) => v[i],
         }
-        let region = self.slice(m.docs_offset, m.docs_length)?;
-        let mut docs = Vec::with_capacity(m.num_values as usize);
-        let mut pos = 0usize;
-        loop {
-            if pos + 4 > region.len() {
-                return Err(corrupt("truncated DISI block header"));
-            }
-            let block_id = Self::read_u16_le(region, pos)? as u32;
-            let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
-            pos += 4;
-            if block_id == DISI_SENTINEL_BLOCK {
-                break;
-            }
-            if cardinality <= DISI_MAX_ARRAY_LENGTH {
-                for _ in 0..cardinality {
-                    docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
-                    pos += 2;
+    }
+
+    fn into_vec(self) -> Vec<u32> {
+        match self {
+            DocIds::Empty => Vec::new(),
+            DocIds::Dense(r) => r.collect(),
+            DocIds::Sparse(v) => v,
+        }
+    }
+}
+
+/// 稀疏 DISI 区顺序解码（IndexedDISI.java:102-254）：逐块——块头 LE short
+/// blockID + LE short cardinality-1；SPARSE（≤4095：LE short 低 16 位）、
+/// DENSE（256B rank 跳过 + 1024 LE long 位图展开）、ALL（==65536：无
+/// payload）；sentinel 块（blockID == 0x7FFF）止；jump table 在块区末尾，
+/// 顺序读不消费。
+fn decode_disi_region(region: &[u8], num_values: u64) -> io::Result<Vec<u32>> {
+    let mut docs = Vec::with_capacity(num_values as usize);
+    let mut pos = 0usize;
+    loop {
+        if pos + 4 > region.len() {
+            return Err(corrupt("truncated DISI block header"));
+        }
+        let block_id = u16::from_le_bytes(region[pos..pos + 2].try_into().unwrap()) as u32;
+        let cardinality =
+            u16::from_le_bytes(region[pos + 2..pos + 4].try_into().unwrap()) as u32 + 1;
+        pos += 4;
+        if block_id == DISI_SENTINEL_BLOCK {
+            break;
+        }
+        if cardinality <= DISI_MAX_ARRAY_LENGTH {
+            for _ in 0..cardinality {
+                if pos + 2 > region.len() {
+                    return Err(corrupt("truncated DISI u16"));
                 }
-            } else if cardinality == DISI_BLOCK_SIZE {
-                docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
-            } else {
-                // DENSE: 256B rank table + 1024 LE longs
-                if pos + 256 + 1024 * 8 > region.len() {
-                    return Err(corrupt("truncated DISI dense block"));
-                }
-                pos += 256; // rank table
-                for word_index in 0..1024usize {
-                    let mut w = Self::read_u64_le(region, pos)?;
-                    pos += 8;
-                    while w != 0 {
-                        let bit = w.trailing_zeros();
-                        docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
-                        w &= w - 1;
-                    }
+                docs.push(
+                    (block_id << 16)
+                        | u16::from_le_bytes(region[pos..pos + 2].try_into().unwrap()) as u32,
+                );
+                pos += 2;
+            }
+        } else if cardinality == DISI_BLOCK_SIZE {
+            docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
+        } else {
+            // DENSE: 256B rank table + 1024 LE longs
+            if pos + 256 + 1024 * 8 > region.len() {
+                return Err(corrupt("truncated DISI dense block"));
+            }
+            pos += 256; // rank table
+            for word_index in 0..1024usize {
+                let mut w = u64::from_le_bytes(region[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                while w != 0 {
+                    let bit = w.trailing_zeros();
+                    docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
+                    w &= w - 1;
                 }
             }
         }
-        if docs.len() as u64 != m.num_values {
-            return Err(corrupt(format!(
-                "DISI docs count mismatch: expected {}, got {}",
-                m.num_values,
-                docs.len()
-            )));
+    }
+    if docs.len() as u64 != num_values {
+        return Err(corrupt(format!(
+            "DISI docs count mismatch: expected {}, got {}",
+            num_values,
+            docs.len()
+        )));
+    }
+    Ok(docs)
+}
+
+impl DocValuesReader {
+    /// docsWithField（IndexedDISI 顺序解码）：docs_offset==-2 → 空；
+    /// ==-1 → 0..num_values（稠密，range 表示）；否则解 DISI 区。
+    fn decode_doc_ids(
+        &self,
+        docs_offset: i64,
+        docs_length: i64,
+        num_values: u64,
+    ) -> io::Result<DocIds> {
+        if docs_offset == -2 {
+            return Ok(DocIds::Empty);
         }
-        Ok(docs)
+        if docs_offset == -1 {
+            return Ok(DocIds::Dense(0..num_values as u32));
+        }
+        let region = self.slice(docs_offset, docs_length)?;
+        Ok(DocIds::Sparse(decode_disi_region(region, num_values)?))
     }
 
     /// 值流：bpv==0 → vec![min; num_values]（producer :487-493）；否则
-    /// DirectReader 逐值 `min + gcd * get(i)`（:527-534；gcd 恒 1 按通用解）。
+    /// 逐值 `min + gcd * get(i)`（:527-534；gcd 恒 1 按通用解）。bpv 字节
+    /// 对齐（8/16/32/64）时走 chunks_exact 批量解码，绕开逐位 DirectReader。
     fn read_values(&self, m: &NumericMeta) -> io::Result<Vec<i64>> {
         if m.bpv == 0 {
             return Ok(vec![m.min; m.num_values as usize]);
@@ -389,17 +442,37 @@ impl DocValuesReader {
                 data.len()
             )));
         }
-        let reader = DirectReader::new(data, m.bpv as u32, 0)?;
-        Ok((0..m.num_values)
-            .map(|i| {
-                (reader.get(i) as i64)
-                    .wrapping_mul(m.gcd)
-                    .wrapping_add(m.min)
-            })
-            .collect())
+        let n = m.num_values as usize;
+        let apply =
+            |v: u64| (v as i64).wrapping_mul(m.gcd).wrapping_add(m.min);
+        let mut values = Vec::with_capacity(n);
+        match m.bpv {
+            8 => values.extend(data[..n].iter().map(|&b| apply(b as u64))),
+            16 => values.extend(
+                data[..n * 2]
+                    .chunks_exact(2)
+                    .map(|c| apply(u16::from_le_bytes([c[0], c[1]]) as u64)),
+            ),
+            32 => values.extend(
+                data[..n * 4]
+                    .chunks_exact(4)
+                    .map(|c| apply(u32::from_le_bytes(c.try_into().unwrap()) as u64)),
+            ),
+            64 => values.extend(
+                data[..n * 8]
+                    .chunks_exact(8)
+                    .map(|c| apply(u64::from_le_bytes(c.try_into().unwrap()))),
+            ),
+            _ => {
+                let reader = DirectReader::new(data, m.bpv as u32, 0)?;
+                values.extend((0..m.num_values).map(|i| apply(reader.get(i))));
+            }
+        }
+        Ok(values)
     }
 
-    /// 逐 doc (doc, value)，doc 升序。全空 → 空 Vec。
+    /// 逐 doc (doc, value)，doc 升序。全空 → 空 Vec。稠密（docs_offset==-1）
+    /// 时 doc_ids 不物化，range 直接与 values zip。
     pub fn numeric_values(&self, field_number: i32) -> io::Result<Vec<(u32, i64)>> {
         let Some(m) = self.numeric_meta(field_number) else {
             return Err(io::Error::new(
@@ -407,7 +480,7 @@ impl DocValuesReader {
                 format!("no NUMERIC DV entry for field {field_number}"),
             ));
         };
-        let docs = self.read_docs_with_field(m)?;
+        let docs = self.decode_doc_ids(m.docs_offset, m.docs_length, m.num_values)?;
         let values = self.read_values(m)?;
         if docs.len() != values.len() {
             return Err(corrupt(format!(
@@ -416,7 +489,11 @@ impl DocValuesReader {
                 values.len()
             )));
         }
-        Ok(docs.into_iter().zip(values).collect())
+        Ok(match docs {
+            DocIds::Empty => Vec::new(),
+            DocIds::Dense(r) => r.zip(values).collect(),
+            DocIds::Sparse(v) => v.into_iter().zip(values).collect(),
+        })
     }
 
     /// 逐 doc (doc, ord)，doc 升序：ords 子条目走 numeric 同一路径。
@@ -427,13 +504,17 @@ impl DocValuesReader {
                 format!("no SORTED DV entry for field {field_number}"),
             ));
         };
-        let docs = self.read_docs_with_field(&s.ords)?;
+        let docs = self.decode_doc_ids(s.ords.docs_offset, s.ords.docs_length, s.ords.num_values)?;
         let values = self.read_values(&s.ords)?;
-        Ok(docs
-            .into_iter()
-            .zip(values)
-            .map(|(d, o)| (d, o as u32))
-            .collect())
+        Ok(match docs {
+            DocIds::Empty => Vec::new(),
+            DocIds::Dense(r) => r.zip(values).map(|(d, o)| (d, o as u32)).collect(),
+            DocIds::Sparse(v) => v
+                .into_iter()
+                .zip(values)
+                .map(|(d, o)| (d, o as u32))
+                .collect(),
+        })
     }
 
     /// terms dict 全量展开：64 项/块，块首词 verbatim（VInt 长度 + 字节），
@@ -441,6 +522,20 @@ impl DocValuesReader {
     /// prefix（15 ⇒ +VInt 续）、高 4 位 suffix-1（=15 ⇒ suffix = 16+VInt）——
     /// 写侧 doc_values.rs:280-291 的逆；块地址 DirectMonotonic :578）。
     pub fn sorted_dict(&self, field_number: i32) -> io::Result<Vec<Vec<u8>>> {
+        let (buf, offsets) = self.sorted_dict_packed(field_number)?;
+        Ok(offsets
+            .iter()
+            .map(|&(s, l)| buf[s as usize..(s + l) as usize].to_vec())
+            .collect())
+    }
+
+    /// terms dict 全量展开的 packed 形式：一个连续 buffer + 每词
+    /// (start, len)，供 `SortedDocValues` 零分配迭代；解码逻辑与
+    /// `sorted_dict` 相同（SliceInput 直接借 mmap 区域，prev 缓冲区复用）。
+    pub fn sorted_dict_packed(
+        &self,
+        field_number: i32,
+    ) -> io::Result<(Vec<u8>, Vec<(u32, u32)>)> {
         let Some(s) = self.sorted_meta(field_number) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -448,7 +543,7 @@ impl DocValuesReader {
             ));
         };
         if s.dict_size == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let num_blocks = (s.dict_size as usize).div_ceil(TERMS_DICT_BLOCK_SIZE);
         let addrs = DirectMonotonicReader::new(
@@ -458,7 +553,9 @@ impl DocValuesReader {
             s.block_shift,
         )?;
         let data = self.slice(s.terms_data_offset, s.terms_data_length)?;
-        let mut terms = Vec::with_capacity(s.dict_size as usize);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<(u32, u32)> = Vec::with_capacity(s.dict_size as usize);
+        let mut prev: Vec<u8> = Vec::new();
         for b in 0..num_blocks {
             let start = addrs.get(b as u64) as usize;
             let end = if b + 1 < num_blocks {
@@ -470,25 +567,26 @@ impl DocValuesReader {
                 return Err(corrupt("terms dict block bounds"));
             }
             let region = &data[start..end];
-            let mut r = IndexInput::in_memory(region.to_vec());
+            let mut r = SliceInput::new(region);
             let first_len = r.read_vint()? as usize;
-            let mut first = vec![0u8; first_len];
-            r.read_bytes(&mut first)?;
-            terms.push(first.clone());
+            prev.clear();
+            prev.resize(first_len, 0);
+            r.read_bytes(&mut prev)?;
+            let term_start = buf.len();
+            buf.extend_from_slice(&prev);
+            offsets.push((term_start as u32, prev.len() as u32));
             let block_count =
                 (s.dict_size as usize - b * TERMS_DICT_BLOCK_SIZE).min(TERMS_DICT_BLOCK_SIZE);
             if block_count > 1 {
                 let uncompressed = r.read_vint()? as usize;
-                let consumed = r.file_pointer() as usize;
+                let consumed = r.position();
                 if consumed > region.len() {
                     return Err(corrupt("terms dict compressed length overflow"));
                 }
-                let mut compressed = vec![0u8; region.len() - consumed];
-                r.read_bytes(&mut compressed)?;
-                let decompressed = lz4::block::decompress(&compressed, Some(uncompressed as i32))
-                    .map_err(|e| corrupt(format!("terms dict lz4: {e}")))?;
-                let mut dr = IndexInput::in_memory(decompressed);
-                let mut prev = first;
+                let decompressed =
+                    lz4::block::decompress(&region[consumed..], Some(uncompressed as i32))
+                        .map_err(|e| corrupt(format!("terms dict lz4: {e}")))?;
+                let mut dr = SliceInput::new(&decompressed);
                 for _ in 1..block_count {
                     let token = dr.read_byte()? as usize;
                     let mut prefix = token & 0x0F;
@@ -499,118 +597,85 @@ impl DocValuesReader {
                     if suffix == 16 {
                         suffix += dr.read_vint()? as usize;
                     }
-                    let mut sfx = vec![0u8; suffix];
-                    dr.read_bytes(&mut sfx)?;
                     if prefix > prev.len() {
                         return Err(corrupt("terms dict prefix exceeds prev term"));
                     }
-                    let mut term = prev[..prefix].to_vec();
-                    term.extend_from_slice(&sfx);
-                    prev = term.clone();
-                    terms.push(term);
+                    let term_start = buf.len();
+                    buf.extend_from_slice(&prev[..prefix]);
+                    buf.resize(buf.len() + suffix, 0);
+                    dr.read_bytes(&mut buf[term_start + prefix..])?;
+                    prev.clear();
+                    prev.extend_from_slice(&buf[term_start..]);
+                    offsets.push((term_start as u32, (buf.len() - term_start) as u32));
                 }
             }
         }
-        Ok(terms)
+        Ok((buf, offsets))
     }
 
     /// BINARY field: returns (doc_id, bytes) pairs in doc order.
-    /// Mirrors Lucene90DocValuesProducer readBinary + BinaryDocValues iteration.
+    /// Thin owned-collecting wrapper over [`Self::binary_doc_values`].
     pub fn binary_values(&self, field_number: i32) -> io::Result<Vec<(u32, Vec<u8>)>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|(n, _)| *n == field_number)
-            .and_then(|(_, e)| match e {
-                DvEntry::Binary(m) => Some(m),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no BINARY DV entry for field {field_number}"),
-                )
-            })?;
+        let mut it = self.binary_doc_values(field_number)?;
+        let mut out = Vec::with_capacity(it.len());
+        while let Some((doc, bytes)) = it.next() {
+            out.push((doc, bytes.to_vec()));
+        }
+        Ok(out)
+    }
 
-        if entry.num_values == 0 {
-            return Ok(vec![]);
+    /// BINARY field zero-copy iterator: each `next` borrows the value bytes
+    /// straight out of the .dvd mmap — no per-doc allocation. All bounds are
+    /// validated up front (corrupt data → InvalidData at construction), so
+    /// iteration itself is infallible.
+    pub fn binary_doc_values(&self, field_number: i32) -> io::Result<BinaryDocValues<'_>> {
+        let entry = self.binary_meta(field_number).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no BINARY DV entry for field {field_number}"),
+            )
+        })?;
+
+        if entry.num_values == 0 || entry.docs_offset == -2 {
+            return Ok(BinaryDocValues {
+                doc_ids: DocIds::Empty,
+                data: &[],
+                addrs: None,
+                fixed_len: 0,
+                pos: 0,
+            });
         }
 
-        // Decode doc IDs (DISI or dense)
-        let doc_ids: Vec<u32> = if entry.docs_offset == -1 {
-            // Dense: all docs 0..num_values have values
-            (0..entry.num_values).collect()
-        } else if entry.docs_offset == -2 {
-            return Ok(vec![]);
-        } else {
-            // Sparse: decode doc IDs from DISI region
-            let region = self.slice(entry.docs_offset, entry.docs_length)?;
-            let mut docs = Vec::with_capacity(entry.num_values as usize);
-            let mut pos = 0usize;
-            loop {
-                if pos + 4 > region.len() {
-                    return Err(corrupt("truncated DISI block header"));
-                }
-                let block_id = Self::read_u16_le(region, pos)? as u32;
-                let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
-                pos += 4;
-                if block_id == DISI_SENTINEL_BLOCK {
-                    break;
-                }
-                if cardinality <= DISI_MAX_ARRAY_LENGTH {
-                    for _ in 0..cardinality {
-                        docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
-                        pos += 2;
-                    }
-                } else if cardinality == DISI_BLOCK_SIZE {
-                    docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
-                } else {
-                    // DENSE: 256B rank table + 1024 LE longs
-                    if pos + 256 + 1024 * 8 > region.len() {
-                        return Err(corrupt("truncated DISI dense block"));
-                    }
-                    pos += 256; // rank table
-                    for word_index in 0..1024usize {
-                        let mut w = Self::read_u64_le(region, pos)?;
-                        pos += 8;
-                        while w != 0 {
-                            let bit = w.trailing_zeros();
-                            docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
-                            w &= w - 1;
-                        }
-                    }
-                }
-            }
-            if docs.len() != entry.num_values as usize {
-                return Err(corrupt(format!(
-                    "binary DISI docs count mismatch: expected {}, got {}",
-                    entry.num_values,
-                    docs.len()
-                )));
-            }
-            docs
-        };
-
-        // Decode values
+        let doc_ids = self.decode_doc_ids(
+            entry.docs_offset,
+            entry.docs_length,
+            entry.num_values as u64,
+        )?;
         let data = self.slice(entry.data_offset, entry.data_length)?;
-        let mut result = Vec::with_capacity(entry.num_values as usize);
 
         if entry.min_length == entry.max_length {
-            // Fixed-length: slice directly by min_length
+            // Fixed-length: value i at [i*len, (i+1)*len).
             let len = entry.min_length as usize;
-            for (i, &doc_id) in doc_ids.iter().enumerate() {
-                let start = i * len;
-                let end = start + len;
-                if end > data.len() {
-                    return Err(corrupt("binary fixed-length data truncated"));
-                }
-                result.push((doc_id, data[start..end].to_vec()));
+            let total = (entry.num_values as usize)
+                .checked_mul(len)
+                .ok_or_else(|| corrupt("binary fixed-length size overflow"))?;
+            if total > data.len() {
+                return Err(corrupt("binary fixed-length data truncated"));
             }
+            Ok(BinaryDocValues {
+                doc_ids,
+                data,
+                addrs: None,
+                fixed_len: len,
+                pos: 0,
+            })
         } else {
-            // Variable-length: use DirectMonotonic addresses
-            let addr_meta = entry.addresses_meta.as_ref().ok_or_else(|| {
-                corrupt("binary variable-length field missing addresses meta")
-            })?;
+            // Variable-length: DirectMonotonic addresses; validate every
+            // offset now so `next` never fails.
+            let addr_meta = entry
+                .addresses_meta
+                .as_ref()
+                .ok_or_else(|| corrupt("binary variable-length field missing addresses meta"))?;
             let addr_data = self.slice(entry.addresses_offset, entry.addresses_length)?;
             let dm = DirectMonotonicReader::new(
                 addr_meta,
@@ -618,16 +683,19 @@ impl DocValuesReader {
                 entry.num_values as usize + 1,
                 DIRECT_MONOTONIC_BLOCK_SHIFT,
             )?;
-            for (i, &doc_id) in doc_ids.iter().enumerate() {
-                let start = dm.get(i as u64) as usize;
-                let end = dm.get(i as u64 + 1) as usize;
-                if end > data.len() {
+            for i in 0..=entry.num_values as u64 {
+                if dm.get(i) as usize > data.len() {
                     return Err(corrupt("binary variable-length data truncated"));
                 }
-                result.push((doc_id, data[start..end].to_vec()));
             }
+            Ok(BinaryDocValues {
+                doc_ids,
+                data,
+                addrs: Some(dm),
+                fixed_len: 0,
+                pos: 0,
+            })
         }
-        Ok(result)
     }
 
     /// BINARY field, packed form: `(doc_ids, data, offsets)`. `data` is the
@@ -640,77 +708,20 @@ impl DocValuesReader {
         &self,
         field_number: i32,
     ) -> io::Result<(Vec<u32>, Vec<u8>, Vec<(usize, usize)>)> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|(n, _)| *n == field_number)
-            .and_then(|(_, e)| match e {
-                DvEntry::Binary(m) => Some(m),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no BINARY DV entry for field {field_number}"),
-                )
-            })?;
+        let entry = self.binary_meta(field_number).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no BINARY DV entry for field {field_number}"),
+            )
+        })?;
 
-        if entry.num_values == 0 {
-            return Ok((Vec::new(), Vec::new(), Vec::new()));
-        }
-        if entry.docs_offset == -2 {
+        if entry.num_values == 0 || entry.docs_offset == -2 {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
 
-        // Decode doc IDs (DISI or dense) — same logic as binary_values.
-        let doc_ids: Vec<u32> = if entry.docs_offset == -1 {
-            (0..entry.num_values).collect()
-        } else {
-            let region = self.slice(entry.docs_offset, entry.docs_length)?;
-            let mut docs = Vec::with_capacity(entry.num_values as usize);
-            let mut pos = 0usize;
-            loop {
-                if pos + 4 > region.len() {
-                    return Err(corrupt("truncated DISI block header"));
-                }
-                let block_id = Self::read_u16_le(region, pos)? as u32;
-                let cardinality = Self::read_u16_le(region, pos + 2)? as u32 + 1;
-                pos += 4;
-                if block_id == DISI_SENTINEL_BLOCK {
-                    break;
-                }
-                if cardinality <= DISI_MAX_ARRAY_LENGTH {
-                    for _ in 0..cardinality {
-                        docs.push((block_id << 16) | Self::read_u16_le(region, pos)? as u32);
-                        pos += 2;
-                    }
-                } else if cardinality == DISI_BLOCK_SIZE {
-                    docs.extend((0..DISI_BLOCK_SIZE).map(|i| (block_id << 16) | i));
-                } else {
-                    if pos + 256 + 1024 * 8 > region.len() {
-                        return Err(corrupt("truncated DISI dense block"));
-                    }
-                    pos += 256;
-                    for word_index in 0..1024usize {
-                        let mut w = Self::read_u64_le(region, pos)?;
-                        pos += 8;
-                        while w != 0 {
-                            let bit = w.trailing_zeros();
-                            docs.push((block_id << 16) | ((word_index as u32) << 6) | bit);
-                            w &= w - 1;
-                        }
-                    }
-                }
-            }
-            if docs.len() != entry.num_values as usize {
-                return Err(corrupt(format!(
-                    "binary DISI docs count mismatch: expected {}, got {}",
-                    entry.num_values,
-                    docs.len()
-                )));
-            }
-            docs
-        };
+        let doc_ids = self
+            .decode_doc_ids(entry.docs_offset, entry.docs_length, entry.num_values as u64)?
+            .into_vec();
 
         // Contiguous value region (single owned copy of the field's data).
         let data = self
@@ -730,9 +741,10 @@ impl DocValuesReader {
                 offsets.push((start, end));
             }
         } else {
-            let addr_meta = entry.addresses_meta.as_ref().ok_or_else(|| {
-                corrupt("binary variable-length field missing addresses meta")
-            })?;
+            let addr_meta = entry
+                .addresses_meta
+                .as_ref()
+                .ok_or_else(|| corrupt("binary variable-length field missing addresses meta"))?;
             let addr_data = self.slice(entry.addresses_offset, entry.addresses_length)?;
             let dm = DirectMonotonicReader::new(
                 addr_meta,
@@ -750,6 +762,91 @@ impl DocValuesReader {
             }
         }
         Ok((doc_ids, data, offsets))
+    }
+
+    /// SORTED field zero-copy iterator: ords decoded once, dict held in
+    /// packed form; `next` borrows term bytes from the internal dict buffer.
+    pub fn sorted_doc_values(&self, field_number: i32) -> io::Result<SortedDocValues> {
+        let doc_ords = self.sorted_ords(field_number)?;
+        let (dict, dict_offsets) = self.sorted_dict_packed(field_number)?;
+        if doc_ords
+            .iter()
+            .any(|&(_, ord)| ord as usize >= dict_offsets.len())
+        {
+            return Err(corrupt("sorted ord out of dict range"));
+        }
+        Ok(SortedDocValues {
+            doc_ords,
+            dict,
+            dict_offsets,
+            pos: 0,
+        })
+    }
+}
+
+/// BINARY DocValues 零拷贝迭代器：value 字节直接借自 .dvd mmap
+/// （`next` 返回的切片生命周期为 `'a`，与迭代器借用无关）。构造时已完成
+/// 全部边界校验（corrupt → InvalidData），迭代过程不会失败。
+pub struct BinaryDocValues<'a> {
+    doc_ids: DocIds,
+    data: &'a [u8],
+    addrs: Option<DirectMonotonicReader<'a>>,
+    fixed_len: usize, // 仅定长路径使用；变长以 addrs.is_some() 区分
+    pos: usize,
+}
+
+impl<'a> BinaryDocValues<'a> {
+    /// 下一对 (doc_id, bytes)，doc 升序；耗尽返回 None。
+    pub fn next(&mut self) -> Option<(u32, &'a [u8])> {
+        if self.pos >= self.doc_ids.len() {
+            return None;
+        }
+        let i = self.pos;
+        self.pos += 1;
+        let doc = self.doc_ids.get(i);
+        let (start, end) = match &self.addrs {
+            Some(dm) => (dm.get(i as u64) as usize, dm.get(i as u64 + 1) as usize),
+            None => (i * self.fixed_len, (i + 1) * self.fixed_len),
+        };
+        // 构造时已校验 end <= data.len()，这里直接切。
+        Some((doc, &self.data[start..end]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.doc_ids.len() == 0
+    }
+}
+
+/// SORTED DocValues 零拷贝迭代器：ords 解码为 (doc, ord) 列表，dict 以
+/// packed 形式自持；`next` 返回的 term 切片借自内部 dict buffer
+/// （生命周期绑定到本次 `next` 调用）。per-doc 零分配。
+pub struct SortedDocValues {
+    doc_ords: Vec<(u32, u32)>,
+    dict: Vec<u8>,
+    dict_offsets: Vec<(u32, u32)>,
+    pos: usize,
+}
+
+impl SortedDocValues {
+    /// 下一对 (doc_id, term)，doc 升序；耗尽返回 None。
+    pub fn next(&mut self) -> Option<(u32, &[u8])> {
+        let &(doc, ord) = self.doc_ords.get(self.pos)?;
+        self.pos += 1;
+        // 构造时已校验 ord < dict_offsets.len()。
+        let (s, l) = self.dict_offsets[ord as usize];
+        Some((doc, &self.dict[s as usize..(s + l) as usize]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.doc_ords.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.doc_ords.is_empty()
     }
 }
 
@@ -1137,6 +1234,154 @@ mod tests {
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0], (1, b"aaa".to_vec()));
         assert_eq!(bins[1], (3, b"bbbbb".to_vec()));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    // ---- zero-copy iterator tests ----
+
+    /// 迭代器收集结果与 binary_values 对拍。
+    fn assert_binary_iter_matches(r: &DocValuesReader, field: i32) {
+        let want = r.binary_values(field).unwrap();
+        let mut it = r.binary_doc_values(field).unwrap();
+        assert_eq!(it.len(), want.len());
+        assert_eq!(it.is_empty(), want.is_empty());
+        let mut got: Vec<(u32, Vec<u8>)> = Vec::with_capacity(it.len());
+        while let Some((doc, bytes)) = it.next() {
+            got.push((doc, bytes.to_vec()));
+        }
+        assert_eq!(got, want);
+        assert!(it.next().is_none(), "exhausted iterator stays exhausted");
+    }
+
+    #[test]
+    fn binary_doc_values_variable_length() {
+        let root = write_index("biter-var", |w| {
+            let values = vec![
+                (0u32, b"hello".to_vec()),
+                (1u32, b"world!!".to_vec()),
+                (2u32, b"".to_vec()),
+            ];
+            w.add_binary_field(0, 3, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        assert_binary_iter_matches(&r, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn binary_doc_values_fixed_length() {
+        let root = write_index("biter-fixed", |w| {
+            let values = vec![
+                (0u32, vec![0xDE, 0xAD]),
+                (1u32, vec![0xBE, 0xEF]),
+            ];
+            w.add_binary_field(0, 2, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        assert_binary_iter_matches(&r, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn binary_doc_values_sparse() {
+        let root = write_index("biter-sparse", |w| {
+            // 稀疏 DISI + 变长地址
+            let values = vec![
+                (1u32, b"aaa".to_vec()),
+                (3u32, b"bbbbb".to_vec()),
+                (7u32, b"c".to_vec()),
+            ];
+            w.add_binary_field(0, 10, &values).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        assert_binary_iter_matches(&r, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn binary_doc_values_empty_field() {
+        let root = write_index("biter-empty", |w| {
+            w.add_binary_field(0, 5, &[]).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let mut it = r.binary_doc_values(0).unwrap();
+        assert_eq!(it.len(), 0);
+        assert!(it.is_empty());
+        assert!(it.next().is_none());
+        assert_binary_iter_matches(&r, 0);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn binary_doc_values_missing_field_not_found() {
+        let root = write_index("biter-missing", |w| {
+            w.add_binary_field(0, 1, &[(0u32, b"x".to_vec())]).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let err = r.binary_doc_values(7).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sorted_doc_values_matches_dict_and_ords() {
+        // 150 词 → 3 个 64 项块；ords 稀疏（复用 sorted_dict_and_ords 的分布）
+        let dict: Vec<String> = (0..150).map(|i| format!("term-{i:04}")).collect();
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|s| s.as_bytes()).collect();
+        let ords: Vec<(u32, u32)> = (0..300u32)
+            .filter(|d| d % 3 != 0)
+            .enumerate()
+            .map(|(i, d)| (d, (i % 150) as u32))
+            .collect();
+        let root = write_index("siter", |w| {
+            w.add_sorted_field(0, 300, &dict_refs, &ords).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+
+        // 对拍基准：sorted_ords + sorted_dict 组合
+        let want_dict = r.sorted_dict(0).unwrap();
+        let want_ords = r.sorted_ords(0).unwrap();
+
+        let mut it = r.sorted_doc_values(0).unwrap();
+        assert_eq!(it.len(), want_ords.len());
+        assert!(!it.is_empty());
+        let mut got: Vec<(u32, Vec<u8>)> = Vec::with_capacity(it.len());
+        while let Some((doc, term)) = it.next() {
+            got.push((doc, term.to_vec()));
+        }
+        assert!(it.next().is_none());
+        let want: Vec<(u32, Vec<u8>)> = want_ords
+            .iter()
+            .map(|&(d, o)| (d, want_dict[o as usize].clone()))
+            .collect();
+        assert_eq!(got, want);
+
+        // sorted_dict_packed 与 sorted_dict 一致
+        let (buf, offsets) = r.sorted_dict_packed(0).unwrap();
+        assert_eq!(offsets.len(), want_dict.len());
+        for (i, &(s, l)) in offsets.iter().enumerate() {
+            assert_eq!(&buf[s as usize..(s + l) as usize], want_dict[i].as_slice());
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sorted_doc_values_empty_field() {
+        let root = write_index("siter-empty", |w| {
+            w.add_sorted_field(1, 10, &[], &[]).unwrap();
+        });
+        let dir = FSDirectory::open(&root).unwrap();
+        let r = DocValuesReader::open(&dir, "_0", &SEGMENT_ID, SUFFIX).unwrap();
+        let mut it = r.sorted_doc_values(1).unwrap();
+        assert_eq!(it.len(), 0);
+        assert!(it.is_empty());
+        assert!(it.next().is_none());
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -1,182 +1,51 @@
-# Task 1 Report: 骨架——DocBlockBuf + trait 默认 fill + 开关 + driver + CountCollector
+# Task 1 报告：analysis 模块骨架 + 三个内置 tokenizer
 
-**Status:** DONE
-**Commit:** e40d1d0
-**Branch:** dev
+## 做了什么
 
-## Implementation Summary
+按 brief 逐字实现：
 
-Implemented the foundational block-level iteration infrastructure per spec 2026-07-26 §3/§5:
+- 新建 `crates/core/src/analysis/tokenizer.rs`：`Tokenizer<'a>` trait（`next_token(&mut self) -> Option<&'a [u8]>`，零拷贝借用输入）、`WhitespaceTokens`（包装 `SplitAsciiWhitespace`，同时保留 `Iterator<Item = &'a str>` 供 doc_writer 现状路径）、`LetterTokens`（按 `char::is_alphabetic` 最大连续段切分）、`KeywordTokens`（整体一个 token，空输入无 token）。实现与测试代码均逐字取自 brief。
+- 新建 `crates/core/src/analysis/mod.rs`：骨架模块，re-export 四个公开项。
+- `crates/core/src/lib.rs:21`：`pub mod tokenizer;` → `pub mod analysis;`。
+- `crates/core/src/doc_writer.rs:7`：`use crate::tokenizer::WhitespaceTokens;` → `use crate::analysis::WhitespaceTokens;`。
+- 删除 `crates/core/src/tokenizer.rs`（`git rm`）。doc_writer 的 `for token in WhitespaceTokens::new(&text)` 调用点（doc_writer.rs:399）经 Iterator impl 无缝工作，未改动。
+- 无新依赖；全部 safe Rust（`#![forbid(unsafe_code)]` 不受影响）。
 
-- `DOC_BLOCK` constant (128) and `DocBlockBuf` struct for block-aligned iteration
-- `DocIter::next_block()` trait method with default fill implementation (absorbs two-phase confirmation)
-- `SegmentDocIter::next_block()` dispatch across all 14 variants (12 delegate, 2 inline for Docs/Freqs)
-- `block_enabled()` kill switch (mirrors `bitmap_enabled()` pattern, `RL_BLOCK=0` disables)
-- `Collector::collect_block()` trait method with default per-doc fallback
-- `CountCollector::collect_block()` override (direct count increment)
-- `drive_blocks()` free function for block-level iteration loop
-- `search()` and `count()` methods now branch on `block_enabled()` to use block or per-doc paths
+## TDD 过程
 
-## TDD Evidence
+1. 先写测试模块（含 `analysis/mod.rs` 声明与 lib.rs 切换，否则测试文件不参与编译、无法失败），运行
+   `RUST_MIN_STACK=4194304 cargo test -p rustlucene-core analysis::tokenizer` → 按预期编译失败（E0432/E0433/E0405：`Tokenizer`、`WhitespaceTokens`、`LetterTokens`、`KeywordTokens` 未定义）。
+2. 写入 brief 的实现后 `git rm crates/core/src/tokenizer.rs`，全量测试通过。
 
-### RED (Step 2)
+## 测试命令与输出摘要
+
+命令：`RUST_MIN_STACK=4194304 cargo test -p rustlucene-core`
+
 ```
-error[E0432]: unresolved import `super::doc_iter::DocBlockBuf`
-error[E0432]: unresolved import `super::doc_iter::DOC_BLOCK`
-error[E0432]: unresolved import `super::searcher::drive_blocks`
-error[E0599]: no method named `next_block` found for struct `SegmentDocIter`
-error[E0599]: no method named `collect_block` found for struct `VecCollector`
-```
-Compilation failed as expected—none of the block infrastructure existed.
-
-### GREEN (Step 8)
-```
-test search::block_tests::collect_block_default_matches_per_doc ... ok
-test search::block_tests::default_fill_tail_semantics ... ok
-test search::block_tests::drive_blocks_doc_base_offset ... ok
-test search::block_tests::drive_blocks_count_parity_single_segment ... ok
-
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out
+test analysis::tokenizer::tests::keyword_yields_whole_input_once ... ok
+test analysis::tokenizer::tests::letter_splits_on_non_alphabetic ... ok
+test analysis::tokenizer::tests::whitespace_splits_on_ascii_whitespace ... ok
+test result: ok. 165 passed; 0 failed; 1 ignored   (lib)
+test result: ok. 1 passed; 0 failed                (另一 target)
+test result: ok. 2 passed; 0 failed                (rustlucene-cli)
+test result: ok. 0 passed; 0 failed                (doc-tests)
 ```
 
-## Test Results
+全部绿色，0 失败。既有测试零改动：`git diff HEAD~1 --stat` 对 crates/ 仅显示 lib.rs、doc_writer.rs 各 1 行 import 变更、tokenizer.rs 删除（其旧测试 `splits_on_whitespace` 的用例被新测试 `whitespace_splits_on_ascii_whitespace` 覆盖，属 brief 要求的迁移）。
 
-### Full Workspace Suite
-```
-test result: ok. 185 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out  [codec_lucene9]
-test result: ok. 89 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out   [rustlucene-core]
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out    [binary tests]
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out    [other]
-```
+## 自审（对照 brief 逐项）
 
-**Total:** 277 tests passed (185 + 89 + 2 + 1)
-- Baseline: 273 tests (88 core + 185 codec)
-- Added: 4 block_ tests
-- Final: 277 tests (92 core + 185 codec)
+- [x] Create `analysis/tokenizer.rs`（实现+测试逐字）
+- [x] Create `analysis/mod.rs`（逐字）
+- [x] Delete `crates/core/src/tokenizer.rs`
+- [x] `lib.rs:21` → `pub mod analysis;`
+- [x] `doc_writer.rs:7` import 路径
+- [x] Produces 接口四项全部就位（trait + 三个 struct + WhitespaceTokens 的 Iterator 保留）
+- [x] 无新依赖（Cargo.toml/Cargo.lock 未动）
+- [x] 全量测试绿、既有测试未改动
 
-**No warnings.** Output pristine.
+## 疑虑 / 说明
 
-## Files Changed
-
-1. **crates/core/src/search/doc_iter.rs**
-   - Added `DOC_BLOCK` constant and `DocBlockBuf` struct (lines 16-33)
-   - Added `DocIter::next_block()` trait method with default fill (lines 63-77)
-   - Added `SegmentDocIter::next_block()` 14-arm dispatch (lines 1596-1629)
-
-2. **crates/core/src/search/segment_reader.rs**
-   - Added `block_enabled()` function (lines 133-141)
-
-3. **crates/core/src/search/collector.rs**
-   - Added `Collector::collect_block()` trait method with default fallback (lines 27-39)
-   - Added `CountCollector::collect_block()` override (lines 53-55)
-
-4. **crates/core/src/search/searcher.rs**
-   - Added `drive_blocks()` free function (lines 16-36)
-   - Modified `search()` to branch on `block_enabled()` (lines 51-68)
-   - Modified `count()` to branch on `block_enabled()` (lines 79-101)
-
-5. **crates/core/src/search/mod.rs**
-   - Added `#[cfg(test)] mod block_tests;` declaration (lines 21-22)
-
-6. **crates/core/src/search/block_tests.rs** (new file)
-   - Created test file with 4 tests (152 lines)
-   - Tests verify: default fill semantics, block vs per-doc parity, doc_base offset, collect_block default
-
-## Self-Review
-
-### Completeness ✓
-All 9 steps executed in order:
-1. ✓ Created failing test file
-2. ✓ Confirmed compilation failure (RED)
-3. ✓ Added DOC_BLOCK/DocBlockBuf/next_block to doc_iter.rs
-4. ✓ Added SegmentDocIter next_block dispatch
-5. ✓ Added block_enabled() to segment_reader.rs
-6. ✓ Added collect_block to collector.rs
-7. ✓ Added drive_blocks and search/count branching to searcher.rs
-8. ✓ Confirmed all tests pass (GREEN)
-9. ✓ Committed with exact message format
-
-### Quality ✓
-- All names match brief's naming contract exactly: `DOC_BLOCK`, `DocBlockBuf`, `next_block`, `collect_block`, `block_enabled`, `drive_blocks`
-- No deviations from brief's code (only added `#[allow(unused_imports)]` and `#[allow(dead_code)]` to suppress warnings for items reserved for future tasks)
-- No extra tests, methods, or re-exports beyond what the brief specified
-
-### Discipline ✓
-- Implemented only what the brief specified
-- `top_docs()` left unchanged (Task 7 will add block path)
-- No premature optimizations or refactoring
-
-### Testing ✓
-- 4 new block_ tests pass
-- Full suite green (277 tests)
-- No warnings in output
-- Output pristine
-
-## Line-Number Drift and Adjustments
-
-### Drift Resolved
-1. **doc_iter.rs trait definition**: Brief cited `:17-41`, actual was `:17-41` (no drift)
-2. **SegmentDocIter impl**: Brief cited `:1514-1583`, actual was `:1514-1583` (no drift)
-3. **segment_reader.rs bitmap_enabled()**: Brief cited `:128-131`, actual was `:128-131` (no drift)
-4. **collector.rs trait**: Brief cited `:4-14`, actual was `:4-14` (no drift)
-5. **searcher.rs search/count**: Brief cited `:37-56` and `:60-80`, actual was `:37-56` and `:60-80` (no drift)
-
-### Adjustments Made
-1. **block_tests.rs imports**: Brief included `CollectBlock` in import line but noted it was a "trap" (typo defense). Applied brief's correction: removed `CollectBlock`, kept only `Collector`.
-2. **block_tests.rs warnings**: Brief's code imported `DOC_BLOCK` and defined `stream_per_doc` for future tasks but these generated warnings. Added minimal `#[allow(unused_imports)]` and `#[allow(dead_code)]` attributes to suppress warnings without deviating from the brief's code.
-
-## Notes
-
-The implementation establishes the block iteration skeleton that Tasks 2-10 will build upon:
-- Task 2: codec-level batch reading for DocsEnum/DocsFreqsEnum
-- Task 3: leaf iterator overrides (MatchAll, Docs, Freqs)
-- Task 4: block algebra primitives (intersect/andnot/kway_union)
-- Task 5-6: combinator overrides (Excluding/ConjOver/DisjOver/And/Or/Roaring)
-- Task 7: top_docs block path + TopDocCollector/FreqSumCollector overrides
-- Task 8-9: regression batteries and performance validation
-- Task 10: final report
-
-All block paths currently use the default fill (loop over next_doc+matches). Subsequent tasks will override with optimized implementations while maintaining the same trait interface.
-
-## Fix I-1
-
-**Finding:** `SegmentDocIter::next_block` `Self::Freqs(f)` arm filled `out.docs[n]` but not `out.freqs[n]`, violating trait contract §4.
-
-**Lines added (2 files):**
-
-1. `crates/core/src/search/doc_iter.rs` (Freqs arm):
-   ```rust
-   if f.decode_freqs() {
-       out.freqs[n] = f.freq();
-   }
-   ```
-   Guard required: `SegmentDocIter::Freqs` may wrap a no-freq `DocsFreqsEnum` (constructed via `docs_and_freqs_no_freq` when `needs_freq=false`, e.g., `CountCollector`/`TopDocCollector`). The per-doc driver guards via `if needs_freq { iter.freq() } else { 1 }`; the block arm mirrors with the enum's own `decode_freqs()` predicate.
-
-2. `crates/codec-lucene9/src/postings_read.rs` (`DocsFreqsEnum` impl):
-   ```rust
-   pub fn decode_freqs(&self) -> bool {
-       self.core.decode_freqs
-   }
-   ```
-
-**Test command:**
-```
-RUST_MIN_STACK=4194304 cargo test --workspace 2>&1 | grep "test result"
-```
-
-**Output:**
-```
-test result: ok. 185 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.36s
-test result: ok. 89 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.31s
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-```
-**Total: 277 passed, 0 failed. No warnings.**
-
-**New commit SHA:** `f6194ae feat(batch): 块迭代骨架——DocBlockBuf + next_block 默认 fill + RL_BLOCK 开关 + drive_blocks`
-
-## Fix I-1 follow-up (controller)
-
-I-1 修复经核实为**必要扩展**：`EnumCore::freq()` 在 no-freq 模式 panic（postings_read.rs:197,580），裸 `f.freq()` 会让 block 路径在 needs_freq=false + 无 freq 字段时 panic 而 per-doc 路径正常——违反约束 1。guard `if f.decodes_freqs()` 保留。
-访问器名 `decode_freqs` 与计划命名契约（Task 2 产出 `decodes_freqs`）冲突，已重命名为契约名 `decodes_freqs`，amend 进 Task 1 commit。Task 2 需知：`DocsFreqsEnum::decodes_freqs` 已存在，勿重复添加。
-最终 commit: 2435f5d；277 全绿。
+- brief 代码与 rustfmt 有细微出入（如 `Self { input: text, offset: 0 }` 单行、import 字母序），但基线本身已有 88 处既有 fmt drift（含 doc_writer.rs），项目未强制 fmt；按要求逐字使用 brief 代码，未另行格式化。
+- 操作插曲：验证 fmt 基线时用了 `git stash`/`git stash pop`，导致已暂存的 tokenizer.rs 删除被退回未暂存状态，已用 `git add -A` 重新暂存后提交，最终 commit 内容经 `git show --stat` 确认完整。
+- `.superpowers/sdd/.gitignore`（内容为 `*`）存在，但 task-1-brief.md / task-1-report.md 此前已被跟踪，`git add -f` 正常工作，未删除该 .gitignore。

@@ -356,6 +356,13 @@ pub extern "system" fn Java_RustIndexWriter_nativeSearch<'a>(
     let sort_field = req.sort_field();
 
     let guard = h.index.read().unwrap();
+    // Query-side analysis (spec §查询侧双通道): rewrite term bytes to match
+    // analyzer-configured fields before execution. No-analyzer fields and
+    // indexes built without analyzers pass through unchanged.
+    let query = jni_try_obj!(
+        &mut env,
+        rustlucene_core::analysis::analyze_query(&query, guard.schema())
+    );
     let results = jni_try_obj!(
         &mut env,
         guard

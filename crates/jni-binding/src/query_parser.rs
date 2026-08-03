@@ -39,6 +39,7 @@ pub enum QuerySpec {
     Prefix { field: String, value: String },
     Wildcard { field: String, value: String },
     Phrase { field: String, terms: Vec<String> },
+    Terms { field: String, values: Vec<String> },
     MatchAll,
 }
 
@@ -58,6 +59,10 @@ impl SearchRequest {
 fn spec_to_query(spec: &QuerySpec) -> Result<Query, String> {
     match spec {
         QuerySpec::Term { field, value } => Ok(Query::term(field, value)),
+        QuerySpec::Terms { field, values } => {
+            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+            Ok(Query::terms(field, &refs))
+        }
         QuerySpec::MatchAll => Ok(Query::MatchAll),
         QuerySpec::Range { field, low, high } => Ok(Query::point_range(field, *low, *high)),
         QuerySpec::Prefix { field, value } => Ok(Query::prefix(field, value)),
@@ -144,6 +149,29 @@ mod tests {
         let json = br#"{"query":{"type":"wildcard","field":"tid","value":"req-*"}}"#;
         let req = parse_search_request(json).unwrap();
         assert_eq!(req.to_query().unwrap(), Query::wildcard("tid", "req-*"));
+    }
+
+    #[test]
+    fn parse_terms_query() {
+        let json = br#"{"query":{"type":"terms","field":"level","values":["ERROR","WARN"]},"top_n":5}"#;
+        let req = parse_search_request(json).unwrap();
+        assert_eq!(req.to_query().unwrap(), Query::terms("level", &["ERROR", "WARN"]));
+    }
+
+    #[test]
+    fn terms_nested_in_bool() {
+        let json = br#"{"query":{"type":"bool","clauses":[
+            {"occur":"must","query":{"type":"terms","field":"level","values":["ERROR"]}},
+            {"occur":"must","query":{"type":"match_all"}}
+        ]}}"#;
+        let req = parse_search_request(json).unwrap();
+        match req.to_query().unwrap() {
+            Query::Bool { clauses } => {
+                assert_eq!(clauses.len(), 2);
+                assert_eq!(clauses[0].1, Query::terms("level", &["ERROR"]));
+            }
+            _ => panic!("expected Bool"),
+        }
     }
 
     #[test]

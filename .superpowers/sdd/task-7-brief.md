@@ -1,165 +1,100 @@
-### Task 7: top_docs 块路径 + TopDocCollector / FreqSumCollector 覆写
+### Task 7: JNI `terms` 类型 + nativeSearch 接线 analyze_query
 
 **Files:**
-- Modify: `crates/core/src/search/searcher.rs`（top_docs :86-122）
-- Modify: `crates/core/src/search/collector.rs`（TopDocCollector :47-54；FreqSumCollector :63-70）
-- Modify: `crates/core/src/search/block_tests.rs`（collector 块语义测试）
+- Modify: `crates/jni-binding/src/query_parser.rs`（QuerySpec 加 Terms）
+- Modify: `crates/jni-binding/src/lib.rs:354-365`（nativeSearch 调 analyze_query）
 
 **Interfaces:**
-- Consumes: `drive_blocks`、叶子/组合器覆写（Task 1-6）
-- Produces: 三 driver 全部块化；`TopDocCollector::collect_block`（total += len + 块前缀补满 n）、`FreqSumCollector::collect_block`（freqs 求和）
+- Consumes: Task 6 `rustlucene_core::analysis::analyze_query`、`Query::terms(field, &[&str])`
+- Produces:
+  - JSON：`{"query":{"type":"terms","field":"level","values":["ERROR","WARN"]}}`
+  - `nativeSearch` 对所有查询在 `spec_to_query` 之后执行 analyze_query 重写
 
-- [ ] **Step 1: 写失败测试——collector 块语义**
+- [ ] **Step 1: Write the failing test**
 
-`block_tests.rs` 尾部追加：
+`crates/jni-binding/src/query_parser.rs` 测试模块追加：
 
 ```rust
-use super::collector::{FreqSumCollector, TopDocCollector};
-
 #[test]
-fn top_doc_collector_block_per_doc_parity() {
-    for top_n in [1usize, 5, 128, 129, 300, 1000] {
-        let docs: Vec<u32> = (0..300).map(|i| i * 7).collect();
-        // 逐 doc 参照
-        let mut ref_c = TopDocCollector::new(top_n);
-        for &d in &docs {
-            ref_c.collect(d as i32, 1);
-        }
-        // 块路径（128 一块 + 尾块）
-        let mut blk_c = TopDocCollector::new(top_n);
-        for chunk in docs.chunks(128) {
-            blk_c.collect_block(chunk, None);
-        }
-        assert_eq!(blk_c.total, ref_c.total, "top_n={top_n}");
-        assert_eq!(blk_c.docs, ref_c.docs, "top_n={top_n}");
-        assert_eq!(blk_c.docs.len(), top_n.min(docs.len()));
-    }
+fn parse_terms_query() {
+    let json = br#"{"query":{"type":"terms","field":"level","values":["ERROR","WARN"]},"top_n":5}"#;
+    let req = parse_search_request(json).unwrap();
+    assert_eq!(req.to_query().unwrap(), Query::terms("level", &["ERROR", "WARN"]));
 }
 
 #[test]
-fn freq_sum_collector_block() {
-    let mut c = FreqSumCollector::default();
-    let docs = [1u32, 2, 3];
-    c.collect_block(&docs, Some(&[4, 5, 6]));
-    assert_eq!(c.total_freq, 15);
-    let mut c2 = FreqSumCollector::default();
-    c2.collect_block(&docs, None);
-    assert_eq!(c2.total_freq, 3); // freq 恒 1
+fn terms_nested_in_bool() {
+    let json = br#"{"query":{"type":"bool","clauses":[
+        {"occur":"must","query":{"type":"terms","field":"level","values":["ERROR"]}},
+        {"occur":"must","query":{"type":"match_all"}}
+    ]}}"#;
+    let req = parse_search_request(json).unwrap();
+    match req.to_query().unwrap() {
+        Query::Bool { clauses } => {
+            assert_eq!(clauses.len(), 2);
+            assert_eq!(clauses[0].1, Query::terms("level", &["ERROR"]));
+        }
+        _ => panic!("expected Bool"),
+    }
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p rustlucene-core top_doc_collector 2>&1 | tail -5`
-Expected: 编译错误——`TopDocCollector::collect_block` / `FreqSumCollector::collect_block` 未定义（默认回退存在但测试需要覆写？——默认回退语义正确，测试可能 PASS；确认 PASS 后把覆写当性能改动加，测试作回归守卫）
+Run: `cargo test -p rustlucene-jni-binding 2>&1 | tail -5`（包名以 `cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name'` 确认为准）
+Expected: FAIL（`type":"terms"` 反序列化失败：`unknown variant`）
 
-- [ ] **Step 3: collector 覆写**
+- [ ] **Step 3: Write minimal implementation**
 
-`impl Collector for TopDocCollector`（collector.rs :47-54）内 `collect` 之后追加：
+`crates/jni-binding/src/query_parser.rs` 的 `QuerySpec`（line 35-43）增加变体：
 
 ```rust
-    fn collect_block(&mut self, docs: &[u32], _freqs: Option<&[u32]>) {
-        self.total += docs.len() as u64;
-        let room = self.top_n.saturating_sub(self.docs.len());
-        let take = room.min(docs.len());
-        self.docs.extend(docs[..take].iter().map(|&d| d as i32));
-    }
+    Terms { field: String, values: Vec<String> },
 ```
 
-`impl Collector for FreqSumCollector`（:63-70）内追加：
+`spec_to_query` 增加分支（放在 `QuerySpec::Term` 分支后）：
 
 ```rust
-    fn collect_block(&mut self, _docs: &[u32], freqs: Option<&[u32]>) {
-        match freqs {
-            Some(f) => self.total_freq += f.iter().map(|&x| x as u64).sum::<u64>(),
-            None => self.total_freq += _docs.len() as u64,
+        QuerySpec::Terms { field, values } => {
+            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+            Ok(Query::terms(field, &refs))
         }
-    }
 ```
 
-- [ ] **Step 4: top_docs 块路径**
-
-`top_docs` 方法（searcher.rs :86-122）的迭代段循环改为（保留 fast-count 短路语义逐条）：
+`crates/jni-binding/src/lib.rs` 的 `nativeSearch`（line 354-365）改为：
 
 ```rust
-    pub fn top_docs(&mut self, query: &Query, n: usize) -> io::Result<(u64, Vec<i32>)> {
-        let mut total = 0u64;
-        let mut docs: Vec<i32> = Vec::with_capacity(n.min(1024));
-        for (doc_base, seg) in self.reader.leaves() {
-            let fast = query::fast_segment_count(seg, query)?;
-            if let Some(c) = fast {
-                total += c;
-            }
-            if docs.len() >= n && fast.is_some() {
-                continue;
-            }
-            let Some(mut iter) = query.segment_iterator(seg, false)? else {
-                continue;
-            };
-            if block_enabled() {
-                let mut out = DocBlockBuf::new();
-                loop {
-                    if docs.len() >= n && fast.is_some() {
-                        break;
-                    }
-                    let cnt = iter.next_block(&mut out)?;
-                    if cnt == 0 {
-                        break;
-                    }
-                    if fast.is_none() {
-                        total += cnt as u64;
-                    }
-                    for &d in &out.docs[..cnt] {
-                        if docs.len() >= n {
-                            break;
-                        }
-                        docs.push(doc_base + d as i32);
-                    }
-                }
-                continue;
-            }
-            loop {
-                if docs.len() >= n && fast.is_some() {
-                    break;
-                }
-                let doc = iter.next_doc()?;
-                if doc == NO_MORE_DOCS {
-                    break;
-                }
-                if !iter.matches()? {
-                    continue;
-                }
-                if fast.is_none() {
-                    total += 1;
-                }
-                if docs.len() < n {
-                    docs.push(doc_base + doc);
-                }
-            }
-        }
-        Ok((total, docs))
-    }
+    let req = jni_try_obj!(&mut env, query_parser::parse_search_request(&json));
+    let query = jni_try_obj!(&mut env, req.to_query());
+    let sort_field = req.sort_field();
+
+    let guard = h.index.read().unwrap();
+    // Query-side analysis (spec §查询侧双通道): rewrite term bytes to match
+    // analyzer-configured fields before execution. No-analyzer fields and
+    // indexes built without analyzers pass through unchanged.
+    let query = jni_try_obj!(
+        &mut env,
+        rustlucene_core::analysis::analyze_query(&query, guard.schema())
+    );
+    let results = jni_try_obj!(
+        &mut env,
+        guard
+            .search(&query, sort_field, req.top_n)
+            .map_err(|e| e.to_string())
+    );
+    drop(guard);
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test --workspace 2>&1 | tail -3`
-Expected: 全绿（基线 + 本计划新增全部，0 failed）
+Run: `cargo test -p rustlucene-jni-binding`
+Expected: PASS（新增 2 项 + 现有 query_parser 测试全绿）
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/core/src/search/searcher.rs crates/core/src/search/collector.rs crates/core/src/search/block_tests.rs
-git commit -m "$(cat <<'EOF'
-feat(batch): top_docs 块路径 + TopDocCollector/FreqSumCollector 块覆写
-
-spec 2026-07-26 Task 7：INDEXORDER 块前缀补满 n + fast-count 短路逐条
-保留；三 driver 全部块化完成。collector 块/逐 doc 对拍（top_n 跨块
-边界 1/5/128/129/300/1000）。
-
-Co-Authored-By: Claude <noreply@anthropic.com>
-EOF
-)"
+git add crates/jni-binding/src/query_parser.rs crates/jni-binding/src/lib.rs
+git commit -m "jni: terms (IN) query type + analyze_query wiring in nativeSearch"
 ```
 
 ---
